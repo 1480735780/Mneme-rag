@@ -1,0 +1,141 @@
+# Mneme-rag
+
+> 基于 **[ragent](https://github.com/nageoffer/ragent)** 架构裁剪并自研的轻量级 RAG（检索增强生成）Python 实现。
+> 目标是为 LLM 接入高精准度的"外挂记忆"——通过可控的知识入库、多路检索与模型路由，让大模型回答有据可依。
+
+---
+
+## 项目背景与目标
+
+**背景**：ragent 是一套以 Java / Spring Boot 构建的企业级 RAG 平台，覆盖模型管理（多供应商路由、故障转移、熔断）、知识库离线入库、在线多路检索、Agent 编排与评估体系。但其 Java 技术栈与 Python AI 生态（HuggingFace、Milvus、向量检索工具链）的协作成本较高。
+
+**目标**：
+
+1. 用 Python 复刻 ragent 的核心能力：模型抽象与路由、RAG 离线入库/在线检索、Agent 规划执行、MCP 工具接入、评估闭环；
+2. 保持与 ragent 一致的分层架构思想（framework → infra → rag → agent），便于对照学习与持续演进；
+3. 轻量务实：仅依赖必要组件（httpx / PyYAML），不引入重型框架，MVP 优先，逐步补全。
+
+## 核心功能特性
+
+| 特性 | 说明 | 状态 |
+|------|------|------|
+| LLM 对话门面 | `ChatService` 统一同步/流式调用，屏蔽供应商差异 | ✅ 已实现 |
+| 数据契约 | `ChatRequest` / `Message` / `SourceRef` / `GroundingChunk` 类型安全建模 | ✅ 已实现 |
+| YAML 配置体系 | 供应商/模型候选/档位/熔断参数，支持 `${ENV}` 占位符与缺失告警 | ✅ 已实现 |
+| 流式回调 | `StreamCallback` 增量推送（内容/思考/来源/完成/异常） | ✅ 已实现 |
+| 模型选择与路由 | 档位（tier）解析、候选构建、健康过滤 | 🚧 占位待实现 |
+| 故障转移与熔断 | 候选逐个回退、失败阈值熔断 | 🚧 占位待实现 |
+| 供应商客户端 | OpenAI 风格适配基类（openai/qwen/ollama/siliconflow） | 🚧 占位待实现 |
+| RAG 入库与检索 | 文档加载/解析/切分，向量/混合检索 | 🚧 占位待实现 |
+| Agent 能力 | 规划 / 执行 / 记忆 / 工具 | 🚧 占位待实现 |
+| MCP 工具层 | 服务端工具（检索/数据库）+ 客户端接入 | 🚧 占位待实现 |
+| 评估体系 | 检索质量指标与基准测试 | 🚧 占位待实现 |
+
+> ✅ = 已有代码实现；🚧 = 文件结构已就绪，待编写实现
+
+## 目录结构
+
+```
+mneme-rag/
+├── common/           # 公共基础设施层（等价 ragent framework 模块）
+│   ├── middleware/   # 中间件（日志/鉴权/限流）
+│   ├── exception/    # 统一异常体系（ModelClientException 等）
+│   ├── response/     # 统一响应结构
+│   ├── logging/      # 日志
+│   ├── tracing/      # 链路追踪
+│   └── security/     # 安全
+├── core/             # AI 基础设施层
+│   ├── llm/          # 模型层：抽象接口、对话门面、配置、供应商、路由
+│   └── pipeline/     # 流水线：RAG 流水线 / Agent 流水线
+├── rag/              # RAG 核心：离线入库（ingestion）、在线检索（retrieval）、Prompt
+├── agent/            # Agent 能力：规划 / 执行 / 记忆 / 工具
+├── mcp/              # MCP 工具层：客户端 + 服务端
+├── storage/          # 数据存储抽象：向量库 / 关系库 / 缓存
+├── evaluation/       # AI 评估：指标 / 基准 / 数据集
+├── scripts/          # 运维脚本：入库、评估
+├── tests/            # 单元与集成测试
+├── docker/           # 容器化与中间件编排
+├── docs/             # 项目文档与架构资产
+├── requirements.txt  # 依赖清单
+└── .env.example      # 环境变量模板
+```
+
+## 快速开始
+
+### 环境要求
+
+- Python 3.10+（开发环境使用 3.13）
+- 至少一个可访问的模型供应商（OpenAI / 阿里云百炼 / Ollama / SiliconFlow）
+
+### 安装与配置
+
+```bash
+# 1. 克隆项目
+git clone <your-repo-url> mneme-rag
+cd mneme-rag
+
+# 2. 安装依赖
+pip install -r requirements.txt
+
+# 3. 配置环境变量（API Key 等）
+cp .env.example .env
+#   编辑 .env：填入 QWEN_API_KEY / OPENAI_API_KEY / SILICONFLOW_API_KEY 等
+```
+
+### 验证配置加载
+
+```python
+from core.llm.config.config import load_config_from_yaml
+
+cfg = load_config_from_yaml("core/llm/config/ai.yaml")
+print(cfg.chat.default_tier)          # standard
+print(list(cfg.providers.keys()))     # ['qwen', 'openai', 'ollama', 'siliconflow']
+print(cfg.chat.tiers["deep"].candidates)  # 深度思考档候选
+```
+
+### 使用 LLM 对话门面（核心层已可用）
+
+```python
+import asyncio
+from core.llm.chat import ChatService
+from core.llm.schema import Message
+from core.llm.config.config import load_config_from_yaml
+
+async def main():
+    cfg = load_config_from_yaml("core/llm/config/ai.yaml")
+    # clients 字典在供应商客户端（providers/）实现后注入；
+    # 当前可用 FakeClient 或等待 providers 落地
+    chat_service = ChatService(clients={...}, config=cfg)
+    reply = await chat_service.chat(
+        messages=[Message.user("介绍一下 RAG")],
+        provider="qwen",
+        model="qwen-max",
+    )
+    print(reply)
+
+asyncio.run(main())
+```
+
+> 提示：`providers/` 下的供应商客户端尚未实现，上述调用需先完成客户端注入；RAG 入库 / 检索 / Agent / 评估等模块待实现，详见 [docs/roadmap.md](docs/roadmap.md)。
+
+## 技术栈
+
+| 类别 | 选型 |
+|------|------|
+| 语言 | Python 3.10+（asyncio 原生异步） |
+| HTTP | httpx（异步，供应商客户端规划） |
+| 配置 | PyYAML + python-dotenv |
+| 测试 | pytest |
+| 对标参考 | ragent（Java 17 / Spring Boot 3 / OkHttp / SSE） |
+
+## 贡献指南
+
+1. Fork 本仓库，从 `main` 分支创建功能分支；
+2. 提交前运行 `pytest` 确保测试通过（位于 `tests/`）；
+3. 代码风格遵循 PEP 8，注释与 docstring 使用中文（与现有代码一致）；
+4. 新模块请同步补充对应目录的 `README.md` 与 `docs/modules.md`；
+5. 通过 Pull Request 提交，说明改动目的与验证方式。
+
+## 许可证
+
+本项目基于 **Apache License 2.0** 分发（与上游 ragent 一致）。`LICENSE` 文件待补充；若需更换许可证，请在发布前更新。

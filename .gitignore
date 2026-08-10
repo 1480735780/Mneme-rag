@@ -1,0 +1,26 @@
+# ---- 私密文件（严禁上传）----
+.env
+.env.*
+!.env.example
+
+# ---- 依赖清单（按需维护，不随仓库分发）----
+requirements.txt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- IDE / 系统 ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,192 @@
+# ============================================================
+# Mneme-rag AI 模型配置文件
+# ============================================================
+# 使用说明：
+#   1. 所有 ${ENV_VAR} 格式的变量会从系统环境变量或 .env 文件读取
+#   2. providers 定义所有可用的提供商（含 API Key 和 Base URL）
+#   3. chat/embedding/rerank 定义模型组，candidates 注册具体模型，
+#      tiers 定义不同档位（仅 chat 使用）
+# ============================================================
+
+ai:
+  # ==========================================================
+  # 1. 提供商配置（对应 ProviderConfig）
+  # ==========================================================
+  providers:
+    # 通义千问（阿里云 DashScope）
+    qwen:
+      url: https://dashscope.aliyuncs.com
+      api_key: ${QWEN_API_KEY}          # 从 .env 读取
+      endpoints:
+        chat: /compatible-mode/v1/chat/completions
+        embedding: /compatible-mode/v1/embeddings
+
+    # OpenAI
+    openai:
+      url: https://api.openai.com
+      api_key: ${OPENAI_API_KEY}
+      endpoints:
+        chat: /v1/chat/completions
+        embedding: /v1/embeddings
+
+    # Ollama（本地部署）
+    ollama:
+      url: http://localhost:11434
+      api_key: ""                       # Ollama 通常不需要 API Key
+      endpoints:
+        chat: /v1/chat/completions
+        embedding: /v1/embeddings
+
+    # SiliconFlow（聚合网关）
+    siliconflow:
+      url: https://api.siliconflow.cn
+      api_key: ${SILICONFLOW_API_KEY}
+      endpoints:
+        chat: /v1/chat/completions
+        embedding: /v1/embeddings
+        rerank: /v1/rerank
+
+  # ==========================================================
+  # 2. 聊天模型组配置（对应 ModelGroup，包含 candidates + tiers）
+  # ==========================================================
+  chat:
+    # 默认档位（业务层未指定 tier 时使用）
+    default_tier: standard
+
+    # 深度思考档位（用户开启 thinking 时自动切换）
+    deep_thinking_tier: deep
+
+    # ---- 2.1 模型候选注册表（对应 ModelCandidate） ----
+    candidates:
+      - id: qwen-max                    # 模型唯一标识符
+        provider: qwen                  # 对应 providers 中的 key
+        model: qwen-max                 # 实际调用时的模型名
+        enabled: true
+        supports_thinking: true         # 支持思考链（DeepSeek-R1 风格）
+        priority: 10
+
+      - id: qwen-turbo
+        provider: qwen
+        model: qwen-turbo
+        enabled: true
+        supports_thinking: false
+        priority: 20
+
+      - id: qwen-plus
+        provider: qwen
+        model: qwen-plus
+        enabled: true
+        supports_thinking: false
+        priority: 15
+
+      - id: gpt-4o
+        provider: openai
+        model: gpt-4o
+        enabled: true
+        supports_thinking: false
+        priority: 10
+
+      - id: gpt-4o-mini
+        provider: openai
+        model: gpt-4o-mini
+        enabled: true
+        supports_thinking: false
+        priority: 20
+
+      - id: llama3
+        provider: ollama
+        model: llama3:latest
+        enabled: true
+        supports_thinking: false
+        priority: 30
+
+      - id: deepseek-v3
+        provider: siliconflow
+        model: deepseek-ai/DeepSeek-V3
+        enabled: true
+        supports_thinking: true
+        priority: 10
+
+    # ---- 2.2 档位配置（对应 TierConfig） ----
+    tiers:
+      # 快速档：低延迟，适合简单问答
+      fast:
+        candidates:
+          - qwen-turbo
+          - gpt-4o-mini
+          - llama3
+        timeout_ms: 5000                # 5 秒超时
+
+      # 标准档：平衡质量和速度
+      standard:
+        candidates:
+          - qwen-max
+          - gpt-4o
+          - deepseek-v3
+        timeout_ms: 30000               # 30 秒超时
+
+      # 深度思考档：高质量，长超时，支持 thinking
+      deep:
+        candidates:
+          - deepseek-v3
+          - qwen-max
+        timeout_ms: 120000              # 120 秒超时（2 分钟）
+
+  # ==========================================================
+  # 3. 向量嵌入模型组配置
+  # ==========================================================
+  embedding:
+    default_model: qwen-embedding       # 默认使用的模型 ID
+    candidates:
+      - id: qwen-embedding
+        provider: qwen
+        model: text-embedding-v3
+        dimension: 1024                 # 向量维度
+        enabled: true
+
+      - id: openai-embedding
+        provider: openai
+        model: text-embedding-3-small
+        dimension: 1536
+        enabled: true
+
+      - id: bge-embedding
+        provider: ollama
+        model: nomic-embed-text
+        dimension: 768
+        enabled: true
+
+  # ==========================================================
+  # 4. 重排序模型组配置
+  # ==========================================================
+  rerank:
+    default_model: bge-reranker
+    candidates:
+      - id: bge-reranker
+        provider: siliconflow
+        model: BAAI/bge-reranker-v2-m3
+        enabled: true
+
+  # ==========================================================
+  # 5. 视觉模型组配置（图生文，知识库入库期使用）
+  # ==========================================================
+  vlm:
+    default_model: qwen-vl-max
+    candidates:
+      - id: qwen-vl-max
+        provider: qwen
+        model: qwen-vl-max
+        enabled: true
+
+  # ==========================================================
+  # 6. 故障转移与熔断策略（对应 SelectionConfig）
+  # ==========================================================
+  selection:
+    failure_threshold: 2                # 连续失败 2 次触发熔断
+    open_duration_ms: 30000             # 熔断持续 30 秒
+
+  # ==========================================================
+  # 7. 流式响应配置（对应 StreamConfig）
+  # ==========================================================
+  stream:
+    message_chunk_size: 5               # 前端每次渲染的块大小
