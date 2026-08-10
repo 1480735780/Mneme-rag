@@ -18,13 +18,19 @@ core.llm.chat - AI 对话服务门面（Facade）
     2. 将业务层的简单参数（provider, model）组装成 ModelTarget。
     3. 统一处理超时、重试策略（可集成 tenacity 或自定义）。
     4. 提供简易的快捷方法，避免业务层每次都手动构造 ChatRequest。
+
+后续安排：
+    1. 补全chat模式，ragent中的LLMService有四种，分别对应四种不同的chat模式。
+        增加tier档位和优先模型选择这两种模式
+    
 """
 
 from typing import Dict, List, Optional
 
-from .base import BaseChatClient
+from .providers.base import BaseChatClient
 from .schema import ChatRequest, Message
-from core.llm.config.config import AIModelConfig, ModelCandidate, ModelTarget, ProviderConfig
+from core.llm.config.config import AIModelConfig, ModelCandidate, ProviderConfig
+from core.llm.model.model_target import ModelTarget
 from .callback import StreamCallback
 
 
@@ -98,7 +104,7 @@ class ChatService:
             messages: 对话消息列表（包含历史）。
             provider: 供应商名称（如 "qwen", "openai"）。
             model:   模型名称（如 "qwen-max", "gpt-4o"）。
-            temperature: 温度参数（0~1），控制随机性。
+            temperature: 温度参数（0~2），控制随机性。
             top_p: 核采样参数。
             max_tokens: 最大输出 Token 数。
             system_prompt: 系统提示词（会被自动插入 messages 开头）。

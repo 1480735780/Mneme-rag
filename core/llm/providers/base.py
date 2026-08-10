@@ -32,9 +32,9 @@ core.llm.providers.base - AI 模型客户端抽象协议（对应 ragent 的 Cha
 
 from abc import ABC, abstractmethod
 
-from .schema import ChatRequest
-from core.llm.config.config import ModelTarget
-from .callback import StreamCallback
+from ..schema import ChatRequest
+from core.llm.model.model_target import ModelTarget
+from ..callback import StreamCallback
 
 
 class BaseChatClient(ABC):
