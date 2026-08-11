@@ -53,11 +53,9 @@ mneme-rag/
 ├── storage/          # 数据存储抽象：向量库 / 关系库 / 缓存
 ├── evaluation/       # AI 评估：指标 / 基准 / 数据集
 ├── scripts/          # 运维脚本：入库、评估
-├── tests/            # 单元与集成测试
 ├── docker/           # 容器化与中间件编排
 ├── docs/             # 项目文档与架构资产
-├── requirements.txt  # 依赖清单
-└── .env.example      # 环境变量模板
+└── requirements.txt  # 依赖清单
 ```
 
 ## 快速开始
@@ -78,8 +76,7 @@ cd mneme-rag
 pip install -r requirements.txt
 
 # 3. 配置环境变量（API Key 等）
-cp .env.example .env
-#   编辑 .env：填入 QWEN_API_KEY / OPENAI_API_KEY / SILICONFLOW_API_KEY 等
+#   创建 .env 并填入 QWEN_API_KEY / OPENAI_API_KEY / SILICONFLOW_API_KEY 等
 ```
 
 ### 验证配置加载
@@ -137,7 +134,7 @@ asyncio.run(main())
 ## 贡献指南
 
 1. Fork 本仓库，从 `main` 分支创建功能分支；
-2. 提交前运行 `pytest` 确保测试通过（位于 `tests/`）；
+2. 提交前运行本地测试确保行为不变；
 3. 代码风格遵循 PEP 8，注释与 docstring 使用中文（与现有代码一致）；
 4. 新模块请同步补充对应目录的 `README.md` 与 `docs/modules.md`；
 5. 通过 Pull Request 提交，说明改动目的与验证方式。
