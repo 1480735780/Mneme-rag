@@ -23,7 +23,7 @@
 ## 与其他模块的关系
 
 ```
-planner / executor ──► core/llm（对话门面 ChatService）
+planner / executor ──► core/llm（对话门面 RoutingLLMService）
 tools.py           ──► mcp/server/tools（检索 / 数据库工具）
 memory.py          ──► storage/（缓存 / 数据库） + rag/（检索证据）
 agent_pipeline     ──► core/pipeline/agent_pipeline.py（流水线骨架）

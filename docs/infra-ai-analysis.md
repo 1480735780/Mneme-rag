@@ -106,7 +106,7 @@
 
 ### Mneme-rag对应
 
-LLMService.java--->core/llm/chat.py的ChatService
+LLMService.java--->core/llm/chat.py的RoutingLLMService
 
 ## RoutingLLMService文件详解
 
@@ -177,7 +177,7 @@ ChatClient client = clientsByProvider.get(target.provider); // "qwen" → QwenCh
 所以对于第一种chat模式的宏观完整调用链路：
 
 ```
-ChatService
+LLMService
 
 ↓
 
@@ -415,8 +415,6 @@ streamChat 循环体内:
 ## ModelSelector文件详解
 
 **重点关注：它到底如何生成这个 List\<ModelTarget>。**
-
-&#x20;
 
 也就是：
 
@@ -712,7 +710,7 @@ private ModelTarget buildModelTarget(ModelCandidate candidate, Map<String, Provi
 
 ***
 
-## 八、小结：选择器的三层职责
+- 八、小结：选择器的三层职责
 
 ```
 第一层：档位解析（resolveTierName）     → 回答"这次请求属于哪个档位"
@@ -724,7 +722,372 @@ private ModelTarget buildModelTarget(ModelCandidate candidate, Map<String, Provi
 
 <br />
 
+## ModelHealthStore分析
+
+### 一、在infra-ai的整体架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        业务层                               │
+│              (LLMService / RoutingLLMService)               │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      路由决策层                             │
+│  1. ModelSelector  →  选出候选模型列表                      │
+│  2. ModelHealthStore → 过滤掉不健康的模型（熔断中）         │
+│  3. RoutingExecutor  → 遍历候选，执行故障转移              │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    执行层 (ChatClient)                      │
+│              clientsByProvider["qwen"] → QwenClient         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+`ModelHealthStore` 位于 **路由决策层**，在 `RoutingExecutor` 遍历候选之前/过程中被调用，用来**决定是否跳过某个候选**。
+
+阅读源码，ModelHealthStore在上下层之间的联动过程：
+
+```
+RoutingExecutor 开始遍历候选列表
+    │
+    ▼
+对每个 ModelTarget:
+    │
+    ├─ 调用 ModelHealthStore.allowCall(modelId)
+    │       │
+    │       ▼
+    │   ┌─────────────────────────────────────────────┐
+    │   │  State.CLOSED (正常) → 返回 CallPermit     │
+    │   │  直接执行 → 成功则 markSuccess()           │
+    │   │           → 失败则 markFailure()           │
+    │   ├─────────────────────────────────────────────┤
+    │   │  State.OPEN (熔断中)                       │
+    │   │  检查 openUntil 是否已过                   │
+    │   │  未过 → 返回 null（拒绝调用，跳过此候选） │
+    │   │  已过 → 进入 HALF_OPEN（半开探测）        │
+    │   ├─────────────────────────────────────────────┤
+    │   │  State.HALF_OPEN (半开)                    │
+    │   │  允许一个探测请求通过（halfOpenInFlight）  │
+    │   │  成功 → markSuccess() → 恢复 CLOSED       │
+    │   │  失败 → markFailure() → 回到 OPEN         │
+    │   └─────────────────────────────────────────────┘
+```
+
+***
+
+### 二、方法分析
+
+- CallPermit() : 模型调用许可，halfOpenToken 为 0 时不持有**半开探测名额**
+- isUnavailable() : 判断这个模型当前是否不可用，核心逻辑体现在State==OPEN且openUntil没有超过当前时间。
+  - System.currentTimeMillis()：当前时间，会转化为一个数字
+  - openUntil：在初始化时定义的属性，意思是解除熔断时间
+    ```Java
+    public boolean isUnavailable(String id) {
+            ModelHealth health = healthById.get(id);  //由ID获得健康状态
+            if (health == null) {   //在遍历候选ModelTarget时一直没失败，则说明可用
+                return false;
+            }
+            //如果健康state是OPEN且当前时间<解除熔断时间，则说明还需要熔断，模型不可用
+            if (health.state == State.OPEN && health.openUntil > System.currentTimeMillis()) {
+                return true;
+            }
+           // 如果当前状态是 HALF_OPEN，并且此时正有一个探测请求在执行（halfOpenInFlight = true），那么返回 true（不可用）；否则返回 false（可用）
+            return health.state == State.HALF_OPEN && health.halfOpenInFlight;
+        }
+    ```
+- allowCall() : 根据model\_id
+  - 状态 CLOSED：允许调用模型，返回CallPermit(id,0)
+  - 状态 OPEN：判断熔断时间没结束
+  - 时间结束：进入HALF\_OPEN，抢占探测资格(halfOpenInFlight=True)，生成halfOpenToken，返回CallPermit
+- markSuccess():调用成功，恢复健康
+- markFailure():
+- releaseHalfOpenPermit(): 释放当前凭证持有的半开探测名额
+
 <br />
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  RoutingExecutor 遍历候选                       │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+              ┌───────────────────────────────┐
+              │  1. isUnavailable(modelId)    │ ← 快速过滤（批量跳过）
+              │  返回 true → 直接跳过候选      │
+              └───────────────────────────────┘
+                              │ false
+                              ▼
+              ┌───────────────────────────────┐
+              │  2. allowCall(modelId)        │ ← 精细许可（原子操作）
+              │  返回 null → 拒绝调用          │
+              │  返回 CallPermit → 继续执行    │
+              └───────────────────────────────┘
+                              │ CallPermit
+                              ▼
+              ┌───────────────────────────────┐
+              │  3. 执行 client.chat()        │
+              └───────────────────────────────┘
+                     /                    \
+                  成功                     失败
+                    │                      │
+                    ▼                      ▼
+    ┌───────────────────────┐  ┌───────────────────────┐
+    │ 4. markSuccess(id)    │  │ 5. markFailure(id)    │
+    │   重置失败计数         │  │   累加失败计数         │
+    │   进入 CLOSED          │  │   达到阈值 → OPEN     │
+    └───────────────────────┘  └───────────────────────┘
+                              │
+                              ▼
+              ┌───────────────────────────────┐
+              │  6. releaseHalfOpenPermit()   │ ← 释放探测名额
+              │  仅在 HALF_OPEN 时有效         │
+              └───────────────────────────────┘
+```
+
+<br />
+
+# Provider层分析
+
+## AbstractOpenaAIStyleChatClient是LLM Gateway / Model Adapter 层
+
+AbstractOpenaAIStyleChatClient的作用就是\*\*屏蔽不同大模型厂商 API 差异，\*\*它解决的是一个更大的工程问题：
+
+&#x20;
+
+> **如何让上层业务不用关心底层到底是 OpenAI、Qwen、Ollama、DeepSeek 还是企业内部模型。**
+
+- &#x20;doChat()：展示调用LLM的一次过程。由于千问，deepseek，openai或者ollama都是一样的流程，故进行抽象封装。
+  - // 1. 拿配置（校验 provider 是否存在）
+  -
+    // 2. 检查 API Key（如果 requiresApiKey 是 true，且 Key 为空就抛异常）
+  -
+    // 3. 构造请求体（把 ChatRequest 转成 OpenAI 标准 JSON）
+  -
+    // 4. 构造 HTTP 请求（加 Header + Bearer Token）
+  -
+    // 5. 发请求（拿到响应流）
+  -
+    // 6. 判断 HTTP 状态码（非 2xx 抛异常）
+  -
+    // 7. 解析 JSON 响应体
+  - // 8. 提取 content（校验 choices\[0].message.content 是否存在且非空）
+- requiresApiKey()：是否要求提供API key，ollama是本地，后续在写ollama.py时就需要单独重写函数。
+- buildRequestBody( ChatRequest request, ModelTarget target, boolean stream)：将我内部的ChatRequest转化为Openai能识别的请求体格式。
+- isReasoningEnabledForStream():决定要不要解析 `reasoning_content`（DeepSeek-R1 / QwQ 的思考过程）。默认跟着请求的 `thinking` 标志走。
+- customizeRequestBody(JsonObject body, ChatRequest request):让子类（如 Qwen）可以在请求体里塞**私有字段**。比如 Qwen 要用 `enable_thinking`，OpenAI 不需要。
+- **`doStreamChat:流式输出，和doChat()有新增内容：`**
+  - // 1. 鉴权 & 构造请求（同步）
+  -
+    &#x20;   // 2. 发起流式 Call
+  - // 3. 开启链路追踪 Span
+  - // 4. 把耗时任务扔进线程池 (modelStreamExecutor) 去跑，主线程立刻返回一个“取消句柄”
+  - // 5. 返回取消句柄（调用方可以随时点“停止生成”）
+  - 但是，Python 里你的 `stream_chat` 直接就是 `async` 的，**不需要线程池**，直接 `await client.stream()` + `async for line` 即可。
+
+```
+1. 获取provider配置
+
+2. 检查apikey
+
+3. 构造request body
+
+4. HTTP请求
+
+5. 判断HTTP状态
+
+6. 解析JSON
+
+7. 提取content
+
+8. 返回文本
+```
+
+<br />
+
+<br />
+
+<br />
+
+<br />
+
+<br />
+
+对于openai\_style.py文件的说明：
+
+严格来说应该：
+
+&#x20;
+
+```
+from abc import ABC, abstractmethod
+
+
+class OpenAIStyleChatClient(
+    BaseChatClient,
+    ABC
+):
+```
+
+然后：
+
+```
+@abstractmethod
+@property
+def provider(self):
+    pass
+```
+
+原因：你现在虽然注释说：
+
+> Qwen/OpenAI继承
+
+但是实际上，任何人都可以：
+
+```
+client = OpenAIStyleChatClient()
+```
+
+虽然功能不完整。这是面向对象约束问题。建议后续改。
+
+***
+
+# httpx 连接池配置优化建议
+
+## 一、当前配置现状
+
+```python
+limits=httpx.Limits(
+    max_keepalive_connections=20,   # 空闲连接池大小
+    max_connections=50,              # 最大并发连接数
+)
+```
+
+### 参数含义
+
+| 参数                          | 含义                        | 当前值 |
+| :-------------------------- | :------------------------ | :-- |
+| `max_keepalive_connections` | 连接池中**保持空闲**的最大连接数（超过则关闭） | 20  |
+| `max_connections`           | **同时打开**的最大连接数（含活跃+空闲）    | 50  |
+
+***
+
+## 二、不同并发场景评估
+
+| 场景        | 典型并发数  | 是否够用   | 说明          |
+| :-------- | :----- | :----- | :---------- |
+| 单用户/低并发   | ≤ 5    | ✅ 绰绰有余 | 开发/测试环境完全够用 |
+| 中等并发（小团队） | 10\~20 | ✅ 够用   | 接近上限但仍有余量   |
+| 中等并发（生产）  | 20\~50 | ⚠️ 刚好  | 建议预留余量      |
+| 高并发       | > 50   | ❌ 可能不足 | 可能出现连接等待/超时 |
+
+**核心瓶颈**：每个 Provider（Qwen/OpenAI/Ollama）各有独立连接池，总连接数 = 50 × N，但隔离意味着无法共享资源。
+
+***
+
+## 三、优化方案
+
+### 方案一：共享连接池（推荐）
+
+**做法**：所有 Provider 使用同一个全局连接池。
+
+```python
+_SHARED_HTTP_CLIENT: httpx.AsyncClient | None = None
+
+def get_shared_http_client() -> httpx.AsyncClient:
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is None:
+        _SHARED_HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout=30.0, connect=10.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=50,
+                max_connections=200,
+            ),
+            http2=True,
+        )
+    return _SHARED_HTTP_CLIENT
+```
+
+**收益**：
+
+- 所有 Provider 共享连接池，按总量统一控制
+- 内存占用更低（一个连接池 vs 多个）
+- 支持 HTTP/2 多路复用，连接效率更高
+
+**适用场景**：所有 Provider 对网络质量要求相似的场景。
+
+### 方案二：独立池 + 差异化配置
+
+**做法**：根据 Provider 特性配置不同参数。
+
+| Provider   | 建议 `max_connections` | 理由             |
+| :--------- | :------------------- | :------------- |
+| Qwen（阿里云）  | 100                  | 国内直连，稳定性好      |
+| OpenAI     | 50                   | 有速率限制，连接过多反被限流 |
+| Ollama（本地） | 20                   | 本地模型，并发受硬件限制   |
+
+### 方案三：可配置化（最佳实践）
+
+**做法**：连接池参数从配置文件读取，方便调优。
+
+```python
+def __init__(
+    self,
+    http_client: httpx.AsyncClient | None = None,
+    max_connections: int = 50,
+    max_keepalive: int = 20,
+):
+    self._http_client = http_client or httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_keepalive_connections=max_keepalive,
+            max_connections=max_connections,
+        ),
+        timeout=httpx.Timeout(timeout=30.0, connect=10.0),
+    )
+```
+
+***
+
+## 四、超时配置注意事项
+
+当前通过 `target.timeout_ms` 控制请求级超时，httpx 支持的三个超时维度：
+
+| 超时类型      | 含义     | 建议值               |
+| :-------- | :----- | :---------------- |
+| `connect` | 建立连接超时 | 10 秒（固定）          |
+| `read`    | 读取响应超时 | 由 `timeout_ms` 控制 |
+| `write`   | 发送请求超时 | 由 `timeout_ms` 控制 |
+
+**注意**：Java 中通过 `syncClientByTimeout` 缓存不同超时的 OkHttpClient，是为了避免每次 `newBuilder()` 重建连接池的开销。httpx 支持**请求级 timeout**，直接传参即可，**无需缓存**。
+
+***
+
+## 五、监控建议
+
+建议在生产环境监控以下指标：
+
+1. **连接池活跃连接数**（判断是否达到上限）
+2. **连接等待时间**（判断是否有排队）
+3. **连接超时率**（判断超时配置是否合理）
+4. **请求成功率**（判断网络稳定性）
+
+可通过 `httpx.AsyncClient` 的 `limits` 属性和自定义中间件收集。
+
+***
+
+## 六、结论
+
+| 场景               | 建议配置                |
+| :--------------- | :------------------ |
+| 开发/测试            | 保持当前配置（50/20）       |
+| 小规模生产（<20 并发）    | 保持当前配置或共享连接池        |
+| 中等规模生产（20-50 并发） | **改为共享连接池**（200/50） |
+| 大规模生产（>50 并发）    | 共享连接池 + 可配置化调优      |
+
+**最终推荐**：采用**共享连接池 + 可配置化**方案，既满足当前需求，又为未来扩展预留空间。httpx 的连接池复用能力优于 OkHttp（支持 HTTP/2 多路复用），200 连接在 Python 异步下完全可以支撑数百 QPS。
 
 ## 6. 总结与后续动作
 

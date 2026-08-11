@@ -25,8 +25,8 @@ core.llm.providers.base - AI 模型客户端抽象协议（对应 ragent 的 Cha
 
 使用规范：
     - 业务层（RAG Pipeline）不应直接依赖本接口的具体实现，而应通过
-      core/llm/chat.py 中的 ChatService 门面进行调用。
-    - 本接口的实现类应注册到 ChatService 的 clients 字典中，
+      core/llm/chat.py 中的 RoutingLLMService 门面进行调用。
+    - 本接口的实现类应注册到 RoutingLLMService 的 clients 列表中，
       以 provider 属性值作为键名。
 """
 
@@ -65,7 +65,7 @@ class BaseChatClient(ABC):
         返回当前客户端的供应商标识符。
 
         该属性用于路由层在运行时进行精准匹配：
-            当 ChatService 收到一个指定 provider="qwen" 的请求时，
+            当 RoutingLLMService 收到一个指定 provider="qwen" 的请求时，
             它会遍历所有已注册的 BaseChatClient 实例，找到
             client.provider == "qwen" 的那个，然后将请求转发给它。
 

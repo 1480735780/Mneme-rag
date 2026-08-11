@@ -19,7 +19,7 @@
 
 | 特性 | 说明 | 状态 |
 |------|------|------|
-| LLM 对话门面 | `ChatService` 统一同步/流式调用，屏蔽供应商差异 | ✅ 已实现 |
+| LLM 对话门面 | `RoutingLLMService` 统一同步/流式调用，屏蔽供应商差异 | ✅ 已实现 |
 | 数据契约 | `ChatRequest` / `Message` / `SourceRef` / `GroundingChunk` 类型安全建模 | ✅ 已实现 |
 | YAML 配置体系 | 供应商/模型候选/档位/熔断参数，支持 `${ENV}` 占位符与缺失告警 | ✅ 已实现 |
 | 流式回调 | `StreamCallback` 增量推送（内容/思考/来源/完成/异常） | ✅ 已实现 |
@@ -97,19 +97,25 @@ print(cfg.chat.tiers["deep"].candidates)  # 深度思考档候选
 
 ```python
 import asyncio
-from core.llm.chat import ChatService
-from core.llm.schema import Message
+from core.llm.chat import RoutingLLMService
+from core.llm.schema import ChatRequest, Message
 from core.llm.config.config import load_config_from_yaml
+from core.llm.model.health_store import ModelHealthStore
+from core.llm.model.selector import ModelSelector
+from core.llm.model.routing_executor import RoutingExecutor
 
 async def main():
     cfg = load_config_from_yaml("core/llm/config/ai.yaml")
-    # clients 字典在供应商客户端（providers/）实现后注入；
-    # 当前可用 FakeClient 或等待 providers 落地
-    chat_service = ChatService(clients={...}, config=cfg)
-    reply = await chat_service.chat(
-        messages=[Message.user("介绍一下 RAG")],
-        provider="qwen",
-        model="qwen-max",
+    health = ModelHealthStore(failure_threshold=2, open_duration_ms=30000)
+    selector = ModelSelector(cfg, health)
+    executor = RoutingExecutor(health)
+    # 供应商客户端（providers/）实现后注入到 clients 列表
+    service = RoutingLLMService(
+        selector=selector, health_store=health, executor=executor,
+        clients=[...],  # 例如 [QwenChatClient(), OpenAIChatClient()]
+    )
+    reply = await service.chat(
+        ChatRequest(messages=[Message.user("介绍一下 RAG")], maxTokens=256),
     )
     print(reply)
 

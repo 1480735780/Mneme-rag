@@ -13,7 +13,7 @@ mneme-rag 的模型接入与流水线核心，等价于 ragent 的 `infra-ai` �
 
 | 文件 | 说明 | 状态 |
 |------|------|------|
-| `llm/chat.py` | `ChatService` 对话门面：统一同步/流式入口，屏蔽客户端查找与 `ModelTarget` 构造 | ✅ 已实现 |
+| `llm/chat.py` | `RoutingLLMService` 对话门面：统一同步/流式入口，屏蔽客户端查找与 `ModelTarget` 构造 | ✅ 已实现 |
 | `llm/base.py` | `BaseChatClient` 抽象协议（对应 ragent `ChatClient` 接口） | ✅ 已实现 |
 | `llm/schema.py` | 数据契约：`Message` / `ChatRequest` / `SourceRef` / `GroundingChunk` | ✅ 已实现 |
 | `llm/callback.py` | `StreamCallback` 流式回调接口 + `BaseStreamCallback` 默认空实现 | ✅ 已实现 |
@@ -52,7 +52,7 @@ agent/（规划执行） ──►  core/pipeline（流水线）      ──► 
 
 ## 使用说明与注意事项
 
-1. **业务层隔离**：业务代码不应直接依赖 `providers/` 具体实现，一律通过 `llm/chat.py` 的 `ChatService` 门面调用；
-2. **模型目标构造**：`ChatService` 已内置 `ModelTarget` 构造（含全局配置解析），不要在业务层手工拼装；
+1. **业务层隔离**：业务代码不应直接依赖 `providers/` 具体实现，一律通过 `llm/chat.py` 的 `RoutingLLMService` 门面调用；
+2. **模型目标构造**：`RoutingLLMService` 已内置 `ModelTarget` 构造（含全局配置解析），不要在业务层手工拼装；
 3. **命名注意**：`llm/monitor.py` 为正式文件名，目录中历史遗留的 `moniter.py`（拼写错误）待清理；
 4. 实现 `providers/` 时请继承 `base.py` 的 `BaseChatClient`，并在 `openai_style.py` 中沉淀 OpenAI 兼容协议的公共逻辑（请求体构建 / SSE 解析 / 鉴权）。

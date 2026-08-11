@@ -16,9 +16,9 @@
 ```
 业务层 (pipeline.py)
     │
-    │ 1. 调用: chat_service.chat(provider="qwen", messages=[...])
+    │ 1. 调用: service.chat(ChatRequest(...))  # RoutingLLMService
     ▼
-chat.py (ChatService)
+chat.py (RoutingLLMService)
     │
     │ 2. 内部执行: client = self._clients["qwen"]
     │    (注意：这里只是字典取值，根本没有调用 base.py)

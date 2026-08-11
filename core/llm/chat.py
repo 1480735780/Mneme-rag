@@ -1,89 +1,321 @@
 # -*- coding: utf-8 -*-
 """
-core.llm.chat - AI 对话服务门面（Facade）
+core.llm.chat - LLM 对话服务（对应 ragent 的 LLMService / RoutingLLMService）
 
-本模块是 RAG 业务层（如 core/pipeline/rag_pipeline.py）与底层模型客户端之间
-的唯一交互入口。它屏蔽了具体的客户端查找、ModelTarget 构造等细节，
-使业务层只需要关注 "发什么消息" 和 "用哪个供应商/模型"。
+本模块定义路由式 LLM 服务访问入口：
+
+RoutingLLMService（推荐）
+   对齐 ragent 的 RoutingLLMService.java：
+   - 注入 ModelSelector / ModelHealthStore / RoutingExecutor 与 clients 列表，
+     启动时构建 clients_by_provider 注册表（含重复 provider fail-fast）；
+   - 通过档位 / thinking / preferred 让 selector 产出候选，交给 executor 故障转移；
+   - 提供 4 种变体（默认档 / 显式档位 / 档位+优先模型 / 流式），
+     Python 以默认参数形式折叠为 chat 与 stream_chat 两个方法；
+   - 另提供 chat_direct / stream_chat_direct 便捷方法：按 provider / model
+     直接定位单一客户端（不经过档位选择与故障转移），供业务层快捷调用。
 
 架构对应关系：
     Ragent (Java)              Mneme-rag (Python)
     ──────────────────────────────────────────────────
-    LLMService (调度层)   -->  core/llm/chat.py (ChatService)
-    ChatClient (接口)      -->  core/llm/providers/base.py (BaseChatClient)
-    QwenClient (实现)      -->  core/llm/providers/qwen.py (QwenClient)
-
-职责：
-    1. 根据 provider 名称查找已注册的 BaseChatClient 实例。
-    2. 将业务层的简单参数（provider, model）组装成 ModelTarget。
-    3. 统一处理超时、重试策略（可集成 tenacity 或自定义）。
-    4. 提供简易的快捷方法，避免业务层每次都手动构造 ChatRequest。
-
-后续安排：
-    1. 补全chat模式，ragent中的LLMService有四种，分别对应四种不同的chat模式。
-        增加tier档位和优先模型选择这两种模式
-    
+    LLMService (接口)    -->  core/llm/chat.py (LLMService)
+    RoutingLLMService    -->  core/llm/chat.py (RoutingLLMService)
+    ChatClient           -->  core/llm/providers/base.py (BaseChatClient)
 """
 
+import asyncio
+import logging
+from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Dict, List, Optional
 
+from .callback import BaseStreamCallback, StreamCallback
+from .config.config import AIModelConfig, ModelCandidate, ProviderConfig
+from .enums import ModelCapability, Tier
+from .model.health_store import ModelHealthStore
+from .model.model_target import ModelTarget
+from .model.routing_executor import RoutingExecutionError, RoutingExecutor
+from .model.selector import ModelSelector
 from .providers.base import BaseChatClient
 from .schema import ChatRequest, Message
-from core.llm.config.config import AIModelConfig, ModelCandidate, ProviderConfig
-from core.llm.model.model_target import ModelTarget
-from .callback import StreamCallback
+
+logger = logging.getLogger(__name__)
 
 
-class ChatService:
+# ============================================================================
+# 流式首包桥（ProbeStreamBridge 简化 asyncio 版，对应 Java ProbeStreamBridge）
+# ============================================================================
+
+
+class ProbeResult(Enum):
+    """流式候选结果（对应 Java ProbeResult.Type）。"""
+    SUCCESS = "success"          # 已产出首包内容（首个 content/thinking）
+    ERROR = "error"              # on_error 或异常
+    NO_CONTENT = "no_content"    # on_complete 但无任何内容
+
+
+class ProbeStreamBridge(BaseStreamCallback):
     """
-    AI 对话服务门面（对应 ragent 的 LLMService）。
+    流式首包桥（对应 Java 的 ProbeStreamBridge）。
 
-    持有所有已注册的模型客户端（通过构造器注入），并对外提供
-    统一的 chat / stream_chat 方法。
+    包装下游 callback，缓冲"首包之前"的回调；一旦收到首个 content/thinking
+    即提交缓冲并进入增量转发模式。首包之前出现 on_error / 无内容完成视为该候选失败，
+    缓冲被丢弃、不污染下游（中间候选的失败不会上报给业务层）。
 
-    使用示例：
-        # 1. 初始化（通常在应用启动时完成）
-        clients = {
-            "qwen": QwenChatClient(config),
-            "openai": OpenAIChatClient(config),
-        }
-        chat_service = ChatService(clients)
+    语义对齐 Java：
+        - 首包（content/thinking）→ SUCCESS，提交缓冲，后续增量直通下游；
+        - 首包前 on_complete（空流）→ NO_CONTENT，失败，丢弃缓冲；
+        - 首包前 on_error → ERROR，失败，丢弃缓冲；
+        - 成功后 on_error → 已提交，直通下游（由下游自行处理）。
+    """
 
-        # 2. 在 RAG Pipeline 中使用
-        messages = [
-            Message(role="system", content="你是助手"),
-            Message(role="user", content="介绍一下 RAG")
-        ]
-        reply = await chat_service.chat(
-            messages=messages,
-            provider="qwen",
-            model="qwen-max",
-            temperature=0.7
-        )
+    def __init__(self, downstream: StreamCallback) -> None:
+        self._downstream = downstream
+        self._buffer: List = []
+        self._committed = False
+        self.succeeded = False
+        self.result: ProbeResult = ProbeResult.NO_CONTENT
+        self.error: Optional[BaseException] = None
+
+    # ---- 缓冲/提交 ----
+
+    async def _emit(self, action) -> None:
+        """未提交则缓冲，已提交则立即执行。"""
+        if self._committed:
+            await action()
+        else:
+            self._buffer.append(action)
+
+    async def _commit(self) -> None:
+        """提交缓冲（首包到达时），按序执行缓冲动作。"""
+        if self._committed:
+            return
+        self._committed = True
+        for action in self._buffer:
+            await action()
+        self._buffer.clear()
+
+    def _mark_success(self) -> None:
+        self.succeeded = True
+        self.result = ProbeResult.SUCCESS
+
+    # ---- 生命周期 ----
+
+    async def on_start(self) -> None:
+        await self._emit(self._downstream.on_start)
+
+    async def on_reply_to_message_id(self, message_id: str) -> None:
+        await self._emit(lambda: self._downstream.on_reply_to_message_id(message_id))
+
+    async def on_sources(self, sources) -> None:
+        await self._emit(lambda: self._downstream.on_sources(sources))
+
+    async def on_grounding_chunks(self, chunks) -> None:
+        await self._emit(lambda: self._downstream.on_grounding_chunks(chunks))
+
+    async def on_content(self, token: str) -> None:
+        self._mark_success()
+        await self._commit()
+        await self._downstream.on_content(token)
+
+    async def on_thinking(self, token: str) -> None:
+        self._mark_success()
+        await self._commit()
+        await self._downstream.on_thinking(token)
+
+    async def on_complete(self) -> None:
+        if self.succeeded:
+            # 已产出内容 → 正常结束，转发 on_complete
+            await self._downstream.on_complete()
+        else:
+            # 无内容完成 → NO_CONTENT 失败，丢弃缓冲
+            self.result = ProbeResult.NO_CONTENT
+            self._buffer.clear()
+
+    async def on_error(self, error: Exception) -> None:
+        self.result = ProbeResult.ERROR
+        self.error = error
+        if self.succeeded:
+            # 成功之后才出错 → 已提交，直通下游
+            await self._downstream.on_error(error)
+        else:
+            # 首包前出错 → 丢弃缓冲，不污染下游
+            self._buffer.clear()
+
+
+# ============================================================================
+# LLMService 接口
+# ============================================================================
+
+
+class LLMService(ABC):
+    """
+    通用大模型访问接口（对应 Java 的 LLMService）。
+
+    为业务层提供统一的大模型访问能力，屏蔽不同厂商/协议的差异。
+    """
+
+    @abstractmethod
+    async def chat(
+        self,
+        request: ChatRequest,
+        tier: Optional[Tier] = None,
+        preferred_model_id: Optional[str] = None,
+    ) -> str:
+        """
+        同步调用（对应 Java 的三个 chat 重载，Python 以默认参数折叠）。
+
+        Args:
+            request: 包含完整配置的请求对象。
+            tier: 显式档位覆盖（如 Tier.FAST）；None 走默认/深度思考档。
+            preferred_model_id: 优先模型 id；空则走档位候选。
+
+        Returns:
+            str: 模型返回的完整回答。
+        """
+        pass
+
+    @abstractmethod
+    async def stream_chat(
+        self,
+        request: ChatRequest,
+        callback: StreamCallback,
+    ) -> None:
+        """
+        流式调用（对应 Java 的 streamChat）。
+
+        所有增量内容通过 callback.on_content() 回调，结束调用 on_complete()，
+        异常调用 on_error()。
+
+        Args:
+            request: 完整配置的请求对象。
+            callback: 流式回调接口。
+        """
+        pass
+
+
+# ============================================================================
+# RoutingLLMService 实现
+# ============================================================================
+
+
+class RoutingLLMService(LLMService):
+    """
+    路由式 LLM 服务实现（对应 Java 的 RoutingLLMService）。
+
+    通过档位 / thinking / preferred 选择候选，经 RoutingExecutor 故障转移调用。
+    流式调用按候选逐个尝试：首包成功即提交并继续，失败（错误/无内容）切换到下一候选。
+
+    Args:
+        selector: 模型选择器。
+        health_store: 健康状态存储（熔断）。
+        executor: 路由执行器（故障转移调度）。
+        clients: 所有 ChatClient 实例列表；启动时构建 clients_by_provider 注册表，
+            重复 provider 会抛 ValueError（fail-fast，区别于 Java 的静默覆盖）。
+        config: 全局 AI 模型配置（可选）。传入后 chat_direct / stream_chat_direct
+            构造 ModelTarget 时提供商配置从此解析；未传入或未登记时回退占位配置。
     """
 
     def __init__(
         self,
-        clients: Dict[str, BaseChatClient],
+        selector: ModelSelector,
+        health_store: ModelHealthStore,
+        executor: RoutingExecutor,
+        clients: List[BaseChatClient],
         config: Optional[AIModelConfig] = None,
-    ):
-        """
-        初始化对话服务。
-
-        Args:
-            clients: 供应商名称 -> 客户端实例的映射。
-                    例如：{"qwen": QwenClient(), "openai": OpenAIClient()}
-                    名称需与 ModelTarget.provider 严格匹配。
-            config:  全局 AI 模型配置（可选）。传入后构造 ModelTarget 时
-                    提供商配置（ProviderConfig）会从配置中解析；
-                    未传入或提供商未登记时回退到占位配置。
-        """
-        self._clients = clients
+    ) -> None:
+        self._selector = selector
+        self._health_store = health_store
+        self._executor = executor
         self._config = config
+        self._clients_by_provider: Dict[str, BaseChatClient] = self._build_registry(clients)
 
-    # ==================== 同步聊天（完整返回） ====================
+    # ==================== 同步调用 ====================
 
     async def chat(
+        self,
+        request: ChatRequest,
+        tier: Optional[Tier] = None,
+        preferred_model_id: Optional[str] = None,
+    ) -> str:
+        """同步调用，经 selector 选候选 + executor 故障转移。"""
+        return await self._executor.execute_with_fallback(
+            ModelCapability.CHAT,
+            self._selector.select_chat_candidates(
+                bool(request.thinking),
+                override=tier,
+                preferred_model_id=preferred_model_id,
+            ),
+            lambda t: self._clients_by_provider.get(t.candidate.provider),
+            lambda client, t: client.chat(request, t),
+        )
+
+    # ==================== 流式调用 ====================
+
+    async def stream_chat(
+        self,
+        request: ChatRequest,
+        callback: StreamCallback,
+    ) -> None:
+        """
+        流式调用，带候选级故障转移（对应 Java 的 RoutingLLMService.streamChat）。
+
+        逐候选尝试：
+            - 首包成功（ProbeStreamBridge 提交）→ 持续流式输出，成功返回；
+            - 失败（错误 / 无内容）→ mark_failure 并切换下一候选；
+            - 全部失败 → 回调 on_error 并抛 RoutingExecutionError。
+        中间候选的失败不会上报下游（由 ProbeStreamBridge 丢弃缓冲）。
+        """
+        targets = self._selector.select_chat_candidates(bool(request.thinking))
+        if not targets:
+            raise RoutingExecutionError("No Chat model candidates available")
+
+        last_error: Optional[BaseException] = None
+        for target in targets:
+            client = self._clients_by_provider.get(target.candidate.provider)
+            if client is None:
+                logger.warning(
+                    "Chat provider client missing: provider=%s, modelId=%s",
+                    target.candidate.provider, target.id,
+                )
+                continue
+
+            permit = self._health_store.allow_call(target.id)
+            if permit is None:
+                continue  # 熔断中（执行期双保险），跳过该候选
+
+            bridge = ProbeStreamBridge(callback)
+            try:
+                await client.stream_chat(request, bridge, target)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                bridge.result = ProbeResult.ERROR
+                bridge.error = e
+            finally:
+                self._health_store.release_half_open_permit(permit)
+
+            if bridge.result == ProbeResult.SUCCESS:
+                self._health_store.mark_success(target.id)
+                return
+
+            self._health_store.mark_failure(target.id)
+            last_error = bridge.error or last_error
+            logger.warning(
+                "Chat stream failed, fallback to next. modelId=%s, provider=%s, result=%s",
+                target.id, target.candidate.provider, bridge.result.value,
+            )
+
+        error = RoutingExecutionError(
+            f"All Chat model candidates failed: "
+            f"{last_error if last_error is not None else 'unknown'}",
+            cause=last_error,
+        )
+        await callback.on_error(error)
+        raise error
+
+    # ==================== 便捷直连（按 provider / model 定位） ====================
+
+    async def chat_direct(
         self,
         messages: List[Message],
         provider: str,
@@ -110,12 +342,7 @@ class ChatService:
             system_prompt: 系统提示词（会被自动插入 messages 开头）。
             timeout_ms: 本次请求的超时时间（毫秒），覆盖客户端默认值。
 
-        Returns:
-            str: 模型生成的完整回答。
-
-        Raises:
-            KeyError: 如果 provider 未注册。
-            ModelClientException: 网络/鉴权/模型错误。
+        保留原简易门面的便捷语义，供业务层快捷调用。
         """
         # 1. 构造 ChatRequest
         request = self._build_request(messages, system_prompt, temperature, top_p, max_tokens)
@@ -127,9 +354,7 @@ class ChatService:
         client = self._get_client(provider)
         return await client.chat(request, target)
 
-    # ==================== 流式聊天（增量回调） ====================
-
-    async def stream_chat(
+    async def stream_chat_direct(
         self,
         messages: List[Message],
         provider: str,
@@ -157,6 +382,7 @@ class ChatService:
             max_tokens: 最大输出 Token 数。
             system_prompt: 系统提示词。
             timeout_ms: 超时时间（毫秒）。
+        流式直连：按 provider / model 直接定位单一客户端，不经过档位选择与故障转移。
         """
         request = self._build_request(messages, system_prompt, temperature, top_p, max_tokens)
         target = self._build_target(provider, model, timeout_ms)
@@ -167,13 +393,12 @@ class ChatService:
     # ==================== 私有辅助方法 ====================
 
     def _get_client(self, provider: str) -> BaseChatClient:
-        """根据供应商名称查找客户端，未找到则抛出 KeyError。"""
-        if provider not in self._clients:
+        if provider not in self._clients_by_provider:
             raise KeyError(
                 f"未注册的模型供应商: {provider}。"
-                f"已注册: {list(self._clients.keys())}"
+                f"已注册: {list(self._clients_by_provider.keys())}"
             )
-        return self._clients[provider]
+        return self._clients_by_provider[provider]
 
     def _build_target(
         self,
@@ -228,3 +453,21 @@ class ChatService:
             topP=top_p,
             maxTokens=max_tokens,
         )
+
+    # ==================== 注册表 ====================
+
+    @staticmethod
+    def _build_registry(clients: List[BaseChatClient]) -> Dict[str, BaseChatClient]:
+        """
+        构建 clients_by_provider 注册表（对应 Java 的 Collectors.toMap）。
+
+        与 Java 静默覆盖不同，此处显式检测重复 provider 并抛 ValueError（fail-fast），
+        避免同一 provider 被多个客户端注册导致路由歧义。
+        """
+        registry: Dict[str, BaseChatClient] = {}
+        for client in clients:
+            pid = client.provider
+            if pid in registry:
+                raise ValueError(f"重复的 provider 客户端注册: {pid}")
+            registry[pid] = client
+        return registry
