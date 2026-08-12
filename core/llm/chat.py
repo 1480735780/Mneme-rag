@@ -51,6 +51,7 @@ class ProbeResult(Enum):
     SUCCESS = "success"          # 已产出首包内容（首个 content/thinking）
     ERROR = "error"              # on_error 或异常
     NO_CONTENT = "no_content"    # on_complete 但无任何内容
+    TIMEOUT = "timeout"          # 首包等待超时（TTFT 超预算）
 
 
 class ProbeStreamBridge(BaseStreamCallback):
@@ -61,10 +62,15 @@ class ProbeStreamBridge(BaseStreamCallback):
     即提交缓冲并进入增量转发模式。首包之前出现 on_error / 无内容完成视为该候选失败，
     缓冲被丢弃、不污染下游（中间候选的失败不会上报给业务层）。
 
+    首包超时机制（对齐 Java 的 awaitFirstPacket）：
+        通过 asyncio.Event 实现：首包到达时 set()，await_first_packet(timeout)
+        在超时内等待该事件；超时则返回 TIMEOUT 结果，由调用方取消任务并切换候选。
+
     语义对齐 Java：
         - 首包（content/thinking）→ SUCCESS，提交缓冲，后续增量直通下游；
         - 首包前 on_complete（空流）→ NO_CONTENT，失败，丢弃缓冲；
         - 首包前 on_error → ERROR，失败，丢弃缓冲；
+        - 首包等待超时 → TIMEOUT，失败，由调用方 cancel 任务；
         - 成功后 on_error → 已提交，直通下游（由下游自行处理）。
     """
 
@@ -75,6 +81,7 @@ class ProbeStreamBridge(BaseStreamCallback):
         self.succeeded = False
         self.result: ProbeResult = ProbeResult.NO_CONTENT
         self.error: Optional[BaseException] = None
+        self._first_packet_event = asyncio.Event()
 
     # ---- 缓冲/提交 ----
 
@@ -97,6 +104,45 @@ class ProbeStreamBridge(BaseStreamCallback):
     def _mark_success(self) -> None:
         self.succeeded = True
         self.result = ProbeResult.SUCCESS
+        # 信号灯这是一个“只触发一次”的标志位。首包没到时，它是“未设置”状态，所有等待者会阻塞；
+        # 首包一到，它变为“已设置”，所有等待者被唤醒。
+        self._first_packet_event.set()     
+
+    # ---- 首包等待（对齐 Java awaitFirstPacket）----
+
+    async def await_first_packet(self, timeout_s: Optional[float]) -> ProbeResult:
+        """
+        等待首包到达，超时返回 TIMEOUT（对应 Java 的 awaitFirstPacket）。
+
+        若 bridge 已有终态结果（ERROR / NO_CONTENT），直接返回当前结果；
+        否则等待 _first_packet_event，超时则设为 TIMEOUT。
+
+        Args:
+            timeout_s: 首包超时预算（秒）；None 表示不限制（退化为止等首包）。
+
+        Returns:
+            ProbeResult: SUCCESS / ERROR / NO_CONTENT / TIMEOUT。
+        """
+        # 1. 快速路径：如果已经有终态（ERROR/NO_CONTENT），直接返回，无需等待首包   
+        if self.result != ProbeResult.NO_CONTENT:
+            return self.result
+        try:
+            # 2. 核心等待：等待 Event 被 set，同时带超时
+            # 判断用户是否设置了超时
+            if timeout_s is not None:
+                #如果在 timeout_s 秒内 _first_packet_event 没有被 set()，就会抛出 asyncio.TimeoutError。
+                # 上层捕获这个异常后，就可以执行降级/切换备用模型等操作。
+                await asyncio.wait_for(self._first_packet_event.wait(), timeout=timeout_s)
+            else:
+                # 没用设置超时直接裸等 _first_packet_event.wait()，没有超时保护。
+                # 此时只能依赖外层的 HTTP 总超时（如 aiohttp 的 total_timeout），无法区分"连接成功但迟迟不出数据"和"正常生成中"。
+                await self._first_packet_event.wait()
+        except asyncio.TimeoutError:
+            # 3.只有设置超时时间才进行 超时处理：如果首包未到达，设为 TIMEOUT
+            if self.result == ProbeResult.NO_CONTENT:
+                self.result = ProbeResult.TIMEOUT
+            return self.result
+        return self.result
 
     # ---- 生命周期 ----
 
@@ -127,9 +173,10 @@ class ProbeStreamBridge(BaseStreamCallback):
             # 已产出内容 → 正常结束，转发 on_complete
             await self._downstream.on_complete()
         else:
-            # 无内容完成 → NO_CONTENT 失败，丢弃缓冲
+            # 无内容完成 → NO_CONTENT 失败，丢弃缓冲，唤醒等待者
             self.result = ProbeResult.NO_CONTENT
             self._buffer.clear()
+            self._first_packet_event.set()
 
     async def on_error(self, error: Exception) -> None:
         self.result = ProbeResult.ERROR
@@ -138,8 +185,9 @@ class ProbeStreamBridge(BaseStreamCallback):
             # 成功之后才出错 → 已提交，直通下游
             await self._downstream.on_error(error)
         else:
-            # 首包前出错 → 丢弃缓冲，不污染下游
+            # 首包前出错 → 丢弃缓冲，不污染下游，唤醒等待者
             self._buffer.clear()
+            self._first_packet_event.set()
 
 
 # ============================================================================
@@ -257,14 +305,19 @@ class RoutingLLMService(LLMService):
         callback: StreamCallback,
     ) -> None:
         """
-        流式调用，带候选级故障转移（对应 Java 的 RoutingLLMService.streamChat）。
+        流式调用，带候选级故障转移 + 首包超时（对应 Java 的 RoutingLLMService.streamChat）。
 
         逐候选尝试：
-            - 首包成功（ProbeStreamBridge 提交）→ 持续流式输出，成功返回；
-            - 失败（错误 / 无内容）→ mark_failure 并切换下一候选；
+            - 将 client.stream_chat 作为 asyncio Task 启动；
+            - bridge.await_first_packet(timeout) 等待首包：
+              · SUCCESS → await task 让流继续到完成，mark_success 返回；
+              · ERROR / NO_CONTENT → mark_failure 切换下一候选；
+              · TIMEOUT → cancel task，mark_failure 切换下一候选；
             - 全部失败 → 回调 on_error 并抛 RoutingExecutionError。
+        首包超时预算取 target.timeout_ms（对齐 Java firstPacketBudgetMs = target.timeoutMs()）。
         中间候选的失败不会上报下游（由 ProbeStreamBridge 丢弃缓冲）。
         """
+        
         targets = self._selector.select_chat_candidates(bool(request.thinking))
         if not targets:
             raise RoutingExecutionError("No Chat model candidates available")
@@ -284,19 +337,54 @@ class RoutingLLMService(LLMService):
                 continue  # 熔断中（执行期双保险），跳过该候选
 
             bridge = ProbeStreamBridge(callback)
+            first_packet_budget_s = (
+                target.timeout_ms / 1000 if target.timeout_ms else None
+            )
+            # 1. 启动后台流式任务（非阻塞）
+            # 启动流式任务（对应 Java 的 StreamAsyncExecutor.submit）
+            task = asyncio.create_task(
+                client.stream_chat(request, bridge, target)
+            )
             try:
-                await client.stream_chat(request, bridge, target)
+                # 2. 主协程挂起，等待首包结果（带超时）
+                # 等待首包或超时（对应 Java 的 awaitFirstPacket）
+                probe_result = await bridge.await_first_packet(first_packet_budget_s)
             except asyncio.CancelledError:
+                # 3. 外部取消（比如 HTTP 请求断开）
+                task.cancel()
                 raise
-            except Exception as e:
-                bridge.result = ProbeResult.ERROR
-                bridge.error = e
-            finally:
-                self._health_store.release_half_open_permit(permit)
 
-            if bridge.result == ProbeResult.SUCCESS:
-                self._health_store.mark_success(target.id)
-                return
+            if probe_result == ProbeResult.SUCCESS:
+                # 路径 A：首包成功 → 将 task 切回“等待完成”模式
+                try:
+                    await task # 此时流在后台继续，主协程等待它彻底结束
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # 流式中途出错（首包后），bridge 已提交 → on_error 已由 bridge 转发下游
+                    bridge.result = ProbeResult.ERROR
+                    bridge.error = e
+                finally:
+                    self._health_store.release_half_open_permit(permit)
+
+                if bridge.result == ProbeResult.SUCCESS:
+                    self._health_store.mark_success(target.id)
+                    return
+                # 首包后出错（bridge.on_error 已转发下游）
+                self._health_store.mark_failure(target.id)
+                last_error = bridge.error or last_error
+                logger.warning(
+                    "Chat stream failed after first packet. modelId=%s, provider=%s, result=%s",
+                    target.id, target.candidate.provider, bridge.result.value,
+                )
+                continue
+            # 路径 B：超时/错误/无内容 → 强制取消后台任务 切换下一候选
+            task.cancel()
+            try:
+                await task  #等待取消操作完成，清理资源
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._health_store.release_half_open_permit(permit)
 
             self._health_store.mark_failure(target.id)
             last_error = bridge.error or last_error

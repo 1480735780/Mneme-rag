@@ -14,11 +14,11 @@
 | P0 | RoutingLLMService（含注册表 + 4 模式 + 流式 fallback） | `infra/chat/RoutingLLMService.java` `LLMService.java` | `core/llm/chat.py` | ✅ 已完成 |
 | P0 | ChatTierConfigValidator（启动期档位校验） | `infra/model/ChatTierConfigValidator.java` | `core/llm/model/validator.py` | ✅ 已完成 |
 | P1 | 枚举统一（Tier / ModelProvider / ModelCapability） | `infra/enums/*.java` | `core/llm/enums.py` | ✅ 已完成 |
-| P1 | Embedding 能力层 | `infra/embedding/*.java` | `core/llm/embedding.py` + `providers/embedding/` | ⚠️ 空/缺失 |
+| P1 | Embedding 能力层 | `infra/embedding/*.java` | `core/llm/embedding.py` + `providers/*_embedding.py` | ✅ 已完成 |
 | P1 | Rerank 能力层 | `infra/rerank/*.java` | `core/llm/reranker.py` + `providers/rerank/` | ⚠️ 空/缺失 |
 | P2 | VLM 能力层（图生文） | `infra/vlm/*.java` | `core/llm/vlm.py`（新建） | ❌ 无文件 |
 | P2 | Token 统计 | `infra/token/*.java` | `core/llm/token.py`（新建） | ❌ 无文件 |
-| P2 | 流式首包探测 | `infra/chat/LlmFirstPacketProbe.java` `ProbeStreamBridge.java` | `core/llm/model/first_packet.py`（新建） | ⚠️ 部分完成 |
+| P2 | 流式首包探测 | `infra/chat/LlmFirstPacketProbe.java` `ProbeStreamBridge.java` | `core/llm/chat.py`（内联） | ✅ 已完成 |
 | P3 | 工具/清理 | `infra/util/*.java` | `common/` | ❌ 缺失 |
 | P3 | Ollama / SiliconFlow / AIHubMix 客户端 | `infra/chat/*ChatClient.java` | `core/llm/providers/*.py` | ⚠️ 部分空 |
 
@@ -117,7 +117,13 @@ LLMService（接口）
 
 ---
 
-## P1-2 Embedding 能力层
+## P1-2 Embedding 能力层 —— ✅ 已完成
+
+> 实施状态：`core/llm/embedding.py` 已实现 `EmbeddingService` 接口 + `RoutingEmbeddingService`
+> （复用 `ModelSelector` + `RoutingExecutor`，`clients_by_provider` 注册表 fail-fast）；
+> `providers/` 下已实现 `openai_style_embedding.py`（模板方法）、`siliconflow_embedding.py`、
+> `ollama_embedding.py`。详见 `tests/test_embedding_smoke.py`。
+> 分片后续优化方案见 `docs/embedding-batching-optimization.md`。
 
 ### 现状
 - `embedding.py` 空。
@@ -178,10 +184,11 @@ LLMService（接口）
 
 ---
 
-## P2-3 流式首包探测（TTFT）—— ⚠️ 部分完成
+## P2-3 流式首包探测（TTFT）—— ✅ 已完成
 
-> 实施状态：`ProbeStreamBridge` 已实现（首包提交缓冲），已接入 `RoutingLLMService.stream_chat` 用于候选级
-> 流式 fallback。**尚未实现** `LlmFirstPacketProbe` 的独立首包超时（TTFT budget）机制。
+> 实施状态：`ProbeStreamBridge` 已实现（asyncio.Event 首包事件 + `TIMEOUT` 结果 +
+> `await_first_packet(timeout)`），已接入 `RoutingLLMService.stream_chat` 作为候选级首包超时
+> fallback（超时预算取 `target.timeout_ms`）。详见 `tests/test_first_packet_smoke.py`。
 
 ### 现状
 - 无；`cancellation_handle.py` 空。
@@ -239,13 +246,31 @@ P1-2 / P1-3 / P2-1（Embedding/Rerank/VLM）相互独立，可并行
 P2-2 / P3-1 / P3-2 独立，可插空完成
 ```
 
-**建议推进顺序**：
-1. P1-1 枚举（前置，小改动，为后续铺路）
-2. P0-2 档位校验器（独立、风险低）
-3. P0-1 RoutingLLMService（核心，依赖枚举；流式变体可先接 P2-3）
-4. P2-3 首包探测
-5. P1-2 Embedding → P1-3 Rerank → P2-1 VLM
-6. P2-2 Token → P3-1 工具 → P3-2 客户端
+**推进阶段（基于当前实际状态）**：
+
+- 第一阶段 · 路由骨架（✅ 已完成）
+  1. ✅ P1-1 枚举统一
+  2. ✅ P0-2 档位校验器
+  3. ✅ P0-1 RoutingLLMService（含流式 fallback 基础）
+
+- 第二阶段 · 收尾路由能力（✅ 已完成）
+  4. ✅ P2-3 流式首包探测：`ProbeStreamBridge.await_first_packet` + 首包超时（TTFT budget）
+     已接入 `RoutingLLMService.stream_chat`
+
+- 第三阶段 · 三大能力层（Embedding 已完成，剩余 Rerank / VLM）
+  5. ✅ P1-2 Embedding 能力层（`embedding.py` + `openai_style_embedding.py` + `RoutingEmbeddingService`）
+  6. P1-3 Rerank 能力层（`reranker.py` + `RerankClient` + `RoutingRerankService`）—— **下一步**
+  7. P2-1 VLM 能力层（`vlm.py` + `VlmClient` + `RoutingVlmService`）
+
+- 第四阶段 · 横向能力（可插空）
+  8. P2-2 Token 统计（`token.py` + `TokenCounterService` + Heuristic 实现）
+  9. P3-1 工具/清理（`LLMResponseCleaner` + `LogSafe`）
+
+- 第五阶段 · 供应商补齐
+  10. P3-2 客户端（`OllamaChatClient` + `SiliconFlow` / `AIHubMix`）
+
+> 依赖要点：P2-3 依赖 P0-1（已满足）；Embedding / Rerank / VLM 复用 P1-1 的
+> `ModelCapability` 枚举与 executor / selector 基建。
 
 ---
 
