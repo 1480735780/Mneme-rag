@@ -20,18 +20,25 @@
 | 特性 | 说明 | 状态 |
 |------|------|------|
 | LLM 对话门面 | `RoutingLLMService` 统一同步/流式调用，屏蔽供应商差异 | ✅ 已实现 |
-| 数据契约 | `ChatRequest` / `Message` / `SourceRef` / `GroundingChunk` 类型安全建模 | ✅ 已实现 |
-| YAML 配置体系 | 供应商/模型候选/档位/熔断参数，支持 `${ENV}` 占位符与缺失告警 | ✅ 已实现 |
+| Embedding 向量化 | `RoutingEmbeddingService` + OpenAI 兼容模板，支持批量分片 | ✅ 已实现 |
+| Rerank 精排 | `RoutingRerankService` + 百炼/Noop 客户端，`RetrievedChunk` 契约 | ✅ 已实现 |
+| VLM 图生文 | `RoutingVlmService` + OpenAI 兼容多模态客户端（仅索引侧） | ✅ 已实现 |
+| Token 统计 | `TokenCounterService` 启发式字符密度估算 | ✅ 已实现 |
+| 数据契约 | `ChatRequest` / `Message` / `SourceRef` / `GroundingChunk` / `RetrievedChunk` | ✅ 已实现 |
+| YAML 配置体系 | 供应商/模型候选/档位/熔断参数，支持 `${ENV}` 占位符与启动期校验 | ✅ 已实现 |
 | 流式回调 | `StreamCallback` 增量推送（内容/思考/来源/完成/异常） | ✅ 已实现 |
-| 模型选择与路由 | 档位（tier）解析、候选构建、健康过滤 | 🚧 占位待实现 |
-| 故障转移与熔断 | 候选逐个回退、失败阈值熔断 | 🚧 占位待实现 |
-| 供应商客户端 | OpenAI 风格适配基类（openai/qwen/ollama/siliconflow） | 🚧 占位待实现 |
+| 模型选择与路由 | 档位（tier）解析、候选构建、健康过滤 | ✅ 已实现 |
+| 故障转移与熔断 | 候选逐个回退、失败阈值熔断、半开自动恢复 | ✅ 已实现 |
+| 流式首包探测 | `ProbeStreamBridge` 首包超时（TTFT）fallback | ✅ 已实现 |
+| 供应商客户端 | OpenAI 风格适配基类（openai/qwen）；ollama/siliconflow/aihubmix chat 按需补齐 | 🚧 部分待补 |
+| 工具/清理 | `LLMResponseCleaner` 输出清洗 + `LogSafe` 日志脱敏 | 🚧 延后至上线前 |
 | RAG 入库与检索 | 文档加载/解析/切分，向量/混合检索 | 🚧 占位待实现 |
 | Agent 能力 | 规划 / 执行 / 记忆 / 工具 | 🚧 占位待实现 |
 | MCP 工具层 | 服务端工具（检索/数据库）+ 客户端接入 | 🚧 占位待实现 |
 | 评估体系 | 检索质量指标与基准测试 | 🚧 占位待实现 |
 
-> ✅ = 已有代码实现；🚧 = 文件结构已就绪，待编写实现
+> ✅ = 已有代码实现；🚧 = 文件结构已就绪，待编写实现。
+> 其中 **AI 基础设施层（`core/llm`）已完成约 90%**：Chat / Embedding / Rerank / VLM / Token 五类能力 + 统一路由基建（Selector / Executor / HealthStore / Validator）均已落地，仅剩工具清理与部分供应商 chat 客户端待补齐。
 
 ## 目录结构
 
@@ -119,7 +126,7 @@ async def main():
 asyncio.run(main())
 ```
 
-> 提示：`providers/` 下的供应商客户端尚未实现，上述调用需先完成客户端注入；RAG 入库 / 检索 / Agent / 评估等模块待实现，详见 [docs/roadmap.md](docs/roadmap.md)。
+> 提示：AI 基础设施层（`core/llm`）已具备完整能力，调用前在 `clients` 列表中注入对应的供应商客户端（如 `QwenChatClient`）即可；RAG 入库 / 检索 / Agent / 评估等上层模块待实现，架构规划见 `docs/` 目录。
 
 ## 技术栈
 

@@ -237,3 +237,47 @@ class ChatRequest:
         body = self.to_openai_dict()
         body["stream"] = stream
         return body
+    
+@dataclass
+class RetrievedChunk:
+    """
+    RAG 检索命中结果（对应 Java 的 RetrievedChunk）。
+
+    表示一次向量检索或相关性搜索命中的单条记录，
+    包含原始文档片段主键以及相关性得分。
+
+    Attributes:
+        id: 命中记录的唯一标识（向量库主键/文档 id）。
+        text: 命中的文本内容（切分后的片段/段落）。
+        score: 命中得分，数值越大表示与查询的相关性越高。
+        collection_name: 所属知识库 collection（无库来源如联网检索为 None）。
+        doc_id: 所属文档 ID（检索后由元数据富化补齐，未富化时为 None）。
+        chunk_index: 分块在所属文档中的序号，从 0 开始（未富化时为 None）。
+        doc_name: 所属文档名称（用于组装上下文时作为文档标题的内部锚点）。
+    """
+
+    id: str
+    text: str
+    score: Optional[float] = None
+    collection_name: Optional[str] = None
+    doc_id: Optional[str] = None
+    chunk_index: Optional[int] = None
+    doc_name: Optional[str] = None
+
+    @staticmethod
+    def by_score_desc(chunk: "RetrievedChunk") -> float:
+        """
+        按 score 降序的排序键（对应 Java BY_SCORE_DESC 的 sortScore）。
+
+        缺失分数与非有限值（NaN / ±Infinity）沉底，
+        避免毒值抢占最高名次（用 NEGATIVE_INFINITY 归位）。
+
+        用法：sorted(chunks, key=RetrievedChunk.by_score_desc, reverse=True)
+        """
+        if chunk.score is None:
+            return float("-inf")
+        import math
+        if math.isnan(chunk.score) or math.isinf(chunk.score):
+            return float("-inf")
+        return chunk.score
+
