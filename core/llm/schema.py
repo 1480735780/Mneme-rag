@@ -10,7 +10,7 @@ core.llm.schema - AI 对话数据契约（Data Contract）
     - com.nageoffer.ai.ragent.framework.convention.ChatMessage
     - com.nageoffer.ai.ragent.framework.convention.ChatRequest
 """
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
 class Role(Enum):
@@ -280,4 +280,163 @@ class RetrievedChunk:
         if math.isnan(chunk.score) or math.isinf(chunk.score):
             return float("-inf")
         return chunk.score
+
+
+@dataclass
+class ChunkMetadata:
+    """
+    块的结构化元数据（对应 Java ChunkMetadata，简化版）
+
+    仅包含 MVP 阶段必需的字段，省略了 AssetRef/Provenance 等 parser 模块依赖。
+
+    Attributes:
+        outline_path: 章节层级路径（如 ["第3章", "3.1 节"]），Excel sheet 名也走这里
+        source_file:  原始文件名（简化版，Java 的 Provenance.sourceFile）
+        sheet_name:   所属 Excel sheet 名（如有）
+        extras:       开放扩展位：块级加工产出（摘要、关键词）与文档级元数据
+    """
+    outline_path: List[str] = field(default_factory=list)
+    source_file: Optional[str] = None
+    sheet_name: Optional[str] = None
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+    KEY_SOURCE_FILE = "source_file"
+    KEY_SHEET_NAME = "sheet_name"
+    # Java 的 KEY_ASSETS 因简化版省略 assets 字段而不适用
+
+    @staticmethod
+    def empty() -> "ChunkMetadata":
+        """空元数据：仅用于测试与确实没有任何结构信息的场景"""
+        return ChunkMetadata()
+
+    def with_extras(self, additional: Dict[str, Any]) -> "ChunkMetadata":
+        """
+        合并扩展位并返回新对象（对应 Java withExtras）
+
+        块级加工（摘要 / 关键词）与文档级元数据注入用。
+        additional 为空时原样返回自身；否则复制 extras 再合并，
+        保证返回对象与原对象不共享 dict（不可变语义）。
+
+        Args:
+            additional: 待合并的扩展元数据
+
+        Returns:
+            ChunkMetadata: 携带合并后 extras 的新元数据
+        """
+        if not additional:
+            return self
+        merged: Dict[str, Any] = dict(self.extras)
+        merged.update(additional)
+        return ChunkMetadata(
+            outline_path=list(self.outline_path),
+            source_file=self.source_file,
+            sheet_name=self.sheet_name,
+            extras=merged,
+        )
+
+    def to_flat_map(self) -> Dict[str, Any]:
+        """序列化为各索引后端通用的扁平 Map（对应 Java toMap()）"""
+        result: Dict[str, Any] = {}
+        result.update(self.extras)
+        if self.source_file:
+            result[self.KEY_SOURCE_FILE] = self.source_file
+        if self.sheet_name:
+            result[self.KEY_SHEET_NAME] = self.sheet_name
+        return result
+
+
+@dataclass
+class ChunkData:
+    """
+    分块产物：不可变，不含向量（对应 Java Chunk）
+
+    构造期强制 embedding_text 非空，忘记注入章节上下文就构造不出对象。
+
+    Attributes:
+        chunk_id:       块唯一标识
+        index:          块在文档中的序号，从 0 开始
+        content:        文档原貌（markdown），回填 LLM 上下文与前端预览用
+        embedding_text: 向量文本（章节路径 + 正文），不参与展示
+        metadata:       块元数据
+    """
+    chunk_id: str
+    index: int
+    content: str
+    embedding_text: str
+    metadata: ChunkMetadata = field(default_factory=ChunkMetadata.empty)
+
+    def __post_init__(self):
+        if not self.chunk_id or not self.chunk_id.strip():
+            raise ValueError("chunk_id 不能为空")
+        if self.index < 0:
+            raise ValueError(f"index 必须 >= 0，实际 {self.index}")
+        if self.content is None:
+            raise ValueError(f"content 不能为 None，chunk_id={self.chunk_id}")
+        if not self.embedding_text or not self.embedding_text.strip():
+            raise ValueError(f"embedding_text 不能为空，chunk_id={self.chunk_id}")
+
+    def with_metadata(self, new_metadata: "ChunkMetadata") -> "ChunkData":
+        """
+        复制并替换元数据，返回新对象（对应 Java Chunk.withMetadata）
+
+        块级加工（摘要 / 关键词）写扩展位用，向量文本不受影响，向量在此之前已算完。
+
+        Args:
+            new_metadata: 新的块元数据
+
+        Returns:
+            ChunkData: 携带新元数据的同内容分块
+        """
+        return ChunkData(
+            chunk_id=self.chunk_id,
+            index=self.index,
+            content=self.content,
+            embedding_text=self.embedding_text,
+            metadata=new_metadata,
+        )
+
+
+@dataclass
+class EmbeddedChunk:
+    """
+    已向量化的块：索引层的唯一入参（对应 Java EmbeddedChunk）
+
+    与 ChunkData 分开是为了让未向量化的块在类型上就进不了索引层。
+
+    Attributes:
+        chunk:     未向量化的分块
+        embedding: 向量，维度由部署级配置固定
+    """
+    chunk: ChunkData
+    embedding: List[float]
+
+    def __post_init__(self):
+        if self.chunk is None:
+            raise ValueError("chunk 不能为 None")
+        if not self.embedding:
+            raise ValueError(f"embedding 不能为空，chunk_id={self.chunk.chunk_id}")
+
+    @property
+    def chunk_id(self) -> str:
+        return self.chunk.chunk_id
+
+    @property
+    def index(self) -> int:
+        return self.chunk.index
+
+    @property
+    def content(self) -> str:
+        return self.chunk.content
+
+    @property
+    def embedding_text(self) -> str:
+        return self.chunk.embedding_text
+
+    @property
+    def metadata(self) -> ChunkMetadata:
+        return self.chunk.metadata
+
+    @property
+    def dimension(self) -> int:
+        return len(self.embedding)
 
