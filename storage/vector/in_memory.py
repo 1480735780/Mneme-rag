@@ -4,6 +4,10 @@
 职责：
     - 开发 / 测试 / 演示环境的后端，无外部依赖，进程内存储；
     - 生产后端（Milvus）后续补充，业务代码只依赖 rag/retrieval/vector_store 的抽象接口。
+    - 写单元测试：测 retrieve 排序是否正确 → 必须先 docker compose up milvus → 等 30 秒启动 → 建 collection → 插数据 → 跑一个断言 → 清理
+    - CI 流水线：每次 PR 都要起 Milvus 容器 → CI 时间从 2 分钟变 8 分钟 → 开发者不愿意跑
+    - 调 RAG 链路：改了 chunker 想快速看检索效果 → 先确认 Milvus 活着 → 重新灌数据 → 才能验证
+    - 新人上手：clone 项目 → README 写着"请先安装 Milvus" → 劝退
 
 相似度：入库与查询均做 L2 归一化，点积即余弦相似度（score 越大越相关），
         与 RetrievedChunk.by_score_desc 的排序语义一致。

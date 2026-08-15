@@ -99,6 +99,20 @@ class VectorRetrieverService(ABC):
 
     说明：Java 用重载区分 retrieve(query, topK) 与 retrieve(RetrieveRequest)，
     Python 无重载，故只保留 request 版本；纯文本便捷入口见模块级 retrieve_text()。
+
+    用途说明：
+    - 封装对向量数据库（如 Milvus / pgVector / Elasticsearch KNN）的检索能力
+    - 负责从向量库中查找与用户问题（Query）最相关的若干文档片段（Chunk）
+    - 是 RAG 系统中 Retrieval 阶段的核心组件
+
+    工作流程：
+        1. 获取 Query 的 embedding（通常由 EmbeddingService 提供）
+        2. 在向量库中进行相似度搜索
+        3. 返回排序后的相关 Chunk（RAGHit）
+
+    特点：
+        - 可将检索与大模型（LLM）调用解耦，便于替换搜索实现
+        - 可基于不同召回策略扩展：向量检索、混合检索、符号搜索、多模态检索等
     """
 
     @abstractmethod
@@ -165,6 +179,10 @@ async def retrieve_text(
     纯文本便捷检索入口（对应 Java retrieve(String query, int topK) 默认方法）
 
     内部构造 RetrieveRequest 调用 retriever.retrieve(request)。
+
+    注意事项：
+        - topK 不宜过大，一般 3〜8 为最佳区间
+        - 建议对 vector 维度进行校验，避免与向量库 schema 不匹配
 
     Args:
         retriever: 向量检索服务实例

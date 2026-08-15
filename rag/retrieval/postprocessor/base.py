@@ -67,14 +67,14 @@ class SearchResultPostProcessor(ABC):
         ...
 
     @abstractmethod
-    def process(
+    async def process(
         self,
         chunks: List[RetrievedChunk],
         results: List[SearchChannelResult],
         context: SearchContext,
     ) -> List[RetrievedChunk]:
         """
-        处理检索结果
+        处理检索结果（异步：下游 Rerank 处理器需要 await RerankService.rerank）
 
         Args:
             chunks:  当前的 Chunk 列表（可能是上一个处理器的输出）

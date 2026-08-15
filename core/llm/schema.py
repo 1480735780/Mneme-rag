@@ -282,6 +282,37 @@ class RetrievedChunk:
         return chunk.score
 
 
+def retrieved_chunk_key(chunk: "RetrievedChunk") -> str:
+    """
+    检索结果去重键（对应 Java RetrievedChunkKey中的of类）
+
+    规则：id 非空用 id；id 为空（None/空白）则退回 text 的 SHA-256 小写 hex（text 为 None 时哈希空串）。
+
+    该 key 在去重、RRF 融合赋分、归因日志三处统一使用，
+    保证多通道命中的同一 chunk 在全链路以同一身份识别。
+
+    设计逻辑：
+    chunk.id 非空且非空白？
+    ├── YES → str(chunk.id)          # 主路径：结构化 ID 去重
+    └── NO  → SHA-256(chunk.text)    # 兜底：内容哈希去重
+                └── text is None → SHA-256("")  # 防御性处理
+
+    Args:
+        chunk: 检索命中结果
+
+    Returns:
+        str: 规范化去重键
+    """
+    import hashlib
+    #结构化ID去重
+    chunk_id = chunk.id
+    if chunk_id is not None and str(chunk_id).strip():
+        return str(chunk_id)
+    #内容哈希去重，这里使用SHA-256这个算法，将文本内容转换为256位的哈希值，再转换为小写十六进制字符串
+    text = chunk.text if chunk.text is not None else ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class ChunkMetadata:
     """
