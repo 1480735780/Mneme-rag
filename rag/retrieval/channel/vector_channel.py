@@ -15,12 +15,13 @@
 """
 import asyncio
 import logging
-import math
 import time
 from typing import List, Optional
 
 from core.llm.schema import RetrievedChunk
 from rag.retrieval.channel.base import SearchChannel
+from rag.retrieval.channel.chunk_ranking import ChunkRanking
+from rag.retrieval.channel.scope_quota import ScopeQuota
 from rag.retrieval.schema import (
     RetrieveRequest,
     RetrievalBudget,
@@ -32,38 +33,6 @@ from rag.retrieval.schema import (
 from rag.retrieval.vector_store import VectorRetrieverService
 
 logger = logging.getLogger(__name__)
-
-
-def _sorted_by_score(chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
-    """按相关性降序（毒值沉底由 by_score_desc 保证）"""
-    return sorted(chunks, key=RetrievedChunk.by_score_desc, reverse=True)
-
-
-def _cap(chunks: List[RetrievedChunk], limit: int) -> List[RetrievedChunk]:
-    """按名额截断；名额为 0 即取零条"""
-    if limit <= 0:
-        return []
-    return chunks[:limit] if len(chunks) > limit else chunks
-
-
-def _split_quota(scope: RetrievalScope, budget: int, supplement_ratio: float):
-    """主路/补充路名额切分（对应 Java ScopeQuota.split）"""
-    if (
-        not scope.directed
-        or not scope.supplement_collections
-        or supplement_ratio <= 0
-        or budget <= 0
-    ):
-        return budget, 0
-    # 与 Java Math.round 对齐：floor(x + 0.5) 四舍五入（.5 向上），
-    # Python 内置 round() 是银行家舍入（.5 向偶数），结果会不一致
-    supplement = min(budget - 1, max(1, int(math.floor(budget * supplement_ratio + 0.5))))
-    return budget - supplement, supplement
-
-
-def _merge_by_score(primary: List[RetrievedChunk], supplement: List[RetrievedChunk]) -> List[RetrievedChunk]:
-    """合并两路并按相关性降序"""
-    return _sorted_by_score(primary + supplement)
 
 
 class VectorSearchChannel(SearchChannel):
@@ -136,7 +105,8 @@ class VectorSearchChannel(SearchChannel):
         retrieval_budget = context.budget or RetrievalBudget.uniform(5)
         # 意图级 topK 覆盖默认 recall_budget，再被 candidate_limit 钳制（对齐 Java resolveDirectedBudget）
         directed_budget = self._resolve_directed_budget(scope, retrieval_budget)
-        primary_quota, supplement_quota = _split_quota(scope, directed_budget, self._supplement_ratio)
+        quota = ScopeQuota.split(scope, directed_budget, self._supplement_ratio)
+        primary_quota, supplement_quota = quota.primary, quota.supplement
         # 只 embed 一次，主路与补充路共用（对齐 Java retrieveDirected 的 embedAndNormalize）
         query_vector = await self._retriever.embed_and_normalize(question)
 
@@ -155,7 +125,7 @@ class VectorSearchChannel(SearchChannel):
             )
             primary = primary if isinstance(primary, list) else []
             supplement = supplement if isinstance(supplement, list) else []
-            return _merge_by_score(primary, supplement)
+            return ChunkRanking.merge_by_score(primary, supplement)
         return await fetch(scope.target_collections, primary_quota)
 
     def _resolve_directed_budget(self, scope: RetrievalScope, budget: RetrievalBudget) -> int:
@@ -217,7 +187,10 @@ class VectorSearchChannel(SearchChannel):
 
         # 后端支持跨库单次查询则一次搞定；否则逐库并行 fan-out 再统一截断（预算即总量）
         if self._retriever.supports_global_retrieval():
-            return _cap(_sorted_by_score(await self._retriever.retrieve_by_vector(query_vector, request)), top_k)
+            return ScopeQuota.cap(
+                ChunkRanking.sorted_by_score(await self._retriever.retrieve_by_vector(query_vector, request)),
+                top_k,
+            )
 
         per_collection = [RetrieveRequest(query=question, top_k=top_k, collection_names=[c]) for c in collections]
         results = await asyncio.gather(
@@ -228,4 +201,4 @@ class VectorSearchChannel(SearchChannel):
         for r in results:
             if isinstance(r, list):
                 merged.extend(r)
-        return _cap(_sorted_by_score(merged), top_k)
+        return ScopeQuota.cap(ChunkRanking.sorted_by_score(merged), top_k)

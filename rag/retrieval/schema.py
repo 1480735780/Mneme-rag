@@ -1,10 +1,13 @@
 # 检索 DTO：RetrieveRequest / RetrievalBudget / SearchContext / SearchChannelResult / SearchChannelType / RetrievalScope
 # （对应 ragent RetrieveRequest + RetrievalBudget + SearchContext + SearchChannelResult + SearchChannelType + RetrievalScope）
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Set, Any
 from dataclasses import dataclass, field
 from enum import Enum
 
 from core.llm.schema import RetrievedChunk
+
+# 无归属片段的全局键（对应 Java RAGConstant.MULTI_CHANNEL_KEY）
+MULTI_CHANNEL_KEY = "multi_channel"
 
 @dataclass
 class RetrieveRequest:
@@ -231,3 +234,49 @@ class SearchChannelResult:
     chunks: List[RetrievedChunk] = field(default_factory=list)
     latency_ms: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RetrievalContext:
+    """
+    检索上下文（对应 Java rag/dto/RetrievalContext）
+
+    MCP + KB 检索结果的统一承载，由 RAGChatEngine（StreamChatPipeline 对应物）的检索阶段
+    组装后透传给来源装配 / 引用注入 / Prompt 规划消费。
+
+    Attributes:
+        mcp_context:   MCP 工具召回的上下文文本（A 层 MVP 恒为空串，MCP 属 C 层）
+        kb_context:    知识库召回的上下文文本（已按意图归属格式化；引用开关关闭时仍携带内部锚点待抹除）
+        intent_chunks: 意图 ID → 命中分片（无归属片段挂到 MULTI_CHANNEL_KEY 下）
+    """
+
+    mcp_context: Optional[str] = None
+    kb_context: Optional[str] = None
+    intent_chunks: Dict[str, List[RetrievedChunk]] = field(default_factory=dict)
+
+    def has_mcp(self) -> bool:
+        """是否存在 MCP 上下文（对应 Java hasMcp）"""
+        return bool(self.mcp_context and self.mcp_context.strip())
+
+    def has_kb(self) -> bool:
+        """是否存在 KB 上下文（对应 Java hasKb）"""
+        return bool(self.kb_context and self.kb_context.strip())
+
+    def get_retrieved_intent_ids(self) -> Set[str]:
+        """
+        有文档归属的意图 ID 集合（对应 Java getRetrievedIntentIds）
+
+        排除 MULTI_CHANNEL_KEY 下的无归属片段，避免无意图命中的全局召回
+        被当作「该意图确实有文档」参与 Prompt 规划。
+        """
+        if not self.intent_chunks:
+            return set()
+        return {
+            intent_id
+            for intent_id in self.intent_chunks
+            if intent_id != MULTI_CHANNEL_KEY
+        }
+
+    def is_empty(self) -> bool:
+        """是否无任何上下文（对应 Java isEmpty）"""
+        return not self.has_mcp() and not self.has_kb()

@@ -25,6 +25,7 @@ from typing import Dict, List
 
 from core.llm.schema import RetrievedChunk, retrieved_chunk_key
 from rag.retrieval.postprocessor.base import SearchResultPostProcessor
+from rag.retrieval.postprocessor.channel_attribution import ChannelAttribution
 from rag.retrieval.schema import SearchChannelResult, SearchChannelType, SearchContext
 
 logger = logging.getLogger(__name__)
@@ -150,7 +151,7 @@ class FusionPostProcessor(SearchResultPostProcessor):
         truncate = limit > 0 and len(ranked) > limit
         #截断候选池：取前 limit 条（已经按 RRF 分数降序排好了，所以取的是分数最高的前 N 条）
         candidates = ranked[:limit] if truncate else ranked
-        #日志打印融合结果
+        # 日志打印融合结果
         logger.info(
             "RRF 融合完成 - 通道数: %d, k: %d, 融合后: %d 个, 截断上限: %s, 送入 Rerank: %d 个",
             len(results) if results else 0,
@@ -159,6 +160,15 @@ class FusionPostProcessor(SearchResultPostProcessor):
             str(limit) if limit > 0 else "不限",
             len(candidates),
         )
+        # 截断是弱势通道证据消失的第一现场：池内与出池分布并排打，某通道被整体截没时在此可见，
+        # 下游 Rerank 的存活率日志看到的输入已经是 0
+        if results is not None and len(results) > 1:
+            index = ChannelAttribution.index(results)
+            logger.info(
+                "检索归因 - 融合池按通道: %s, 送入 Rerank 按通道: %s",
+                ChannelAttribution.format(ChannelAttribution.count_by_channel(ranked, index)),
+                ChannelAttribution.format(ChannelAttribution.count_by_channel(candidates, index)),
+            )
         return candidates
 
     def _weight_of(self, channel_type: SearchChannelType) -> float:
