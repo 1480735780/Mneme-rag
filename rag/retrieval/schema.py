@@ -192,7 +192,7 @@ class SearchContext:
         original_question:  原始问题
         rewritten_question: 重写后的问题
         sub_questions:      子问题列表
-        intents:            意图识别结果（SubQuestionIntent 列表，暂用 dict 占位）
+        intents:            意图识别结果（SubQuestionIntent 列表）
         budget:             检索预算
         retrieval_scope:    检索作用域
         metadata:           扩展元数据

@@ -22,7 +22,12 @@ from typing import Dict, List, Optional
 from core.llm.embedding import EmbeddingService
 from core.llm.schema import EmbeddedChunk, RetrievedChunk
 from rag.retrieval.schema import RetrieveRequest
-from rag.retrieval.vector_store import VectorRetrieverService, VectorStoreService
+from rag.retrieval.vector_store import (
+    VectorRetrieverService,
+    VectorStoreAdmin,
+    VectorStoreService,
+)
+from storage.vector.schema import VectorSpaceId, VectorSpaceSpec
 
 
 @dataclass
@@ -170,3 +175,35 @@ class InMemoryVectorStore(VectorStoreService, VectorRetrieverService):
         return all(
             record.flat_metadata.get(k) == v for k, v in metadata_filters.items()
         )
+
+
+class InMemoryVectorStoreAdmin(VectorStoreAdmin):
+    """
+    内存向量空间管理（MVP 后端，对应 ragent 的 Milvus / Pg Admin 实现位）
+
+    ensure / exists / drop 对齐 VectorStoreAdmin 语义：
+        - ensure：幂等，不存在则登记空间规格，已存在则 no-op（不覆盖既有规格）；
+        - exists：只判断登记与否，不创建；
+        - drop：幂等，删除登记的空间，不存在则 no-op。
+
+    内存版仅维护「逻辑空间名 → 规格」登记表，不落任何物理索引；
+    真实后端（Milvus 建 collection / Pg 建共享索引）后续注入同一接口替换。
+
+    对应 ragent 源码：
+        - com.nageoffer.ai.ragent.rag.core.vector.MilvusVectorStoreAdmin / PgVectorStoreAdmin（结构对标）
+    """
+
+    def __init__(self):
+        self._spaces: Dict[str, VectorSpaceSpec] = {}
+
+    def ensure_vector_space(self, spec: VectorSpaceSpec) -> None:
+        key = spec.space_id.logical_name
+        if key in self._spaces:
+            return  # 已存在：幂等 no-op（Java「存在则校验兼容性」的 MVP 简化为不覆盖）
+        self._spaces[key] = spec
+
+    def vector_space_exists(self, space_id: VectorSpaceId) -> bool:
+        return space_id.logical_name in self._spaces
+
+    def drop_vector_space(self, collection_name: str) -> None:
+        self._spaces.pop(collection_name, None)

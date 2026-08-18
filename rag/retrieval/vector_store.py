@@ -1,8 +1,9 @@
 """
-向量库适配层（对应 Java VectorStoreService + VectorRetrieverService）
+向量库适配层（对应 Java VectorStoreService + VectorRetrieverService + VectorStoreAdmin）
 
 写侧（VectorStoreService）：文档 chunk 向量索引的建立 / 更新 / 删除；
-读侧（VectorRetrieverService）：按自然语言 query 或向量检索最相关的 Chunk。
+读侧（VectorRetrieverService）：按自然语言 query 或向量检索最相关的 Chunk；
+管理侧（VectorStoreAdmin）：向量空间的创建 / 存在性 / 销毁（与检索解耦）。
 
 本文件只定义契约（抽象接口），具体后端实现住在 storage/vector/（如内存版、Milvus 版），
 业务代码只面向本模块编程。
@@ -10,12 +11,20 @@
 对应 ragent 源码：
     - com.nageoffer.ai.ragent.rag.core.vector.VectorStoreService
     - com.nageoffer.ai.ragent.rag.core.vector.VectorRetrieverService
+    - com.nageoffer.ai.ragent.rag.core.vector.VectorStoreAdmin
 """
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import List
+from typing import TYPE_CHECKING, List
 
 from core.llm.schema import EmbeddedChunk, RetrievedChunk
 from rag.retrieval.schema import RetrieveRequest
+
+if TYPE_CHECKING:
+    # 仅类型标注用（本模块有 from __future__ import annotations，注解延迟求值）：
+    # 运行时导入 storage.vector.schema 会经 storage.vector.__init__ 反引 in_memory → 本模块，构成环
+    from storage.vector.schema import VectorSpaceId, VectorSpaceSpec
 
 
 class VectorStoreService(ABC):
@@ -193,3 +202,52 @@ async def retrieve_text(
         List[RetrievedChunk]: 按 score 降序的命中结果
     """
     return await retriever.retrieve(RetrieveRequest(query=query, top_k=top_k))
+
+
+class VectorStoreAdmin(ABC):
+    """
+    向量空间元数据 / 索引管理（与检索解耦，对应 Java VectorStoreAdmin）
+
+    用于确保空间存在：不存在就按规格创建；存在则校验兼容性（后端按需）。
+    是入库链路（ingestion）与知识库生命周期（建库 / 删库）的后端无关入口：
+    Milvus 建共享 collection，PG 依赖迁移脚本建表故此处多为空操作，均以本接口抹平差异。
+
+    对应 ragent 源码：
+        - com.nageoffer.ai.ragent.rag.core.vector.VectorStoreAdmin
+    """
+
+    @abstractmethod
+    def ensure_vector_space(self, spec: VectorSpaceSpec) -> None:
+        """
+        幂等：确保向量空间存在（不存在则创建；存在则按后端语义校验/跳过）
+
+        Args:
+            spec: 向量空间规格（跨引擎统一定义）
+        """
+        ...
+
+    @abstractmethod
+    def vector_space_exists(self, space_id: VectorSpaceId) -> bool:
+        """
+        只判断存在性（不创建）
+
+        Args:
+            space_id: 向量空间标识
+
+        Returns:
+            bool: 空间是否存在
+        """
+        ...
+
+    @abstractmethod
+    def drop_vector_space(self, collection_name: str) -> None:
+        """
+        幂等：销毁向量空间（与 ensure_vector_space 对应）
+
+        - Milvus：删除该知识库对应的 collection（不存在则跳过）
+        - PG：删除共享表中属于该 collection 的残留向量行（不动共享 HNSW 索引）
+
+        Args:
+            collection_name: 知识库 collection 名称（即逻辑空间名）
+        """
+        ...

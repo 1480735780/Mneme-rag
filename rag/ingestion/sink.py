@@ -65,6 +65,11 @@ class VectorStoreSink(ChunkSink):
 
     将摄取内核产出的已向量化块，经 VectorStoreService 写入持久化向量库。
     VectorTarget.partition 映射为 collection_name，document.doc_id 映射为 doc_id。
+
+    replace 显式「先删后建」：先清该文档旧向量，再（非空时）写入新块——对齐 Java
+    VectorChunkSink.replaceDocument；装饰器链（图谱 / 关键词同步）正是依赖这个顺序构成
+    upsert 语义；空块列表只删不建（该文档不产生任何块）。各向量后端的 index 语义不同
+    （InMemory 整体替换 / Pg 纯 INSERT 不删旧），显式先删后建保证两后端一致。
     """
 
     def __init__(self, store: VectorStoreService):
@@ -76,7 +81,10 @@ class VectorStoreSink(ChunkSink):
         doc: "DocumentRef",
         chunks: List[EmbeddedChunk],
     ) -> None:
-        await self._store.index_document_chunks(target.partition, doc.doc_id, chunks)
+        # 先删后建：顺序留在实现内部，不暴露给调用方（对齐 Java VectorChunkSink）
+        await self._store.delete_document_vectors(target.partition, doc.doc_id)
+        if chunks:
+            await self._store.index_document_chunks(target.partition, doc.doc_id, chunks)
 
     async def delete_document(self, target: VectorTarget, doc: "DocumentRef") -> None:
         await self._store.delete_document_vectors(target.partition, doc.doc_id)

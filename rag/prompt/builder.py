@@ -8,10 +8,11 @@ Prompt 场景选择与 Prompt 装配（对应 ragent PromptScene + PromptContext
     - AgentPromptSlot：智能体提示词槽位，是槽位元数据的唯一权威源（展示名/分组/生效模式/
       不生效原因/必填占位符，与 Java 构造参数一一对应）。
     - AgentPromptResolver：智能体提示词解析器。Java 侧从 DB（agent_profile + agent_prompt）叠加
-      内置/激活智能体并走 Redis 缓存；Python 无 DB 基础设施，提供 ABC 接口 + 内存版
-      StaticAgentPromptResolver（注入 dict 即生效），真实后端按需实现 ABC 注入。
-    - AgentPromptCacheManager：解析结果缓存。Java 侧是 Redis（1 小时过期），Python MVP 退化为
-      进程内 dict，语义保持一致：命中直接返回、未命中返回 None、clear 后强制重载。
+      内置/激活智能体并走 Redis 缓存；Python 提供 ABC 接口 + 内存版 StaticAgentPromptResolver
+      （注入 dict 即生效）+ DB 数据源版 DatabaseAgentPromptResolver（agent_resolver.py，叠加回落）。
+    - AgentPromptCacheManager：解析结果缓存。Java 侧是 Redis（1 小时过期）；Python 进程内版保持
+      同一语义：命中直接返回、未命中返回 None、clear 后强制重载；Redis 版
+      RedisAgentPromptCacheManager 见 agent_resolver.py（TTL 1h，经 5.0 CacheManager 抽象）。
     - RAGPromptService：RAG Prompt 编排服务。按场景（KB / MCP / Mixed）选模板，组装 system +
       history + 证据 + 问题 的消息序列；KB 场景且引用开关打开时把行内引用规则追加到系统提示词后。
 
@@ -242,10 +243,11 @@ class AgentPromptSlot(Enum):
 
 class AgentPromptCacheManager:
     """
-    智能体提示词缓存管理器（对应 Java AgentPromptCacheManager）
+    智能体提示词缓存管理器·进程内版（对应 Java AgentPromptCacheManager）
 
     Java 侧缓存激活智能体叠加自定义提示词后的结果于 Redis（1 小时过期）；
-    Python MVP 无 Redis 基础设施，退化为进程内 dict：命中直接返回、未命中返回 None。
+    本类为进程内兜底 / 测试注入用：命中直接返回、未命中返回 None、clear 后强制重载。
+    Redis 版（TTL 1 小时、经 5.0 CacheManager 抽象）见 agent_resolver.RedisAgentPromptCacheManager。
     任何写操作后调用 clear_cache() 使缓存失效。
     """
 

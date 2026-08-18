@@ -16,6 +16,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import List
 
+from storage.database import Condition, DatabaseClient
+
 
 class KbCollectionProvider(ABC):
     """有效知识库 collection 提供者接口（对应 Java KbCollectionProvider）"""
@@ -51,3 +53,33 @@ class StaticKbCollectionProvider(KbCollectionProvider):
 
     def list_active_collections(self) -> List[str]:
         return list(self._collections)
+
+
+class DatabaseKbCollectionProvider(KbCollectionProvider):
+    """
+    关系库实现：查 t_knowledge_base（deleted=0）取 collection_name，过滤空白 + 去重保序
+
+    面向 DatabaseClient 抽象编程，注入 InMemoryDatabaseClient（测试 / MVP）或
+    SqlDatabaseClient（真实 SQL）均无感知（对齐 Java 的 BaseMapper<KnowledgeBaseDO> 查询）。
+
+    Args:
+        db: 关系库访问抽象（DatabaseClient）
+    """
+
+    def __init__(self, db: DatabaseClient):
+        self._db = db
+
+    def list_active_collections(self) -> List[str]:
+        rows = self._db.select_rows(
+            "t_knowledge_base",
+            columns=["collection_name"],
+            where=[Condition.eq("deleted", 0)],
+        )
+        result: List[str] = []
+        seen = set()
+        for row in rows:
+            name = (row.get("collection_name") or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                result.append(name)
+        return result

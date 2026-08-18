@@ -4,7 +4,7 @@ RAG 对话引擎（对应 Java RAGChatServiceImpl + StreamChatPipeline）
 
 主编排管线（对齐 Java StreamChatPipeline.execute）：
     记忆加载 → 查询改写/拆分 → 意图解析 → 歧义引导（短路）→ 纯系统意图（短路）→
-    检索（按 KB 意图定向召回 + 上下文格式化）→ 空结果兜底（短路）→ 来源/引用/grounding 装配 → Prompt 组装 → LLM 流式输出
+    检索（按子问题解析作用域 + 多通道召回 + 归因 + 上下文格式化）→ 空结果兜底（短路）→ 来源/引用/grounding 装配 → Prompt 组装 → LLM 流式输出
 
 短路分支（handleXxx 返回 True 即已处理并停止后续阶段，对齐 Java 的 boolean 返回约定）：
     - handle_guidance：歧义时直接把澄清文案当回答推给用户，不再检索；
@@ -15,11 +15,10 @@ MVP 差异（相对 Java）：
     - 记忆：Java 走 ConversationMemoryService（Redis/DB，C 层）；Python 定义接口 +
       进程内 NoopConversationMemoryService 默认实现（load 空历史、append 不落库），
       真实后端实现接口注入即可替换，语义一致（onReplyToMessageId 在无消息 ID 时跳过）。
-    - 检索执行：Java RetrievalEngine 按子问题跑通道并依据 chunk→intent 归属回填
-      intentChunks；Python 复用 MultiChannelRetrievalEngine（单次 SearchContext 全链路：
-      并行通道 → 去重 → RRF 融合 → Rerank），按「每个 KB 意图一次定向召回」得到
-      意图归属；无 KB 意图时做一次全局召回，片段挂到 MULTI_CHANNEL_KEY 下。
-      作用域收窄（RetrievalScopeResolver）与 MCP 工具编排属 B/C 层，MVP 不实现。
+    - 检索执行（B 层接线）：Python 对齐 Java RetrievalEngine —— 按子问题一次
+      retrieve_knowledge_channels：RetrievalScopeResolver 解析作用域（定向/全局）→
+      四通道并行召回 → 去重/RRF 融合/Rerank → 按 scope.intents 归因 → group_by_intent
+      回填 intentChunks，无归属片段挂 MULTI_CHANNEL_KEY。MCP 工具编排属 C 层。
     - 任务取消：Java 用 taskManager.bindHandle 绑定 StreamCancellationHandle；
       Python 无等价句柄（stream_chat 返回 None），由调用方直接取消 execute 协程，故省略。
     - 链路追踪 / 日志脱敏：@RagTraceNode 与 LogSafe 延后上线，Python 用 logging 简要记录。
@@ -30,6 +29,7 @@ MVP 差异（相对 Java）：
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -48,6 +48,7 @@ from rag.intent import (
     NodeScoreFilters,
     SubQuestionIntent,
 )
+from rag.mcp import McpParameterExtractor, McpToolRegistry, McpToolResult, Status
 from rag.prompt.builder import (
     AgentPromptResolver,
     AgentPromptSlot,
@@ -55,14 +56,15 @@ from rag.prompt.builder import (
     RAGPromptService,
     StaticAgentPromptResolver,
 )
-from rag.prompt.formatter import ContextFormatter, DefaultContextFormatter
+from rag.prompt.formatter import ContextFormatter, DefaultContextFormatter, ToolResult
+from rag.retrieval.channel.scope_resolver import RetrievalScopeResolver
+from rag.retrieval.channel.kb_collection_provider import StaticKbCollectionProvider
+from rag.retrieval.config import ScopeProperties
 from rag.retrieval.engine import MultiChannelRetrievalEngine
 from rag.retrieval.schema import (
     MULTI_CHANNEL_KEY,
     RetrievalBudget,
     RetrievalContext,
-    RetrievalScope,
-    SearchContext,
 )
 from rag.rewrite import QueryRewriteService, RewriteResult
 from rag.source import (
@@ -198,6 +200,9 @@ class RAGChatEngine:
         context_formatter: Optional[ContextFormatter] = None,
         retrieval_budget: Optional[RetrievalBudget] = None,
         active_collections: Optional[List[str]] = None,
+        scope_resolver: Optional[RetrievalScopeResolver] = None,
+        mcp_tool_registry: Optional[McpToolRegistry] = None,
+        mcp_parameter_extractor: Optional[McpParameterExtractor] = None,
     ):
         self._memory_service = memory_service or NoopConversationMemoryService()
         self._query_rewrite_service = query_rewrite_service
@@ -217,7 +222,16 @@ class RAGChatEngine:
         self._budget = retrieval_budget or RetrievalBudget(
             recall_budget=20, candidate_limit=40, context_top_k=10
         )
+        # 检索作用域解析器：B 层接线后按子问题解析作用域、由引擎挂进 SearchContext；
+        # 不注入时以 active_collections 构建内存提供者兜底（对齐 Java RetrievalScopeResolver + KbCollectionProvider）
         self._active_collections = list(active_collections or [])
+        self._scope_resolver = scope_resolver or RetrievalScopeResolver(
+            ScopeProperties(),
+            StaticKbCollectionProvider(self._active_collections),
+        )
+        # MCP 工具编排（C 层接线）：不注入注册表/提取器时跳过 MCP 分支，行为等价于未配置 MCP
+        self._mcp_tool_registry = mcp_tool_registry
+        self._mcp_parameter_extractor = mcp_parameter_extractor
 
     # ==================== 主编排 ====================
 
@@ -301,62 +315,175 @@ class RAGChatEngine:
 
     async def _retrieve(self, context: StreamChatContext) -> RetrievalContext:
         """
-        检索：按 KB 意图定向召回并格式化上下文（对应 Java RetrievalEngine.retrieve）
+        检索：按子问题走多通道引擎（作用域 + 归因）+ MCP 工具编排（对应 Java RetrievalEngine.retrieve）
 
-        - 有 KB 意图：每个意图一次定向召回（作用域指向该意图的 collection），
-          命中片段按意图 ID 分组；召回在引擎层已含 去重 → 融合 → Rerank 全链路。
-        - 无 KB 意图：做一次全局召回，片段挂到 MULTI_CHANNEL_KEY 下（无归属）。
-        最后把各意图片段合并后交给上下文格式化器（其内部按 context_top_k 截断）。
+        KB 分支：每个子问题一次 retrieve_knowledge_channels：作用域由 RetrievalScopeResolver 解析
+        （定向命中库 / 全局退化）、四通道并行召回 → 后处理 → 按 scope.intents 归因；
+        命中片段按意图 ID 分组，无归属片段挂到 MULTI_CHANNEL_KEY 下。单子问题失败降级为空、
+        不影响其余子问题。最后把各意图片段合并后交给上下文格式化器（内部按 context_top_k 截断）。
+
+        MCP 分支：每个子问题对命中的 MCP 意图并行执行工具（提取参数 → 调用 → 按 toolId 分组 →
+        格式化上下文），与 KB 分支相互独立（一方失败不影响另一方）；未注入注册表/提取器时跳过。
         """
         sub_intents = context.sub_intents or []
         if not sub_intents:
             return RetrievalContext(intent_chunks={})
 
-        kb_intents = self._merged_kb_intents(sub_intents)
-        intent_chunks: Dict[str, List[RetrievedChunk]] = {}
-        all_chunks: List[RetrievedChunk] = []
-
-        if kb_intents:
-            for node_score in kb_intents:
-                node: IntentNode = node_score.node
-                collections = node.get_effective_collection_names()
-                if not collections:
-                    logger.debug("KB 意图 %s 未配置 collection，跳过定向召回", node.id)
-                    continue
-                try:
-                    chunks = await self._retrieval_engine.retrieve(
-                        self._build_search_context(context, node_score, collections)
-                    )
-                except Exception:  # noqa: BLE001 单意图召回失败降级，不影响其余意图
-                    logger.error("意图 %s 定向召回失败，降级为空", node.id, exc_info=True)
-                    chunks = []
-                if chunks:
-                    intent_chunks[node.id] = chunks
-                    all_chunks.extend(chunks)
-        else:
+        merged_intent_chunks: Dict[str, List[RetrievedChunk]] = {}
+        mcp_context_parts: List[str] = []
+        for si in sub_intents:
+            # ── KB 分支（失败降级为空，不 continue：MCP 分支独立执行） ──
             try:
-                chunks = await self._retrieval_engine.retrieve(
-                    self._build_search_context(
-                        context, None, self._active_collections, directed=False
-                    )
+                result = await self._retrieval_engine.retrieve_knowledge_channels(
+                    si, self._budget, self._scope_resolver
                 )
-            except Exception:  # noqa: BLE001 全局召回失败按空结果兜底
-                logger.error("无 KB 意图全局召回失败，降级为空", exc_info=True)
-                chunks = []
-            if chunks:
-                intent_chunks[MULTI_CHANNEL_KEY] = chunks
-                all_chunks = chunks
+            except Exception:  # noqa: BLE001 单子问题检索失败降级为空，不影响其余子问题
+                logger.error("子问题检索失败，降级为空，question：%s", si.sub_question, exc_info=True)
+            else:
+                if result.chunks:
+                    for intent_id, chunks in result.group_by_intent(MULTI_CHANNEL_KEY).items():
+                        if chunks:
+                            merged_intent_chunks.setdefault(intent_id, []).extend(chunks)
 
+            # ── MCP 分支（对应 Java buildSubQuestionContext 的 executeMcpAndMerge） ──
+            mcp_intents = NodeScoreFilters.mcp(si.node_scores)
+            if mcp_intents:
+                try:
+                    mcp_section = await self._execute_mcp_and_merge(
+                        si.sub_question, mcp_intents
+                    )
+                    if mcp_section:
+                        mcp_context_parts.append(mcp_section)
+                except Exception:  # noqa: BLE001 单子问题 MCP 失败降级为空，不影响其余子问题
+                    logger.error(
+                        "子问题 MCP 工具执行失败，降级为空，question：%s", si.sub_question, exc_info=True
+                    )
+
+        all_chunks = [c for chunks in merged_intent_chunks.values() for c in chunks]
         kb_context = ""
         if all_chunks:
+            kb_intents = self._merged_kb_intents(sub_intents)
             kb_context = self._context_formatter.format_kb_context(
                 kb_intents,
-                self._retrieved_intent_ids(intent_chunks),
+                self._retrieved_intent_ids(merged_intent_chunks),
                 all_chunks,
                 self._budget.context_top_k,
             )
 
-        return RetrievalContext(kb_context=kb_context, intent_chunks=intent_chunks)
+        return RetrievalContext(
+            kb_context=kb_context,
+            mcp_context="\n\n".join(mcp_context_parts) or None,
+            intent_chunks=merged_intent_chunks,
+        )
+
+    # ==================== MCP 工具编排（对应 Java RetrievalEngine 的 MCP 分支） ====================
+
+    async def _execute_mcp_and_merge(
+        self, question: str, mcp_intents: List[NodeScore]
+    ) -> str:
+        """执行子问题的 MCP 工具并格式化为上下文（对应 Java executeMcpAndMerge）"""
+        if not mcp_intents:
+            return ""
+        if self._mcp_tool_registry is None or self._mcp_parameter_extractor is None:
+            logger.warning("未注入 MCP 注册表/参数提取器，跳过 MCP 工具调用")
+            return ""
+        tool_results = await self._execute_mcp_tools(question, mcp_intents)
+        if not tool_results:
+            return ""
+        return self._context_formatter.format_mcp_context(tool_results, mcp_intents)
+
+    async def _execute_mcp_tools(
+        self, question: str, mcp_intents: List[NodeScore]
+    ) -> Dict[str, List[ToolResult]]:
+        """
+        并行执行各 MCP 工具，按 toolId 分组（对应 Java executeMcpTools 的异步版）
+
+        单工具异常已在上层兜底为错误 ToolResult，asyncio.gather 不会抛出；
+        注册表查不到的执行器返回 None（跳过，不分组）。
+        """
+        outputs = await asyncio.gather(
+            *(self._execute_single_mcp_tool(question, ns.node) for ns in mcp_intents)
+        )
+        grouped: Dict[str, List[ToolResult]] = {}
+        for ns, output in zip(mcp_intents, outputs):
+            if output is None:
+                continue
+            tool_id = ns.node.mcp_tool_id
+            if not tool_id:
+                continue
+            grouped.setdefault(tool_id, []).append(output)
+        return grouped
+
+    async def _execute_single_mcp_tool(
+        self, question: str, intent_node: IntentNode
+    ) -> Optional[ToolResult]:
+        """
+        执行单个 MCP 工具（对应 Java executeSingleMcpTool）
+
+        按提参结局分流：仅 SUCCESS 才真正调用远端工具；缺必填参 → 澄清提示（isError=false 进正文，
+        供 LLM 主动追问）；提取失败（协议畸形 / 值非法）→ 失败提示（isError=true 进失败段）；执行器缺失 → None。
+        """
+        tool_id = intent_node.mcp_tool_id
+        executor = (
+            self._mcp_tool_registry.get_executor(tool_id)
+            if self._mcp_tool_registry is not None
+            else None
+        )
+        if executor is None:
+            logger.warning("MCP 工具不存在: %s", tool_id)
+            return None
+
+        tool = executor.get_tool_definition()
+        custom_prompt = intent_node.param_prompt_template
+        try:
+            extraction = await self._mcp_parameter_extractor.extract_parameters(
+                question, tool, custom_prompt
+            )
+        except Exception:  # noqa: BLE001 提取异常视同提取失败，不调用工具
+            logger.error("MCP 参数提取异常, toolId: %s", tool_id, exc_info=True)
+            return ToolResult(
+                text=f"未能为工具【{tool_id}】提取到有效参数，已跳过调用。", is_error=True
+            )
+
+        if extraction.status == Status.SUCCESS:
+            params = extraction.params if extraction.params is not None else {}
+            result = executor.execute(params)
+            return self._to_tool_result(result, tool_id)
+        if extraction.status == Status.NEED_CLARIFICATION:
+            return self._clarification_result(tool_id, extraction.missing_required)
+        return self._extraction_failed_result(tool_id)
+
+    @staticmethod
+    def _to_tool_result(result: Optional[McpToolResult], tool_id: str) -> Optional[ToolResult]:
+        """McpToolResult → ToolResult（供上下文格式化器消费）"""
+        if result is None:
+            logger.warning("MCP 工具调用返回空结果, toolId: %s", tool_id)
+            return ToolResult(text="工具调用返回空结果", is_error=True)
+        return ToolResult(text=result.to_text(), is_error=result.is_error)
+
+    @staticmethod
+    def _clarification_result(tool_id: str, missing_required: List[str]) -> ToolResult:
+        """
+        缺必填参数（用户未提供）：不调用工具，注入结构化提示让 LLM 在回答中主动向用户追问
+
+        isError=false 使其作为正文进入上下文（而非「工具调用失败」段），便于 LLM 直接据此追问
+        （对齐 Java clarificationResult）。
+        """
+        missing = "、".join(missing_required) if missing_required else "必要信息"
+        logger.info("MCP 缺少必填参数，跳过工具调用并注入澄清提示, toolId: %s, missing: %s", tool_id, missing_required)
+        note = (
+            f"调用工具【{tool_id}】需要参数：{missing}，"
+            "但用户问题中未提供。请在回答中主动向用户询问这些信息，不要编造。"
+        )
+        return ToolResult(text=note, is_error=False)
+
+    @staticmethod
+    def _extraction_failed_result(tool_id: str) -> ToolResult:
+        """提取失败（协议畸形 / 值非法）：不调用工具，注入失败提示（isError=true 进「工具调用失败」段）"""
+        logger.warning("MCP 参数提取失败，跳过工具调用, toolId: %s", tool_id)
+        return ToolResult(
+            text=f"未能为工具【{tool_id}】提取到有效参数，已跳过调用。", is_error=True
+        )
 
     async def _handle_empty_retrieval(self, context: StreamChatContext, retrieval_ctx: RetrievalContext) -> bool:
         """空检索兜底：推送固定文案并停止后续（对应 Java handleEmptyRetrieval）"""
@@ -453,34 +580,6 @@ class RAGChatEngine:
         await self._llm_service.stream_chat(request, callback)
 
     # ==================== 私有辅助 ====================
-
-    def _build_search_context(
-        self,
-        context: StreamChatContext,
-        kb_intent: Optional[NodeScore],
-        collections: Optional[List[str]],
-        directed: bool = True,
-    ) -> SearchContext:
-        """构造一次多通道检索的 SearchContext（对应 Java buildSubQuestionContext 的检索部分）"""
-        if directed and kb_intent is not None:
-            scope = RetrievalScope(
-                directed=True,
-                top_score=kb_intent.score,
-                intents=[kb_intent],
-                target_collections=list(collections or []),
-                supplement_collections=[],
-            )
-        else:
-            scope = RetrievalScope.global_scope(0.0, list(collections or []))
-
-        return SearchContext(
-            original_question=context.question,
-            rewritten_question=context.rewrite_result.rewritten_question,
-            sub_questions=list(context.rewrite_result.sub_questions),
-            intents=[kb_intent] if kb_intent is not None else [],
-            budget=self._budget,
-            retrieval_scope=scope,
-        )
 
     @staticmethod
     def _merged_kb_intents(sub_intents: List[SubQuestionIntent]) -> List[NodeScore]:

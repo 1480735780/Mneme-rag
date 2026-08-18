@@ -31,6 +31,7 @@ from rag.retrieval.schema import (
     SearchContext,
 )
 from rag.retrieval.vector_store import VectorRetrieverService
+from storage.vector.strategy import CollectionParallelRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -192,13 +193,8 @@ class VectorSearchChannel(SearchChannel):
                 top_k,
             )
 
-        per_collection = [RetrieveRequest(query=question, top_k=top_k, collection_names=[c]) for c in collections]
-        results = await asyncio.gather(
-            *(self._retriever.retrieve_by_vector(query_vector, r) for r in per_collection),
-            return_exceptions=True,
+        # 兜底：逐库并行 fan-out（抽自本通道原内联实现，对齐 Java CollectionParallelRetriever）
+        merged = await CollectionParallelRetriever(self._retriever).execute_parallel_retrieval(
+            question, collections, top_k, query_vector
         )
-        merged: List[RetrievedChunk] = []
-        for r in results:
-            if isinstance(r, list):
-                merged.extend(r)
-        return ScopeQuota.cap(ChunkRanking.sorted_by_score(merged), top_k)
+        return ScopeQuota.cap(merged, top_k)
