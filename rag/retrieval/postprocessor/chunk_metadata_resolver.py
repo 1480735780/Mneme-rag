@@ -17,6 +17,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from storage.database import Condition, DatabaseClient
+
 
 @dataclass(frozen=True)
 class ChunkMeta:
@@ -78,3 +80,99 @@ class NoopChunkMetadataResolver(ChunkMetadataResolver):
 
     def resolve_doc_names(self, doc_ids: List[str]) -> Dict[str, str]:
         return {}
+
+
+class DatabaseChunkMetadataResolver(ChunkMetadataResolver):
+    """
+    关系库实现：查 t_knowledge_chunk / t_knowledge_document 回表补齐分块元数据
+
+    对齐 Java ChunkMetadataResolver 的完整语义：
+        - resolve：按 chunkId 批量回表（去空、去重、只取 deleted=0），再按 docId 回表补文档标题；
+        - resolve_doc_names：按 docId 批量回表取文档标题（只取 id 与 doc_name 均非 null 的命中）。
+    两次批量查询都只针对已截断的最终结果集，行数小、开销可忽略。
+
+    deleted=0 / 空白 span 过滤均对齐 Java：@TableLogic 自动附加 deleted=0；
+    docId 空白被过滤、不参与第二次回表（docName 对齐 Java docNameById.get 的 null 兜底）。
+
+    面向 DatabaseClient 抽象编程，注入 InMemoryDatabaseClient（测试 / MVP）或
+    SqlDatabaseClient（真实 SQL）均无感知；MetadataEnrichmentPostProcessor 面向
+    ChunkMetadataResolver 抽象编程，注入本实现即可从 Noop 切到真实回表。
+    """
+
+    CHUNK_TABLE = "t_knowledge_chunk"
+    DOCUMENT_TABLE = "t_knowledge_document"
+
+    def __init__(self, db: DatabaseClient):
+        self._db = db
+
+    def resolve(self, chunk_ids: List[str]) -> Dict[str, ChunkMeta]:
+        distinct_ids = _non_blank_deduped(chunk_ids)
+        if not distinct_ids:
+            return {}
+        chunks = self._db.select_rows(
+            self.CHUNK_TABLE,
+            columns=["id", "doc_id", "chunk_index"],
+            where=[
+                Condition.in_("id", distinct_ids),
+                Condition.eq("deleted", 0),
+            ],
+        )
+        if not chunks:
+            return {}
+        doc_name_by_id = self._resolve_doc_names_rows(
+            [chunk.get("doc_id") for chunk in chunks]
+        )
+        result: Dict[str, ChunkMeta] = {}
+        for chunk in chunks:
+            chunk_id = chunk.get("id")
+            if chunk_id is None:
+                continue
+            result[chunk_id] = ChunkMeta(
+                doc_id=chunk.get("doc_id"),
+                chunk_index=chunk.get("chunk_index"),
+                doc_name=doc_name_by_id.get(chunk.get("doc_id")),
+            )
+        return result
+
+    def resolve_doc_names(self, doc_ids: List[str]) -> Dict[str, str]:
+        distinct_ids = _non_blank_deduped(doc_ids)
+        if not distinct_ids:
+            return {}
+        return self._resolve_doc_names_rows(distinct_ids)
+
+    def _resolve_doc_names_rows(self, doc_ids: List[str]) -> Dict[str, str]:
+        distinct_ids = _non_blank_deduped(doc_ids)
+        if not distinct_ids:
+            return {}
+        rows = self._db.select_rows(
+            self.DOCUMENT_TABLE,
+            columns=["id", "doc_name"],
+            where=[
+                Condition.in_("id", distinct_ids),
+                Condition.eq("deleted", 0),
+            ],
+        )
+        result: Dict[str, str] = {}
+        for row in rows:
+            doc_id = row.get("id")
+            doc_name = row.get("doc_name")
+            if doc_id is None or doc_name is None:
+                continue  # 对齐 Java：doc.getId()!=null && docName()!=null
+            result[doc_id] = doc_name
+        return result
+
+
+def _non_blank_deduped(values: List[Optional[str]]) -> List[str]:
+    """过滤空 / 空白字符串 + 去重保序（对应 Java distinctIds 过滤 null/blank）"""
+    seen = set()
+    result: List[str] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result

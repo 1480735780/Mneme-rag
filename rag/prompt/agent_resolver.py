@@ -27,9 +27,7 @@ StringRedisTemplate 在请求线程内的阻塞语义。
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import threading
 from typing import Dict, Optional
 
 from rag.prompt.builder import (
@@ -39,6 +37,7 @@ from rag.prompt.builder import (
 )
 from rag.prompt.formatter import PromptTemplateUtils
 from storage.cache import CacheManager, MemoryCacheManager
+from storage.cache.bridge import AsyncCacheBridge as _AsyncCacheBridge
 from storage.database.client import Condition, DatabaseClient
 
 logger = logging.getLogger(__name__)
@@ -50,30 +49,6 @@ AGENT_PROMPT_TABLE = "t_agent_prompt"
 # 缓存 key 与 TTL（对齐 Java AgentPromptCacheManager 常量：1 小时过期）
 AGENT_PROMPT_CACHE_KEY = "ragent:agent:resolved-prompts"
 AGENT_PROMPT_CACHE_TTL_SECONDS = 3600.0
-
-
-class _AsyncCacheBridge:
-    """
-    同步调用桥：私有事件循环线程承载异步 CacheManager 协程并阻塞等待结果
-
-    AgentPromptResolver 是同步抽象且会在事件循环线程内被调用（引擎流式链路），
-    此处不能使用 asyncio.run（运行中的循环内会抛错）；桥接线程的循环独立于调用方，
-    任何线程调用均安全（对应 Java StringRedisTemplate 的阻塞 I/O 语义）。
-    """
-
-    _lock = threading.Lock()
-    _loop: Optional[asyncio.AbstractEventLoop] = None
-
-    @classmethod
-    def run(cls, coro):
-        with cls._lock:
-            if cls._loop is None:
-                loop = asyncio.new_event_loop()
-                threading.Thread(
-                    target=loop.run_forever, name="cache-sync-bridge", daemon=True
-                ).start()
-                cls._loop = loop
-        return asyncio.run_coroutine_threadsafe(coro, cls._loop).result()
 
 
 class RedisAgentPromptCacheManager(AgentPromptCacheManager):

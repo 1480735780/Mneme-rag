@@ -21,13 +21,12 @@ JdbcConversationMemoryStore.loadHistory），内存占位按追加顺序（时�
 """
 from __future__ import annotations
 
-import itertools
-import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from core.llm.schema import Message, Role
+from rag.dao.message_id import next_message_id
 from rag.memory.config import MemoryProperties
 from rag.source import CitationMarkup
 from storage.database import Condition, DatabaseClient
@@ -164,8 +163,6 @@ class DatabaseConversationMemoryStore(ConversationMemoryStore):
     ):
         self._db = db
         self._properties = properties or MemoryProperties()
-        # 消息 id 自增序号（itertools.count 的 __next__ 在 CPython 下原子，并发 append 不产生重复 id）
-        self._seq_counter = itertools.count()
 
     def load_history(
         self,
@@ -186,7 +183,7 @@ class DatabaseConversationMemoryStore(ConversationMemoryStore):
     ) -> Optional[str]:
         if _is_blank(conversation_id) or _is_blank(user_id):
             return None
-        message_id = self._next_message_id()
+        message_id = next_message_id()  # 单一 ID 源（与在线 add_message 共享，防并发主键碰撞）
         row = {
             "id": message_id,
             "conversation_id": conversation_id,
@@ -195,8 +192,10 @@ class DatabaseConversationMemoryStore(ConversationMemoryStore):
             "content": message.content,
             "thinking_content": message.thinking_content,
             "thinking_duration": message.thinking_duration,
-            "sources": message.sources,
-            "retrieved_chunks": message.retrieved_chunks,
+            # JSONB 列：dataclass 对象列表转 dict 后落库（SQL 后端 _to_bindable 对 list 强制
+            # json.dumps，对象不可序列化会崩；InMemory 存 dict 后读路径一致）
+            "sources": [s.to_dict() for s in (message.sources or [])],
+            "retrieved_chunks": [c.to_dict() for c in (message.retrieved_chunks or [])],
             "reply_to_message_id": message.reply_to_message_id,
             "message_status": (
                 message.message_status.name if message.message_status is not None else None
@@ -288,10 +287,6 @@ class DatabaseConversationMemoryStore(ConversationMemoryStore):
                 "deleted": 0,
             },
         )
-
-    def _next_message_id(self) -> str:
-        """生成消息 ID：毫秒时间戳 + 自增序号，数字串可参与步骤 5 的 ID 窗口比较"""
-        return f"{int(time.time() * 1000)}{next(self._seq_counter):06d}"
 
     @staticmethod
     def _to_chat_message(row: dict) -> Optional[Message]:

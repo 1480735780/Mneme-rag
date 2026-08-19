@@ -29,11 +29,21 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from rag.intent.model import IntentKind, IntentLevel, IntentNode
+from storage.cache import CacheManager, MemoryCacheManager
+from storage.cache.bridge import AsyncCacheBridge as _AsyncCacheBridge
+from storage.database import Condition, DatabaseClient
 
 logger = logging.getLogger(__name__)
+
+# 表名（对齐 Java DO @TableName）
+INTENT_NODE_TABLE = "t_intent_node"
+
+# 缓存 key 与 TTL（对齐 Java IntentTreeCacheManager 常量：7 天过期）
+INTENT_TREE_CACHE_KEY = "ragent:intent:tree"
+INTENT_TREE_CACHE_TTL_SECONDS = 7 * 24 * 3600.0
 
 
 @dataclass
@@ -454,3 +464,183 @@ class IntentTreeCacheManager:
     def is_cache_exists(self) -> bool:
         """缓存是否存在（对应 Java isCacheExists）"""
         return self._store is not None
+
+
+class RedisIntentTreeCacheManager(IntentTreeCacheManager):
+    """
+    Redis 版意图树缓存管理器（对应 Java IntentTreeCacheManager）
+
+    缓存的是「意图树根节点列表」的 JSON 快照（key ragent:intent:tree，TTL 7 天）。
+    经 5.0 CacheManager 抽象存取（生产注入 RedisCacheManager；未注入时进程内
+    MemoryCacheManager 兜底），JSON 序列化与 Redis 异常兜底由 CacheManager 收口；
+    本层再兜一层桥接 / 反序列化异常，语义对齐 Java：
+      读失败 / JSON 非法 → None（回源 DB）；写 / 删失败仅告警不抛错。
+    任何意图节点增删改后必须 clear_cache()，否则改动直到过期才生效。
+
+    Args:
+        cache_manager: 5.0 缓存抽象实例（生产注入 RedisCacheManager）
+        cache_key:     缓存键
+        ttl_seconds:   过期秒数，默认 7 天
+    """
+
+    def __init__(
+        self,
+        cache_manager: Optional[CacheManager] = None,
+        cache_key: str = INTENT_TREE_CACHE_KEY,
+        ttl_seconds: float = INTENT_TREE_CACHE_TTL_SECONDS,
+    ):
+        self._cache = cache_manager or MemoryCacheManager()
+        self._cache_key = cache_key
+        self._ttl_seconds = ttl_seconds
+
+    def get_intent_tree_from_cache(self) -> Optional[List[IntentNode]]:
+        """读取缓存快照；未命中 / 读失败 / 反序列化异常 → None（回源 DB），不抛错"""
+        try:
+            value = _AsyncCacheBridge.run(self._cache.get(self._cache_key))
+        except Exception:
+            logger.warning("读取意图树缓存失败，回源 DB", exc_info=True)
+            return None
+        if not isinstance(value, list):
+            return None
+        try:
+            return [_dict_to_node(entry) for entry in value]
+        except Exception:
+            logger.warning("意图树缓存反序列化失败，回源 DB", exc_info=True)
+            return None
+
+    def save_intent_tree_to_cache(self, roots: List[IntentNode]) -> None:
+        """保存树快照根节点列表（TTL 7 天）；失败仅告警"""
+        try:
+            _AsyncCacheBridge.run(
+                self._cache.set(
+                    self._cache_key,
+                    [_node_to_dict(node) for node in (roots or [])],
+                    self._ttl_seconds,
+                )
+            )
+        except Exception:
+            logger.warning("保存意图树到缓存失败", exc_info=True)
+
+    def clear_cache(self) -> None:
+        """清除缓存，下次加载强制回源；失败仅告警"""
+        try:
+            _AsyncCacheBridge.run(self._cache.delete(self._cache_key))
+        except Exception:
+            logger.warning("清除意图树缓存失败", exc_info=True)
+
+    def is_cache_exists(self) -> bool:
+        """缓存是否存在（近似：可反序列化为节点列表即视为存在）；后端异常 → False"""
+        return self.get_intent_tree_from_cache() is not None
+
+
+def load_intent_tree_from_db(db: DatabaseClient) -> List[IntentNode]:
+    """
+    从关系库加载意图树（对应 Java loadIntentTreeFromDB）
+
+    查 t_intent_node（deleted=0 且 enabled=1）→ 行转 IntentNodeRecord → 组装成树。
+    面向 DatabaseClient 抽象编程，注入 InMemoryDatabaseClient（测试 / MVP）或
+    SqlDatabaseClient（真实 SQL）均无感知。
+    """
+    rows = db.select_rows(
+        INTENT_NODE_TABLE,
+        where=[
+            Condition.eq("deleted", 0),
+            Condition.eq("enabled", 1),
+        ],
+    )
+    records = [_record_from_row(row) for row in rows]
+    return build_intent_tree_from_records(records)
+
+
+def _record_from_row(row: Dict[str, Any]) -> IntentNodeRecord:
+    """t_intent_node 行 → IntentNodeRecord（对应 Java BeanUtil.toBean 的消费子集映射）"""
+    return IntentNodeRecord(
+        record_id=row.get("id"),
+        intent_code=row.get("intent_code") or "",
+        kb_id=row.get("kb_id"),
+        name=row.get("name"),
+        level=row.get("level"),
+        parent_code=row.get("parent_code"),
+        description=row.get("description"),
+        examples=row.get("examples"),
+        collection_name=row.get("collection_name"),
+        collection_names=_parse_string_list(row.get("collection_names")),
+        mcp_tool_id=row.get("mcp_tool_id"),
+        top_k=row.get("top_k"),
+        kind=row.get("kind"),
+        prompt_snippet=row.get("prompt_snippet"),
+        prompt_template=row.get("prompt_template"),
+        param_prompt_template=row.get("param_prompt_template"),
+    )
+
+
+def _parse_string_list(value: Any) -> List[str]:
+    """
+    解析 collection_names：DB 行可能为 JSON 数组字符串（SQL）或原生 list（InMemory）。
+    二者归一为字符串列表；空 / 畸形返回空列表（对应 Java StringListTypeHandler）。
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v is not None]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if isinstance(parsed, list):
+            return [str(v) for v in parsed if v is not None]
+        return []
+    return []
+
+
+# ==================== 意图树 JSON 序列化（供 Redis 缓存） ====================
+
+
+def _node_to_dict(node: IntentNode) -> Dict[str, Any]:
+    """节点 → JSON 可序列化 dict（递归含 children；层级 / 类型编码化，供缓存往返）"""
+    return {
+        "id": node.id,
+        "kb_id": node.kb_id,
+        "name": node.name,
+        "description": node.description,
+        "level": node.level.code if node.level else None,
+        "parent_id": node.parent_id,
+        "examples": list(node.examples or []),
+        "full_path": node.full_path,
+        "kind": node.kind.code if node.kind else None,
+        "collection_name": node.collection_name,
+        "collection_names": list(node.collection_names or []),
+        "mcp_tool_id": node.mcp_tool_id,
+        "top_k": node.top_k,
+        "prompt_snippet": node.prompt_snippet,
+        "prompt_template": node.prompt_template,
+        "param_prompt_template": node.param_prompt_template,
+        "children": [_node_to_dict(child) for child in (node.children or [])],
+    }
+
+
+def _dict_to_node(data: Dict[str, Any]) -> IntentNode:
+    """dict → 节点（递归重建 children；层级 / 类型经 from_code 反查）"""
+    return IntentNode(
+        id=data["id"],
+        kb_id=data.get("kb_id"),
+        name=data.get("name"),
+        description=data.get("description"),
+        level=IntentLevel.from_code(data.get("level")),
+        parent_id=data.get("parent_id"),
+        examples=list(data.get("examples") or []),
+        children=[_dict_to_node(child) for child in (data.get("children") or [])],
+        full_path=data.get("full_path") or "",
+        kind=IntentKind.from_code(data.get("kind")),
+        collection_name=data.get("collection_name"),
+        collection_names=list(data.get("collection_names") or []),
+        mcp_tool_id=data.get("mcp_tool_id"),
+        top_k=data.get("top_k"),
+        prompt_snippet=data.get("prompt_snippet"),
+        prompt_template=data.get("prompt_template"),
+        param_prompt_template=data.get("param_prompt_template"),
+    )

@@ -12,6 +12,8 @@ t_* DO 的表结构，供 in-memory（登记空表）与真实 SQL 后端（CREA
     - com.nageoffer.ai.ragent.rag.dao.entity.ConversationDO / ConversationMessageDO / ConversationSummaryDO
     - com.nageoffer.ai.ragent.knowledge.dao.entity.KnowledgeBaseDO
     - com.nageoffer.ai.ragent.rag.dao.entity.AgentProfileDO / AgentPromptDO
+    - com.nageoffer.ai.ragent.rag.dao.entity.MessageFeedbackDO / SampleQuestionDO
+    - com.nageoffer.ai.ragent.rag.dao.entity.RagTraceRunDO / RagTraceNodeDO
 """
 from __future__ import annotations
 
@@ -188,12 +190,220 @@ _T_AGENT_PROMPT = TableSchema(
     comment="智能体提示词槽位（content 空白视为未配置并回落内置）",
 )
 
-# 当前消费方用到的全部 t_* 表（4.1 KB provider / 5.1 记忆 store / 摘要 / 5.5 AgentPromptResolver）
+_T_INTENT_NODE = TableSchema(
+    name="t_intent_node",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("kb_id", "VARCHAR(32)"),
+            ("intent_code", "VARCHAR(64)"),
+            ("name", "VARCHAR(100)"),
+            ("level", "INTEGER"),
+            ("parent_code", "VARCHAR(64)"),
+            ("description", "VARCHAR(500)"),
+            ("examples", "TEXT"),
+            ("collection_name", "VARCHAR(64)"),
+            ("collection_names", "TEXT"),
+            ("mcp_tool_id", "VARCHAR(64)"),
+            ("top_k", "INTEGER"),
+            ("kind", "INTEGER"),
+            ("sort_order", "INTEGER"),
+            ("prompt_snippet", "TEXT"),
+            ("prompt_template", "TEXT"),
+            ("param_prompt_template", "TEXT"),
+            ("enabled", "INTEGER"),
+            ("create_by", "VARCHAR(64)"),
+            ("update_by", "VARCHAR(64)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="意图树节点（enabled=1 启用 / deleted=0 未删除）",
+)
+
+_T_QUERY_TERM_MAPPING = TableSchema(
+    name="t_query_term_mapping",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("domain", "VARCHAR(64)"),
+            ("source_term", "VARCHAR(200)"),
+            ("target_term", "VARCHAR(200)"),
+            ("match_type", "INTEGER"),
+            ("priority", "INTEGER"),
+            ("enabled", "INTEGER"),
+            ("remark", "VARCHAR(500)"),
+            ("create_by", "VARCHAR(64)"),
+            ("update_by", "VARCHAR(64)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+        ),
+    ),
+    comment="查询术语映射规则（enabled=1 生效；matchType=1 精确匹配；无 deleted 列——Java DO 无 @TableLogic，生命周期由 enabled 禁用控制）",
+)
+
+_T_MESSAGE_FEEDBACK = TableSchema(
+    name="t_message_feedback",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("message_id", "VARCHAR(32)"),
+            ("conversation_id", "VARCHAR(64)"),
+            ("user_id", "VARCHAR(64)"),
+            ("vote", "INTEGER"),
+            ("reason", "VARCHAR(200)"),
+            ("comment", "VARCHAR(500)"),
+            ("submit_time", "BIGINT"),
+            ("cancelled", "INTEGER"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="会话消息反馈（vote=1 点赞 / -1 点踩；submit_time 最新者生效，cancelled=1 取消）",
+)
+
+_T_SAMPLE_QUESTION = TableSchema(
+    name="t_sample_question",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("title", "VARCHAR(200)"),
+            ("description", "VARCHAR(500)"),
+            ("question", "TEXT"),
+            ("create_by", "VARCHAR(64)"),
+            ("update_by", "VARCHAR(64)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="示例问题（运营配置，列表页随机抽样展示）",
+)
+
+_T_RAG_TRACE_RUN = TableSchema(
+    name="t_rag_trace_run",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("trace_id", "VARCHAR(64)"),
+            ("trace_name", "VARCHAR(64)"),
+            ("entry_method", "VARCHAR(128)"),
+            ("conversation_id", "VARCHAR(64)"),
+            ("task_id", "VARCHAR(64)"),
+            ("user_id", "VARCHAR(64)"),
+            ("status", "VARCHAR(16)"),
+            ("error_message", "TEXT"),
+            ("start_time", "TIMESTAMP"),
+            ("end_time", "TIMESTAMP"),
+            ("duration_ms", "INTEGER"),
+            ("extra_data", "JSONB"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="RAG 链路追踪运行汇总（status: RUNNING/SUCCESS/ERROR；extra_data 为 JSON；@TableLogic 软删）",
+)
+
+_T_RAG_TRACE_NODE = TableSchema(
+    name="t_rag_trace_node",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("trace_id", "VARCHAR(64)"),
+            ("node_id", "VARCHAR(64)"),
+            ("parent_node_id", "VARCHAR(64)"),
+            ("depth", "INTEGER"),
+            ("node_type", "VARCHAR(32)"),
+            ("node_name", "VARCHAR(64)"),
+            ("class_name", "VARCHAR(128)"),
+            ("method_name", "VARCHAR(128)"),
+            ("status", "VARCHAR(16)"),
+            ("error_message", "TEXT"),
+            ("start_time", "TIMESTAMP"),
+            ("end_time", "TIMESTAMP"),
+            ("duration_ms", "INTEGER"),
+            ("extra_data", "JSONB"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="RAG 追踪节点（方法级/流式 span；status: RUNNING/SUCCESS/ERROR；@TableLogic 软删）",
+)
+
+_T_KNOWLEDGE_CHUNK = TableSchema(
+    name="t_knowledge_chunk",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("kb_id", "VARCHAR(32)"),
+            ("doc_id", "VARCHAR(32)"),
+            ("chunk_index", "INTEGER"),
+            ("content", "TEXT"),
+            ("content_hash", "VARCHAR(64)"),
+            ("char_count", "INTEGER"),
+            ("token_count", "INTEGER"),
+            ("embedding_text", "TEXT"),
+            ("enabled", "INTEGER"),
+            ("created_by", "VARCHAR(64)"),
+            ("updated_by", "VARCHAR(64)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="知识库文档分块",
+)
+
+_T_KNOWLEDGE_DOCUMENT = TableSchema(
+    name="t_knowledge_document",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("kb_id", "VARCHAR(32)"),
+            ("doc_name", "VARCHAR(200)"),
+            ("source_type", "VARCHAR(16)"),
+            ("source_location", "VARCHAR(512)"),
+            ("schedule_enabled", "INTEGER"),
+            ("schedule_cron", "VARCHAR(64)"),
+            ("enabled", "INTEGER"),
+            ("chunk_count", "INTEGER"),
+            ("file_url", "VARCHAR(512)"),
+            ("file_type", "VARCHAR(32)"),
+            ("mime_type", "VARCHAR(128)"),
+            ("file_size", "BIGINT"),
+            ("process_mode", "VARCHAR(16)"),
+            ("ingestion_spec", "TEXT"),
+            ("pipeline_id", "VARCHAR(32)"),
+            ("status", "VARCHAR(16)"),
+            ("created_by", "VARCHAR(64)"),
+            ("updated_by", "VARCHAR(64)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="知识库文档",
+)
+
+# 当前消费方用到的全部 t_* 表（4.1 KB provider / 5.1 记忆 store / 摘要 / 5.5 AgentPromptResolver / ChunkMetadataResolver
+# / P4 会话/反馈/示例问题/追踪持久化）
 DEFAULT_TABLES: List[TableSchema] = [
     _T_CONVERSATION,
     _T_MESSAGE,
     _T_CONVERSATION_SUMMARY,
     _T_KNOWLEDGE_BASE,
+    _T_KNOWLEDGE_CHUNK,
+    _T_KNOWLEDGE_DOCUMENT,
     _T_AGENT_PROFILE,
     _T_AGENT_PROMPT,
+    _T_INTENT_NODE,
+    _T_QUERY_TERM_MAPPING,
+    _T_MESSAGE_FEEDBACK,
+    _T_SAMPLE_QUESTION,
+    _T_RAG_TRACE_RUN,
+    _T_RAG_TRACE_NODE,
 ]

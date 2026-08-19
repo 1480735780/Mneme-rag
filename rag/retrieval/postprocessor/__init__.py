@@ -22,6 +22,7 @@ from rag.retrieval.postprocessor.base import SearchResultPostProcessor
 from rag.retrieval.postprocessor.channel_attribution import ChannelAttribution
 from rag.retrieval.postprocessor.chunk_metadata_resolver import (
     ChunkMetadataResolver,
+    DatabaseChunkMetadataResolver,
     NoopChunkMetadataResolver,
 )
 from rag.retrieval.postprocessor.dedup import DeduplicationPostProcessor
@@ -32,6 +33,7 @@ from rag.retrieval.postprocessor.rerank import RerankPostProcessor
 __all__ = [
     "ChannelAttribution",
     "ChunkMetadataResolver",
+    "DatabaseChunkMetadataResolver",
     "DeduplicationPostProcessor",
     "FusionPostProcessor",
     "MetadataEnrichmentPostProcessor",

@@ -37,17 +37,27 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from core.llm.chat import LLMService
 from core.llm.enums import Tier
 from core.llm.schema import ChatRequest, Message, Role
 from rag.prompt.formatter import PromptTemplateLoader
+from storage.cache import CacheManager, MemoryCacheManager
+from storage.cache.bridge import AsyncCacheBridge as _AsyncCacheBridge
+from storage.database import Condition, DatabaseClient
 
 logger = logging.getLogger(__name__)
 
 # 改写 + 拆分模板路径（对应 Java RAGConstant.QUERY_REWRITE_AND_SPLIT_PROMPT_PATH）
 QUERY_REWRITE_AND_SPLIT_PROMPT_PATH = "prompt/user-question-rewrite.st"
+
+# 表名（对齐 Java DO @TableName）
+QUERY_TERM_MAPPING_TABLE = "t_query_term_mapping"
+
+# 缓存 key 与 TTL（对齐 Java QueryTermMappingCacheManager 常量：7 天过期）
+QUERY_TERM_MAPPING_CACHE_KEY = "ragent:query-term:mappings"
+QUERY_TERM_MAPPING_CACHE_TTL_SECONDS = 7 * 24 * 3600.0
 
 # 模型偶发包裹 Markdown 代码围栏时的剥离（对应 Java LLMResponseCleaner.stripMarkdownCodeFence，
 # 后者整体延后上线，此处只做改写链路需要的最小清理）
@@ -225,6 +235,151 @@ class QueryTermMappingCacheManager:
         self._store = None
 
 
+class RedisQueryTermMappingCacheManager(QueryTermMappingCacheManager):
+    """
+    Redis 版术语映射缓存管理器（对应 Java QueryTermMappingCacheManager）
+
+    缓存的是「术语映射规则列表」的 JSON 快照（key ragent:query-term:mappings，TTL 7 天）。
+    经 5.0 CacheManager 抽象存取（生产注入 RedisCacheManager；未注入时进程内
+    MemoryCacheManager 兜底），JSON 序列化与 Redis 异常兜底由 CacheManager 收口；
+    本层再兜一层桥接 / 反序列化异常，语义对齐 Java：
+      读失败 / JSON 非法 → None（回源 DB）；写 / 删失败仅告警不抛错。
+    任何映射规则增删改后必须 clear_cache()，否则改动直到过期才生效。
+
+    Args:
+        cache_manager: 5.0 缓存抽象实例（生产注入 RedisCacheManager）
+        cache_key:     缓存键
+        ttl_seconds:   过期秒数，默认 7 天
+    """
+
+    def __init__(
+        self,
+        cache_manager: Optional[CacheManager] = None,
+        cache_key: str = QUERY_TERM_MAPPING_CACHE_KEY,
+        ttl_seconds: float = QUERY_TERM_MAPPING_CACHE_TTL_SECONDS,
+    ):
+        self._cache = cache_manager or MemoryCacheManager()
+        self._cache_key = cache_key
+        self._ttl_seconds = ttl_seconds
+
+    def get_mappings_from_cache(self) -> Optional[List[TermMappingRule]]:
+        """读取缓存快照；未命中 / 读失败 / 反序列化异常 → None（回源 DB），不抛错"""
+        try:
+            value = _AsyncCacheBridge.run(self._cache.get(self._cache_key))
+        except Exception:
+            logger.warning("读取术语映射缓存失败，回源 DB", exc_info=True)
+            return None
+        if not isinstance(value, list):
+            return None
+        try:
+            return [_rule_from_dict(entry) for entry in value]
+        except Exception:
+            logger.warning("术语映射缓存反序列化失败，回源 DB", exc_info=True)
+            return None
+
+    def save_mappings_to_cache(self, mappings: List[TermMappingRule]) -> None:
+        """保存规则列表快照（已排序，TTL 7 天）；失败仅告警"""
+        try:
+            _AsyncCacheBridge.run(
+                self._cache.set(
+                    self._cache_key,
+                    [_rule_to_dict(rule) for rule in (mappings or [])],
+                    self._ttl_seconds,
+                )
+            )
+        except Exception:
+            logger.warning("保存术语映射到缓存失败", exc_info=True)
+
+    def clear_cache(self) -> None:
+        """清除缓存，下次 normalize 强制回源；失败仅告警"""
+        try:
+            _AsyncCacheBridge.run(self._cache.delete(self._cache_key))
+        except Exception:
+            logger.warning("清除术语映射缓存失败", exc_info=True)
+
+
+def load_term_mappings_from_db(db: DatabaseClient) -> List[TermMappingRule]:
+    """
+    从关系库加载术语映射规则（对应 Java QueryTermMappingService.loadMappings 的 DB 部分）
+
+    查 t_query_term_mapping（enabled=1），行转 TermMappingRule 后按 Java 排序规则排序。
+    面向 DatabaseClient 抽象编程，注入 InMemoryDatabaseClient（测试 / MVP）或
+    SqlDatabaseClient（真实 SQL）均无感知。
+    """
+    rows = db.select_rows(
+        QUERY_TERM_MAPPING_TABLE,
+        where=[Condition.eq("enabled", 1)],
+    )
+    return _sort_mappings([_rule_from_row(row) for row in rows])
+
+
+def _rule_from_row(row: Dict[str, Any]) -> TermMappingRule:
+    """t_query_term_mapping 行 → TermMappingRule（对应 Java BeanUtil.toBean 的消费子集）"""
+    return TermMappingRule(
+        source_term=row.get("source_term") or "",
+        target_term=row.get("target_term") or "",
+        match_type=row.get("match_type"),
+        priority=row.get("priority"),
+        enabled=row.get("enabled"),
+    )
+
+
+def _sort_mappings(rules: List[TermMappingRule]) -> List[TermMappingRule]:
+    """
+    应用顺序排序（对齐 Java loadMappings 的 Comparator 链）
+
+    Java：comparing(priority, nullsLast()).reversed() → priority 降序、null 排最前；
+    再 thenComparing(sourceTerm 长度, reverseOrder()) → 同优先级长词在前。
+    """
+    return sorted(
+        rules,
+        key=lambda r: (
+            1 if r.priority is None else 0,  # null 排最前（对齐 Java reversed(nullsLast)）
+            r.priority if r.priority is not None else 0,
+            len(r.source_term) if r.source_term else 0,
+        ),
+        reverse=True,
+    )
+
+
+def _apply_mappings(text: str, mappings: List[TermMappingRule]) -> str:
+    """按顺序应用生效的精确匹配规则（对齐 Java QueryTermMappingService.normalize 主循环）"""
+    result = text
+    for mapping in mappings:
+        if mapping.enabled is None or mapping.enabled == 0:
+            continue
+        if mapping.match_type is not None and mapping.match_type != 1:
+            continue
+        if not mapping.source_term or not mapping.target_term:
+            continue
+        result = QueryTermMappingUtil.apply_mapping(
+            result, mapping.source_term, mapping.target_term
+        )
+    return result
+
+
+def _rule_to_dict(rule: TermMappingRule) -> Dict[str, Any]:
+    """规则 → JSON 可序列化 dict（供 Redis 缓存往返）"""
+    return {
+        "source_term": rule.source_term,
+        "target_term": rule.target_term,
+        "match_type": rule.match_type,
+        "priority": rule.priority,
+        "enabled": rule.enabled,
+    }
+
+
+def _rule_from_dict(data: Dict[str, Any]) -> TermMappingRule:
+    """dict → 规则（缓存反序列化）"""
+    return TermMappingRule(
+        source_term=data.get("source_term") or "",
+        target_term=data.get("target_term") or "",
+        match_type=data.get("match_type"),
+        priority=data.get("priority"),
+        enabled=data.get("enabled"),
+    )
+
+
 class MemoryQueryTermMappingService(QueryTermMappingService):
     """
     内存版术语归一化实现（对应 Java QueryTermMappingService，步骤 4）
@@ -255,37 +410,55 @@ class MemoryQueryTermMappingService(QueryTermMappingService):
         mappings = self._load_mappings()
         if not mappings:
             return text
-
-        result = text
-        for mapping in mappings:
-            if mapping.enabled is None or mapping.enabled == 0:
-                continue
-            if mapping.match_type is not None and mapping.match_type != 1:
-                continue
-            if not mapping.source_term or not mapping.target_term:
-                continue
-            result = QueryTermMappingUtil.apply_mapping(
-                result, mapping.source_term, mapping.target_term
-            )
-        return result
+        return _apply_mappings(text, mappings)
 
     def _load_mappings(self) -> List[TermMappingRule]:
         """加载生效规则：缓存优先，未命中从注入源加载、排序后落缓存（对应 Java loadMappings）"""
         cached = self._cache_manager.get_mappings_from_cache()
         if cached:
             return cached
-
-        enabled_rules = [r for r in self._rules if r.enabled]
-        # 对齐 Java：priority 降序（nullsLast → None 视为最大排最后），再按 source_term 长度降序（长词在前）
-        enabled_rules.sort(
-            key=lambda r: (
-                r.priority if r.priority is not None else float("inf"),
-                len(r.source_term) if r.source_term else 0,
-            ),
-            reverse=True,
-        )
+        enabled_rules = _sort_mappings([r for r in self._rules if r.enabled])
         self._cache_manager.save_mappings_to_cache(enabled_rules)
         return enabled_rules
+
+
+class DatabaseQueryTermMappingService(QueryTermMappingService):
+    """
+    关系库版术语归一化实现（对应 Java QueryTermMappingService）
+
+    以 t_query_term_mapping（enabled=1）为唯一数据源，走「缓存 → DB 加载排序 → 落缓存」
+    三段流程；仅生效（enabled）且精确匹配（matchType=1）的规则参与替换（同 Memory 版）。
+
+    Args:
+        db_client:      5.0 关系库抽象（t_query_term_mapping）
+        cache_manager:  映射规则缓存，默认 RedisQueryTermMappingCacheManager()（未注入
+                        Redis 时进程内兜底）；测试可注入进程内 QueryTermMappingCacheManager
+    """
+
+    def __init__(
+        self,
+        db_client: DatabaseClient,
+        cache_manager: Optional[QueryTermMappingCacheManager] = None,
+    ):
+        self._db = db_client
+        self._cache_manager = cache_manager or RedisQueryTermMappingCacheManager()
+
+    def normalize(self, text: Optional[str]) -> Optional[str]:
+        if text is None or text == "":
+            return text
+        mappings = self._load_mappings()
+        if not mappings:
+            return text
+        return _apply_mappings(text, mappings)
+
+    def _load_mappings(self) -> List[TermMappingRule]:
+        """加载生效规则：缓存优先，未命中从 DB 加载、排序后落缓存（对应 Java loadMappings）"""
+        cached = self._cache_manager.get_mappings_from_cache()
+        if cached:
+            return cached
+        mappings = load_term_mappings_from_db(self._db)
+        self._cache_manager.save_mappings_to_cache(mappings)
+        return mappings
 
 
 class MultiQuestionRewriteService(QueryRewriteService):

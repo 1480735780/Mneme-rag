@@ -16,7 +16,12 @@ rag.graph - 知识图谱检索
     - rag/config/GraphProperties
     - rag/controller/vo/GraphViewVO
 """
-from rag.graph.client import LightRagClient, MemoryGraphDoc, MemoryLightRagClient
+from rag.graph.client import (
+    HttpLightRagClient,
+    LightRagClient,
+    MemoryGraphDoc,
+    MemoryLightRagClient,
+)
 from rag.graph.config import GraphProperties, LightRagProperties
 from rag.graph.evidence import GraphEvidence
 from rag.graph.file_source import GraphFileSource
@@ -31,6 +36,7 @@ __all__ = [
     "GraphProperties",
     "GraphQueryService",
     "GraphViewVO",
+    "HttpLightRagClient",
     "LightRagClient",
     "LightRagProperties",
     "MemoryGraphDoc",

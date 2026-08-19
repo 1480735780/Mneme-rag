@@ -27,17 +27,21 @@ from rag.intent.classifier import (
 )
 from rag.intent.model import IntentKind, IntentLevel, IntentNode, NodeScore
 from rag.intent.tree import (
+    INTENT_TREE_CACHE_KEY,
     IntentNodeRecord,
     IntentTreeCacheManager,
     IntentTreeFactory,
+    RedisIntentTreeCacheManager,
     build_intent_tree_from_records,
     fill_full_path,
     flatten_intent_tree,
+    load_intent_tree_from_db,
 )
 
 __all__ = [
     "INTENT_CLASSIFIER_PROMPT_PATH",
     "INTENT_MIN_SCORE",
+    "INTENT_TREE_CACHE_KEY",
     "MAX_INTENT_COUNT",
     "DefaultIntentClassifier",
     "IntentCandidate",
@@ -54,8 +58,10 @@ __all__ = [
     "IntentTreeFactory",
     "NodeScore",
     "NodeScoreFilters",
+    "RedisIntentTreeCacheManager",
     "SubQuestionIntent",
     "build_intent_tree_from_records",
     "fill_full_path",
     "flatten_intent_tree",
+    "load_intent_tree_from_db",
 ]
