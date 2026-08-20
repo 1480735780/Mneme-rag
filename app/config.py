@@ -23,12 +23,20 @@ class AppSettings:
         port:           uvicorn 监听端口（env RAGENT_PORT，默认 8000）
         stack_profile:  装配栈：memory（全内存，测试/演示）或 real（DB/Redis，env 驱动）
         sse_timeout_ms: SSE 超时（毫秒，M3 用；预留默认 0 = 不超时）
+        orchestration_mode: 编排模式（workflow | agent，env RAGENT_ORCHESTRATION_MODE，默认 workflow）；
+            部署级决策（切换需重启），喂给 5.5 AgentProfileAdminService._mode 与
+            5.6 SystemSettingsService（槽位生效集 / 设置展示统一依此）
+        rate_limit_backend: 限流器后端（process | redis，env RAGENT_RATE_LIMIT_BACKEND，默认 process）：
+            process=ProcessFairRateLimiter（单机，6.2）；redis=RedisFairRateLimiter（分布式，6.3，
+            需注入 redis.asyncio 客户端）
     """
 
     host: str = "127.0.0.1"
     port: int = 8000
     stack_profile: str = "memory"
     sse_timeout_ms: int = 0
+    orchestration_mode: str = "workflow"
+    rate_limit_backend: str = "process"
 
     def is_memory(self) -> bool:
         """是否内存栈（对齐 Java @ConditionalOnProperty 语义）"""
@@ -42,4 +50,6 @@ class AppSettings:
             port=int(os.environ.get("RAGENT_PORT", "8000")),
             stack_profile=os.environ.get("RAGENT_STACK_PROFILE", "memory"),
             sse_timeout_ms=int(os.environ.get("RAGENT_SSE_TIMEOUT_MS", "0")),
+            orchestration_mode=os.environ.get("RAGENT_ORCHESTRATION_MODE", "workflow"),
+            rate_limit_backend=os.environ.get("RAGENT_RATE_LIMIT_BACKEND", "process"),
         )

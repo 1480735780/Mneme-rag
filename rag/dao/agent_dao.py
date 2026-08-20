@@ -106,23 +106,29 @@ class AgentProfileDao:
         self,
         pid: str,
         *,
-        name: Optional[str] = None,
+        name: str,
         description: Optional[str] = None,
         avatar: Optional[str] = None,
     ) -> bool:
         """
-        按主键部分更新（仅传非空字段 + 刷新 update_by/update_time，对齐 Java updateById 逐字段 set）
+        PUT 全量更新档案（对齐 Java updateProfile 的显式 `.set`）：**始终显式覆写**
+        name/description/avatar 三列，None 即**清空为 NULL**，非「跳过字段」。
+
+        Notes:
+            - 唯一调用方是 AgentProfileAdminService.update（name 必传、desc/avatar 可能为 None），
+              故此处按全量覆写语义实现；
+            - description/avatar 传 None 会清空数据库该列（对齐 Java `.set(..., trimToNull)`）。
 
         Returns:
             bool: 是否存在命中档案（软删过滤）
         """
-        values: Row = {"update_by": UserContext.get_user_id(), "update_time": now_iso()}
-        if name is not None:
-            values["name"] = name
-        if description is not None:
-            values["description"] = description
-        if avatar is not None:
-            values["avatar"] = avatar
+        values: Row = {
+            "name": name,
+            "description": description,
+            "avatar": avatar,
+            "update_by": UserContext.get_user_id(),
+            "update_time": now_iso(),
+        }
         count = self._db.update_rows(
             AGENT_PROFILE_TABLE,
             values,
@@ -246,3 +252,15 @@ class AgentPromptDao:
                 Condition.eq("deleted", NOT_DELETED),
             ],
         )
+
+    def delete_by_agent(self, agent_id: str) -> int:
+        """软删某智能体全部提示词（对齐 Java delete agentId wrappers）；返回受影响行数"""
+        count = self._db.update_rows(
+            AGENT_PROMPT_TABLE,
+            mark_deleted(),
+            where=[
+                Condition.eq("agent_id", agent_id),
+                Condition.eq("deleted", NOT_DELETED),
+            ],
+        )
+        return count

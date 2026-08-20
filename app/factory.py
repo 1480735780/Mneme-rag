@@ -40,6 +40,12 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
         container = AppContainer.build(app_settings)
         app.state.container = container
         logger.info("应用装配完成, profile=%s", app_settings.stack_profile)
+        # 半装配防护：引擎就绪（M7 C14 装配）才暴露聊天流式/停止端点，
+        # 避免 chat_service 未装配时路由可达产生 500
+        if container.engine is not None:
+            from rag.controller.chat_controller import router as chat_router
+
+            app.include_router(chat_router)
         try:
             yield
         finally:
@@ -66,8 +72,29 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
 
     # RAG 业务路由（M2 会话域切片接入；其余域随里程碑追加）
     from rag.controller.conversation_controller import router as conversation_router
+    from rag.controller.message_feedback_controller import router as feedback_router
+    from rag.controller.recommended_question_controller import router as recommended_router
+    from rag.controller.sample_question_controller import router as sample_question_router
+    from rag.controller.trace_controller import router as trace_router
+    from rag.controller.query_term_mapping_controller import router as term_mapping_router
+    from rag.controller.intent_tree_controller import router as intent_tree_router
+    from rag.controller.agent_profile_controller import router as agent_profile_router
+    from rag.controller.settings_controller import router as settings_router
+    from rag.controller.graph_controller import router as graph_router
 
     app.include_router(conversation_router)
+    # M4 反馈与推荐追问域（C4/C5/C6）：与 engine 无关，常驻挂载
+    app.include_router(feedback_router)
+    app.include_router(recommended_router)
+    app.include_router(sample_question_router)
+    # M5 管理端切片（C7–C12）：服务已装配，常驻挂载
+    app.include_router(trace_router)
+    app.include_router(term_mapping_router)
+    app.include_router(intent_tree_router)
+    app.include_router(agent_profile_router)
+    app.include_router(settings_router)
+    app.include_router(graph_router)
+    # 聊天流式/停止（M3）经 lifespan 条件挂载（engine 就绪才暴露，见上）
 
     # 探活端点（对齐 M0 DoD：GET /health 返回统一 Result）
     @app.get("/health")

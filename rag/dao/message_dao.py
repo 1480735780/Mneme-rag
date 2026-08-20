@@ -61,6 +61,18 @@ class MessageDao:
         )
         return rows[0] if rows else None
 
+    def update_recommended_questions(self, message_id: str, questions: object) -> bool:
+        """写回推荐追问（对齐 Java updateById 只更新 recommended_questions；JSONB 列由执行器序列化）"""
+        count = self._db.update_rows(
+            MESSAGE_TABLE,
+            {"recommended_questions": questions, "update_time": now_iso()},
+            where=[
+                Condition.eq("id", message_id),
+                Condition.eq("deleted", NOT_DELETED),
+            ],
+        )
+        return count > 0
+
     def list_by_conversation(
         self,
         conversation_id: str,

@@ -31,6 +31,7 @@ import logging
 from typing import Dict, Optional
 
 from rag.prompt.builder import (
+    DEFAULT_AGENT_PROMPTS,
     AgentPromptCacheManager,
     AgentPromptResolver,
     AgentPromptSlot,
@@ -128,7 +129,10 @@ class DatabaseAgentPromptResolver(AgentPromptResolver):
         if slot is None:
             return ""
         value = self.resolve_all().get(slot.name)
-        return "" if value is None else value
+        if value:
+            return value
+        # 未配置回落内置默认（仅对已声明默认值的槽位生效，其余仍空串）
+        return DEFAULT_AGENT_PROMPTS.get(slot.name, "")
 
     def render(self, slot: AgentPromptSlot, slots: Optional[Dict[str, str]]) -> str:
         return PromptTemplateUtils.cleanup_prompt(

@@ -241,6 +241,29 @@ class AgentPromptSlot(Enum):
         return None
 
 
+# ==================== 内置默认槽位模板（对齐 Java 内置智能体播种的默认提示词） ====================
+#
+# 背景：Java 的内置默认来自「数据初始化时播种的 builtin 智能体 + 其 prompt 行」，DB 数据源缺失时
+# 回落空串。Python MVP 无数据初始化器 → 这里以**代码级内置默认**兜底，保证无配置时槽位不落空
+# （尤其 M4 推荐追问链路 RECOMMENDED_QUESTIONS，空 prompt 会使 LLM 生成退化）。
+# 语义：仅对**已声明默认值**的槽位生效；未声明默认值的槽位仍按原逻辑回落空串。
+DEFAULT_AGENT_PROMPTS: Dict[str, str] = {
+    AgentPromptSlot.RECOMMENDED_QUESTIONS.name: (
+        "你是智能提问助手。请基于用户的原始问题、模型给出的答案以及可选检索片段，"
+        "生成 {count} 个用户最可能继续追问的问题。\n"
+        "要求：\n"
+        "1. 只输出一个 JSON 字符串数组，不要任何解释或代码围栏。\n"
+        "2. 每个问题简洁、口语化，聚焦答案中尚未充分展开的方面。\n"
+        "3. 问题之间避免重复。\n\n"
+        "输入：\n"
+        "用户问题：{question}\n"
+        "答案：{answer}\n"
+        "检索片段：\n{chunks}\n\n"
+        "输出格式：[\"追问一\", \"追问二\", ...]"
+    ),
+}
+
+
 class AgentPromptCacheManager:
     """
     智能体提示词缓存管理器·进程内版（对应 Java AgentPromptCacheManager）
@@ -320,7 +343,11 @@ class StaticAgentPromptResolver(AgentPromptResolver):
     def resolve(self, slot: Optional[AgentPromptSlot]) -> str:
         if slot is None:
             return ""
-        return self.resolve_all().get(slot.name, "")
+        value = self.resolve_all().get(slot.name)
+        if value:
+            return value
+        # 未配置回落内置默认（仅对已声明默认值的槽位生效，其余仍空串）
+        return DEFAULT_AGENT_PROMPTS.get(slot.name, "")
 
     def render(self, slot: AgentPromptSlot, slots: Optional[Dict[str, str]]) -> str:
         return PromptTemplateUtils.cleanup_prompt(

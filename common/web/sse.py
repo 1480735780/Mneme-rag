@@ -64,6 +64,8 @@ class SseQueue:
     def __init__(self, maxsize: int = 0):
         self._queue: "asyncio.Queue[str | object]" = asyncio.Queue(maxsize=maxsize)
         self._closed = False
+        # 关闭信号：close() 置位，供限流排队侧监听「emitter 结束」以取消排队（6.4）
+        self._closed_event = asyncio.Event()
 
     def push(self, frame: str) -> None:
         """生产一帧；队列已关闭时静默丢弃（对齐 Java closed 检查）。
@@ -90,7 +92,16 @@ class SseQueue:
         if self._closed:
             return
         self._closed = True
+        self._closed_event.set()
         self._put_with_backpressure(_QUEUE_CLOSED)
+
+    async def wait_closed(self) -> None:
+        """等待队列被关闭（幂等，已关闭立即返回）。
+
+        供限流排队侧（6.4 ChatQueueLimiter）监听「emitter 结束」以取消排队：
+        Java 经 SseEmitter.onCompletion/onTimeout/onError 绑定取消，Python 以本事件等价。
+        """
+        await self._closed_event.wait()
 
     def _put_with_backpressure(self, item) -> None:
         """写入一条，队列满时丢弃最旧帧腾位（对齐计划 R1「满则丢最旧」），保证不抛、必投递"""

@@ -30,6 +30,9 @@ from storage.database import Condition, DatabaseClient, Row
 TRACE_RUN_TABLE = "t_rag_trace_run"
 TRACE_NODE_TABLE = "t_rag_trace_node"
 
+# 首包 TTFT 节点类型（对齐 trace_runner USER_TTFT_NODE_TYPE / Java USER_TTFT）
+USER_TTFT_NODE_TYPE = "USER_TTFT"
+
 
 class RagTraceRunDao:
     """RAG 追踪运行记录数据访问"""
@@ -183,3 +186,35 @@ class RagTraceNodeDao:
             ],
             order_by=[("start_time", "asc"), ("id", "asc")],
         )
+
+    def get_ttft_durations(self, trace_ids: List[str]) -> Dict[str, int]:
+        """
+        批量取各 trace 的首包 TTFT 时长：{trace_id: duration_ms}
+
+        对应 Java loadTtftMap：WHERE node_type='USER_TTFT' AND trace_id IN(...)——
+        一次查询避免 page_runs 的 N+1。每个 trace 保留首条插入的时长（对齐 Java toMap 首个 wins）。
+
+        Args:
+            trace_ids: 待查 trace_id 列表（空则返回空 map）
+
+        Returns:
+            {trace_id: duration_ms}，软删过滤（deleted=0）
+        """
+        if not trace_ids:
+            return {}
+        rows = self._db.select_rows(
+            TRACE_NODE_TABLE,
+            columns=["trace_id", "duration_ms"],
+            where=[
+                Condition.in_("trace_id", trace_ids),
+                Condition.eq("node_type", USER_TTFT_NODE_TYPE),
+                Condition.eq("deleted", NOT_DELETED),
+            ],
+        )
+        result: Dict[str, int] = {}
+        for row in rows:
+            trace_id = row.get("trace_id")
+            duration = row.get("duration_ms")
+            if trace_id and duration is not None and trace_id not in result:
+                result[trace_id] = duration
+        return result
