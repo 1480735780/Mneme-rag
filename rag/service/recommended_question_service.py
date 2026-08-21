@@ -90,6 +90,10 @@ class RecommendedQuestionGenerator:
         self._resolver = agent_prompt_resolver or StaticAgentPromptResolver()
         self._llm_service = llm_service
 
+    def set_llm(self, llm_service: object) -> None:
+        """注入 LLM 路由（快赢②：装配 engine 后回注，推荐追问不再恒 FAILED）"""
+        self._llm_service = llm_service
+
     async def generate(
         self,
         question: Optional[str],
@@ -157,6 +161,10 @@ class RecommendedQuestionService:
     def __init__(self, message_dao: MessageDao, generator: RecommendedQuestionGenerator):
         self._message_dao = message_dao
         self._generator = generator
+
+    def inject_llm(self, llm_service: object) -> None:
+        """注入 LLM 路由（快赢②：装配 engine 后回注 generator，推荐追问走真实模型）"""
+        self._generator.set_llm(llm_service)
 
     async def generate(self, message_id: str, user_id: str) -> RecommendedQuestionsPayload:
         """生成推荐追问并落库（对齐 Java generate）"""

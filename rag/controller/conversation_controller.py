@@ -34,6 +34,7 @@ from common.context.user_context import UserContext
 from common.response.result import Results
 from common.web.serializer import result_to_dict
 from rag.dao.message_dao import MessageOrder
+from rag.controller.vo import ConversationMessageVO, ConversationVO
 
 router = APIRouter(prefix="/conversations", tags=["conversation"])
 
@@ -53,10 +54,11 @@ def _container(request: Request) -> AppContainer:
 
 @router.get("", name="list_conversations")
 async def list_conversations(request: Request) -> dict:
-    """GET /conversations：当前用户会话列表（last_time 倒序）"""
+    """GET /conversations：当前用户会话列表（last_time 倒序，ConversationVO camelCase）"""
     container = _container(request)
     rows = container.conversation_service.list_by_user(UserContext.get_user_id())
-    return result_to_dict(Results.success(rows))
+    data = [ConversationVO.from_row(r).to_camel_dict() for r in rows]
+    return result_to_dict(Results.success(data))
 
 
 # ==================== 重命名 / 删除 ====================
@@ -93,9 +95,10 @@ async def list_conversation_messages(
     request: Request,
     limit: Optional[int] = None,
 ) -> dict:
-    """GET /conversations/{id}/messages：会话消息历史（ASC 时间正序全量，对齐 Java listMessages）"""
+    """GET /conversations/{id}/messages：会话消息历史（ASC 时间正序全量，ConversationMessageVO camelCase）"""
     container = _container(request)
     rows = container.message_service.list_messages(
         conversation_id, UserContext.get_user_id(), limit=limit, order=MessageOrder.ASC
     )
-    return result_to_dict(Results.success(rows))
+    data = [ConversationMessageVO.from_row(r).to_camel_dict() for r in rows]
+    return result_to_dict(Results.success(data))

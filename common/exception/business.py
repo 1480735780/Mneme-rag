@@ -61,6 +61,12 @@ class ClientException(AbstractException):
     DEFAULT_ERROR_CODE = BaseErrorCode.CLIENT_ERROR
 
 
+class TooManyRequestsException(ClientException):
+    """请求过载 / 触发限流（对应 HTTP 429；全局处理器映射为独立错误码 A000429，不等同于普通 400）"""
+
+    DEFAULT_ERROR_CODE = BaseErrorCode.TOO_MANY_REQUESTS
+
+
 class ServiceException(AbstractException):
     """服务端异常：请求运行过程中不符合业务预期的异常（对应 Java ServiceException）"""
 

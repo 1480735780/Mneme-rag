@@ -42,6 +42,21 @@ def _container(request: Request) -> AppContainer:
     return request.app.state.container
 
 
+async def _stream_response(queue: SseQueue):
+    """消费 SSE 队列；**响应结束（含客户端断开/异常）时关闭队列**（emitter 结束信号，6.4）
+
+    - 正常完成：handler 已在 on_complete/on_error 关闭队列，此处幂等；
+    - 客户端断开：ASGI 取消响应任务 → 生成器被 aclose → finally 关闭队列，
+      `ChatQueueLimiter._wait_closed` 随即感知 → 排队中的请求放弃（不空等到超时），
+      对齐 Java cancelBinder 在 emitter.onCompletion/onTimeout/onError 取消排队。
+    """
+    try:
+        async for frame in queue.aiter():
+            yield frame
+    finally:
+        queue.close()
+
+
 # ==================== 流式问答 ====================
 
 
@@ -67,7 +82,7 @@ async def chat(
         )
 
     await container.idempotent_guard.execute(idempotent_key, submit, message=CHAT_SUBMIT_MESSAGE)
-    return StreamingResponse(queue.aiter(), media_type="text/event-stream")
+    return StreamingResponse(_stream_response(queue), media_type="text/event-stream")
 
 
 # ==================== 停止任务 ====================

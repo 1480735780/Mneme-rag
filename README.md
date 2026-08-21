@@ -128,6 +128,52 @@ asyncio.run(main())
 
 > 提示：AI 基础设施层（`core/llm`）已具备完整能力，调用前在 `clients` 列表中注入对应的供应商客户端（如 `QwenChatClient`）即可；RAG 入库 / 检索 / Agent / 评估等上层模块待实现，架构规划见 `docs/` 目录。
 
+## 环境变量
+
+服务装配以环境变量驱动（`app/config.py` 的 `AppSettings` / `rag/service/ratelimit/config.py` 的 `RateLimitProperties` 经 `from_env()` 读取）。**限流与后端相关配置非法即抛（fail-fast）**，不静默回落。
+
+### 服务启动
+
+```bash
+python -m app.main
+```
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `RAGENT_HOST` | `127.0.0.1` | uvicorn 监听地址 |
+| `RAGENT_PORT` | `8000` | uvicorn 监听端口 |
+| `RAGENT_STACK_PROFILE` | `memory` | 装配栈：`memory`（全内存，测试/演示）或 `real`（DB/Redis，env 驱动） |
+| `RAGENT_SSE_TIMEOUT_MS` | `0` | SSE 超时（毫秒；0 = 不超时） |
+| `RAGENT_ORCHESTRATION_MODE` | `workflow` | 编排模式：`workflow` / `agent`（部署级，切换需重启） |
+
+### M6 聊天全局限流（`RAGENT_RATE_LIMIT_*`）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `RAGENT_RATE_LIMIT_BACKEND` | `process` | 限流器后端：`process`（单机，6.2）或 `redis`（分布式，6.3，需注入 redis 客户端） |
+| `RAGENT_RATE_LIMIT_GLOBAL_ENABLED` | `true` | 全局限流总开关 |
+| `RAGENT_RATE_LIMIT_MAX_CONCURRENT` | `50` | 最大并发许可数（≥1） |
+| `RAGENT_RATE_LIMIT_MAX_WAIT_SECONDS` | `20` | 排队等待上限（秒；超时走 reject 流程） |
+| `RAGENT_RATE_LIMIT_LEASE_SECONDS` | `600` | 许可 lease 兜底（秒；崩溃回收） |
+| `RAGENT_RATE_LIMIT_POLL_INTERVAL_MS` | `200` | 排队轮询间隔（毫秒） |
+
+### AI 模型（`core/llm/config/ai.yaml` 的 `${ENV}` 占位符）
+
+| 变量 | 用途 |
+|------|------|
+| `QWEN_API_KEY` | 阿里云百炼（qwen） |
+| `OPENAI_API_KEY` | OpenAI |
+| `SILICONFLOW_API_KEY` | SiliconFlow 聚合网关（embedding/rerank） |
+
+> 未配置 api_key 的 provider 不会进入路由候选；聊天链路（C1 路由）仅在装配到**至少一个可用 chat 客户端**时才挂载。
+
+### 其他
+
+| 变量 | 说明 |
+|------|------|
+| `YDC_API_KEY` | You.com 联网检索（web-search 通道，可选） |
+| 请求头 `X-User-Id` / `X-Username` | 用户上下文（UserContext 中间件解析；未带兜底 `anonymous`） |
+
 ## 技术栈
 
 | 类别 | 选型 |

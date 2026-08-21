@@ -175,10 +175,13 @@ def _to_rate_limit(p: Optional[RateLimitProperties]) -> Optional[Dict]:
 
 
 def _mask_api_key(api_key: Optional[str]) -> Optional[str]:
-    """apiKey 脱敏（对齐 Java maskApiKey）：空白→None；≤10 位→全掩；否则 前6+***+后4"""
+    """apiKey 脱敏（对齐 Java maskApiKey）：空白→None；≤10 位→全掩；否则 前6+***+后4；
+    未解析的 `${ENV}` 占位符视为未配置 → None（不展示掩码占位符）。"""
     if not api_key or not str(api_key).strip():
         return None
     trimmed = str(api_key).strip()
+    if trimmed.startswith("${"):
+        return None
     if len(trimmed) <= 10:
         return "******"
     return trimmed[:6] + "***" + trimmed[-4:]

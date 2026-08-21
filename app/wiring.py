@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 from app.config import AppSettings
@@ -64,6 +65,48 @@ from storage.database import (
 
 logger = logging.getLogger(__name__)
 
+# AI 模型配置文件（LLM 路由栈装配；与 core/llm/config/ai.yaml 对齐）
+_AI_CONFIG_YAML = str(Path(__file__).resolve().parent.parent / "core" / "llm" / "config" / "ai.yaml")
+
+
+def _load_ai_config() -> Any:
+    """加载 AI 模型配置（ai.yaml）；缺失/畸形返回 None（聊天链路与 settings ai 区块随之为空）"""
+    try:
+        from core.llm.config.config import load_config_from_yaml
+
+        return load_config_from_yaml(_AI_CONFIG_YAML)
+    except Exception as ex:  # noqa: BLE001
+        logger.warning("AI 模型配置加载失败（settings ai / 聊天链路不装配）: %s", ex)
+        return None
+
+
+def _build_chat_clients(config: Any) -> list:
+    """按 config.providers 实例化 chat 客户端（仅支持已知 chat client 的 provider）。
+
+    缺 API key 的 provider 跳过（客户端 requires_api_key 时调用会失败，不应进入候选）；
+    Ollama / SiliconFlow 暂无 chat 客户端实现 → 跳过（对应模型候选会因无客户端而在路由时 fail-over）。
+    """
+    from core.llm.providers.openai import OpenAIChatClient
+    from core.llm.providers.qwen import QwenChatClient
+
+    factory = {"qwen": QwenChatClient, "openai": OpenAIChatClient}
+    clients: list = []
+    for name, provider in config.providers.items():
+        client_cls = factory.get(name)
+        if client_cls is None:
+            logger.warning("provider %s 暂无 chat client 实现，跳过", name)
+            continue
+        api_key = str(getattr(provider, "api_key", "") or "").strip()
+        if not api_key or api_key.startswith("${"):
+            # 占位符未解析（如 ${QWEN_API_KEY} 未设环境变量）→ 视为无 key，不进入候选
+            logger.info("provider %s 未配置有效 api_key（占位符未解析），跳过", name)
+            continue
+        try:
+            clients.append(client_cls())
+        except Exception as ex:  # noqa: BLE001 —— 单 provider 构建失败不阻断其余
+            logger.warning("provider %s chat client 构建失败: %s", name, ex)
+    return clients
+
 
 @dataclass
 class AppContainer:
@@ -82,6 +125,24 @@ class AppContainer:
     cache: CacheManager
     # M6 限流 Redis 后端（rate_limit_backend=redis 时注入 redis.asyncio.Redis；缺省 None = process 后端）
     redis: Any = None
+    # M7 引擎全链装配：memory/llm 注入槽（测试注入桩；生产由 _wire_memory/_build_llm 构建）
+    memory_service: Any = None
+    llm_service: Any = None
+    # AI 模型配置（ai.yaml 单次加载；settings ai 区块与 _build_llm 共享同一实例）
+    ai_config: Any = None
+    # 检索通道后端注入槽（快赢①：生产由 _build_retrieval_engine 按 RetrievalProperties 构建真实客户端；
+    # 测试可注入桩客户端/属性经槽位进入引擎）
+    retrieval_properties: Any = None
+    web_search_client: Any = None
+    light_rag_client: Any = None
+    keyword_retriever: Any = None
+    vector_retriever: Any = None
+    # 有效知识库 collection 提供者（检索作用域用）：生产默认 DatabaseKbCollectionProvider(db)；
+    # 测试注入 StaticKbCollectionProvider（P5 知识库域落地前全库范围为空）
+    kb_collection_provider: Any = None
+    # 缓存容器级共享（5.3/5.5 实例同一性：admin 写后清缓存与读路径必须指向同一存储）
+    intent_tree_cache: Any = None
+    agent_prompt_cache: Any = None
     conversation_service: Optional[ConversationService] = None
     message_service: Optional[ConversationMessageService] = None
     feedback_service: Optional[MessageFeedbackService] = None
@@ -190,25 +251,28 @@ class AppContainer:
             QueryTermMappingAdminDao(self.db),
             cache_manager=self.query_term_mapping_cache,
         )
-        # M5 5.4 意图树管理（写后清 intent 树缓存）
+        # M5 5.4 意图树管理（写后清 intent 树缓存；容器级共享，engine 意图分类器复用同一实例）
+        self.intent_tree_cache = RedisIntentTreeCacheManager(cache_manager=self.cache)
         self.intent_tree_admin_service = IntentTreeAdminService(
             IntentNodeAdminDao(self.db),
-            cache_manager=RedisIntentTreeCacheManager(cache_manager=self.cache),
+            cache_manager=self.intent_tree_cache,
         )
-        # M5 5.5 Agent 档案管理（提示词读路径共享同一缓存实例）
-        prompt_cache = RedisAgentPromptCacheManager(cache_manager=self.cache)
+        # M5 5.5 Agent 档案管理（提示词读路径共享同一缓存实例；engine 提示词解析复用同一实例）
+        self.agent_prompt_cache = RedisAgentPromptCacheManager(cache_manager=self.cache)
         orchestration_mode = OrchestrationMode.of(self.settings.orchestration_mode)
         self.agent_profile_admin_service = AgentProfileAdminService(
             profile_dao=AgentProfileDao(self.db),
             prompt_dao=AgentPromptDao(self.db),
-            resolver=DatabaseAgentPromptResolver(self.db, cache_manager=prompt_cache),
-            prompt_cache_manager=prompt_cache,
+            resolver=DatabaseAgentPromptResolver(self.db, cache_manager=self.agent_prompt_cache),
+            prompt_cache_manager=self.agent_prompt_cache,
             mode=orchestration_mode,  # 从 AppSettings 回注，槽位生效集随编排模式
         )
-        # M5 5.6 设置聚合（ai 模型配置待 engine 装配注入）
+        # M5 5.6 设置聚合：ai 模型配置单次加载注入（settings ai 区块 + _build_llm 共享）
+        self.ai_config = _load_ai_config()
         self.rate_limit_properties = RateLimitProperties.from_env()
         self.settings_service = SystemSettingsService(
             memory_properties=MemoryProperties(),
+            ai_config=self.ai_config,  # ai 区块：providers 脱敏 + 模型组 + 熔断 + 流式
             query_rewrite_enabled=True,
             citation_enabled=False,
             orchestration_mode=orchestration_mode.value,  # 与 5.5 槽位生效集同源
@@ -218,39 +282,263 @@ class AppContainer:
         self.graph_service = GraphQueryService()
 
     def _wire_chat_services(self) -> None:
-        """组装流式/聊天依赖（M3 切片）：任务管理器 + 幂等守卫（cache 真实依赖）；chat_service 待 engine 装配（M7 C14）"""
+        """组装流式/聊天依赖（M3 切片 + M6 限流 + M7 引擎全链）：
+        任务管理器 + 幂等守卫 + 容器级 memory + 真实 engine（LLM 可用时）→ chat_service"""
         from rag.service.idempotent import IdempotentSubmitGuard
         from rag.service.stream.task_manager import StreamTaskManager
 
         self.stream_task_manager = StreamTaskManager(cache=self.cache)
         self.idempotent_guard = IdempotentSubmitGuard(cache=self.cache)
+        # 容器级记忆：engine 加载历史 + handler 落库 + reject 落库共享同一实例（M7 ②）
+        self._wire_memory()
+        # LLM：注入槽（测试桩）优先；生产经 _build_llm 按 ai.yaml 装配路由栈（无可用客户端 → None）
+        llm = self.llm_service if self.llm_service is not None else self._build_llm()
+        if llm is not None:
+            # 快赢②：回注推荐追问生成器（此前 `_wire_conversation_services` 先于 engine 装配，generator 缺省 None → 恒 FAILED）
+            self.recommended_question_service.inject_llm(llm)
+        if llm is not None and self.engine is None:
+            self._wire_engine(llm)  # 装配真实引擎 → factory 的 C1 聊天路由随之条件挂载
         if self.engine is not None:
             self._wire_history_chat_service()
 
-    def _wire_history_chat_service(self) -> None:
-        """按 engine 组装 chat_service（M7 C14 注入 engine + memory_service 后调用）"""
-        from rag.dao.conversation_dao import ConversationDao
+    def _wire_memory(self) -> None:
+        """构建容器级会话记忆服务（M7 ②：engine / handler / reject 三处共享）"""
         from rag.memory import (
             DatabaseConversationMemoryStore,
             DefaultConversationMemoryService,
             MemoryConversationMemorySummaryService,
         )
         from rag.memory.config import MemoryProperties
+
+        if self.memory_service is not None:
+            return  # 已注入（测试/外部装配），不覆盖
+        props = MemoryProperties()
+        self.memory_service = DefaultConversationMemoryService(
+            memory_store=DatabaseConversationMemoryStore(self.db, props),
+            summary_service=MemoryConversationMemorySummaryService(properties=props),
+        )
+
+    def _wire_engine(self, llm_service: Any) -> None:
+        """装配真实 RAGChatEngine（M7 ② C14：改写/意图/引导/检索/Prompt/LLM 全链）"""
+        from rag.engine import RAGChatEngine
+        from rag.guidance.checker import AmbiguityLLMChecker
+        from rag.guidance.config import GuidanceProperties
+        from rag.guidance.service import IntentGuidanceService
+        from rag.intent.classifier import DefaultIntentClassifier, IntentResolver
+        from rag.intent.tree import IntentTreeFactory
+        from rag.prompt.builder import RAGPromptService
+        from rag.rewrite.query_rewrite import MultiQuestionRewriteService
+
+        # 改写：LLM 开关关闭时走「术语归一化 + 规则拆分」兜底，不依赖真实模型
+        query_rewrite = MultiQuestionRewriteService(llm_service, enabled=False)
+        # 意图：LLM 分类 + 容器级意图树缓存（admin 写后清缓存与分类器读同源）
+        classifier = DefaultIntentClassifier(
+            llm_service,
+            cache_manager=self.intent_tree_cache,
+            tree_loader=IntentTreeFactory.build_intent_tree,  # 静态 demo 树；DB 树由后续接线替换
+        )
+        intent_resolver = IntentResolver(classifier)
+        guidance = IntentGuidanceService(
+            GuidanceProperties(),
+            classifier,  # 作为 IntentNodeRegistry（parentId 上溯）
+            AmbiguityLLMChecker(llm_service),
+        )
+        # 检索：按 RetrievalProperties（env）装配多通道引擎（快赢①：检索通道按配置展开）
+        retrieval = self._build_retrieval_engine()
+        # Prompt：引用默认关（与 5.6 settings 同源）；Agent 提示词解析复用 5.5 共享缓存
+        prompt = RAGPromptService(
+            agent_prompt_resolver=DatabaseAgentPromptResolver(
+                self.db, cache_manager=self.agent_prompt_cache
+            ),
+            citation_enabled=False,
+        )
+        self.engine = RAGChatEngine(
+            query_rewrite_service=query_rewrite,
+            intent_resolver=intent_resolver,
+            guidance_service=guidance,
+            retrieval_engine=retrieval,
+            llm_service=llm_service,
+            prompt_builder=prompt,
+            memory_service=self.memory_service,
+            scope_resolver=self._scope_resolver,  # 与检索引擎共用同一实例（引擎显式传该 resolver）
+        )
+
+    def _build_retrieval_engine(self) -> Any:
+        """按 RetrievalProperties（env）装配多通道检索引擎（快赢①：检索通道按配置展开）
+
+        四通道各自启停由 env 开关驱动；后端客户端优先取注入槽（测试桩），否则按配置构建真实客户端：
+            - 向量   vector_enabled   → 注入槽 / InMemoryVectorStore(+embedding 服务，无则跳过)
+            - 关键词 keyword_enabled  → 注入槽 / EsKeywordRetrieverService(EsProperties())
+            - 图谱   graph_enabled    → 注入槽 / HttpLightRagClient(LightRagProperties(base_url, api_key))
+            - 联网   web_enabled      → 注入槽 / YouComWebSearchClient(api_key)（key 不可解析则跳过）
+        无任何启用通道 → 保持既有「空检索兜底」形态（三通道禁用）。
+        """
+        from rag.retrieval.channel.graph_channel import GraphSearchChannel
+        from rag.retrieval.channel.keyword_channel import KeywordSearchChannel
+        from rag.retrieval.channel.vector_channel import VectorSearchChannel
+        from rag.retrieval.channel.web_search_channel import WebSearchChannel
+        from rag.retrieval.config import RetrievalProperties
+        from rag.retrieval.engine import MultiChannelRetrievalEngine
+        from rag.retrieval.postprocessor.dedup import DeduplicationPostProcessor
+        from rag.retrieval.postprocessor.fusion import FusionPostProcessor
+        from rag.retrieval.postprocessor.metadata_enrichment import MetadataEnrichmentPostProcessor
+
+        props = self.retrieval_properties or RetrievalProperties.from_env()
+        channels = []
+
+        # 向量：读侧优先注入槽；生产用 InMemoryVectorStore + ai.yaml embedding 服务（无则跳过，Milvus/Pg 由 P6 接线）
+        if props.vector_enabled:
+            retriever = self.vector_retriever
+            if retriever is None:
+                retriever = self._build_memory_vector_retriever()
+            if retriever is not None:
+                channels.append(VectorSearchChannel(retriever, enabled=True))
+
+        # 关键词：注入槽 / ES 真实后端（未配置 ES 时 EsProperties 默认 localhost:9200，搜索失败降级空）
+        if props.keyword_enabled:
+            retriever = self.keyword_retriever
+            if retriever is None:
+                from rag.keyword.config import EsProperties
+                from rag.keyword.es import EsKeywordRetrieverService
+
+                retriever = EsKeywordRetrieverService(properties=EsProperties())
+            if retriever is not None:
+                channels.append(KeywordSearchChannel(retriever, enabled=True))
+
+        # 图谱：注入槽 / HttpLightRagClient（LightRagProperties 由 env 展开）
+        if props.graph_enabled:
+            client = self.light_rag_client
+            if client is None:
+                from rag.graph.client import HttpLightRagClient
+                from rag.graph.config import LightRagProperties
+
+                client = HttpLightRagClient(
+                    LightRagProperties(base_url=props.lightrag_url, api_key=props.lightrag_api_key)
+                )
+            if client is not None:
+                channels.append(GraphSearchChannel(client, enabled=True))
+
+        # 联网：注入槽 / YouComWebSearchClient（api key 不可解析则跳过，与通道 is_enabled 语义一致）
+        if props.web_search_enabled:
+            from rag.websearch.client import YouComWebSearchClient
+
+            api_key = (props.web_api_key or "").strip()
+            client = self.web_search_client or (
+                YouComWebSearchClient(api_key=api_key) if api_key else None
+            )
+            if client is not None:
+                channels.append(WebSearchChannel(client, enabled=True, api_key=api_key))
+
+        if not channels:
+            logger.info("未启用任何检索通道（RAGENT_RETRIEVAL_* 全 off），引擎空检索兜底")
+            channels = [
+                KeywordSearchChannel(None, enabled=False),
+                GraphSearchChannel(None, enabled=False),
+                WebSearchChannel(None, enabled=False),
+            ]
+
+        # 检索作用域：按子问题解析一次（定向/全局）；生产用 DB 知识库表，测试可注入 Static 桩
+        from rag.retrieval.channel.kb_collection_provider import DatabaseKbCollectionProvider
+        from rag.retrieval.channel.scope_resolver import RetrievalScopeResolver
+        from rag.retrieval.config import ScopeProperties
+
+        # 引擎级共用同一实例：RAGChatEngine 显式传 self._scope_resolver 覆盖检索引擎内部 resolver
+        self._scope_resolver = RetrievalScopeResolver(
+            ScopeProperties(),
+            self.kb_collection_provider or DatabaseKbCollectionProvider(self.db),
+        )
+        return MultiChannelRetrievalEngine(
+            channels=channels,
+            postprocessors=[
+                DeduplicationPostProcessor(),
+                FusionPostProcessor(),
+                MetadataEnrichmentPostProcessor(),
+            ],
+            scope_resolver=self._scope_resolver,
+        )
+
+    def _build_memory_vector_retriever(self) -> Any:
+        """构建内存向量读侧（InMemoryVectorStore + ai.yaml embedding 服务）；无 embedding 客户端 → None"""
+        config = self.ai_config if self.ai_config is not None else _load_ai_config()
+        embedding = self._build_embedding_service(config) if config is not None else None
+        if embedding is None:
+            logger.warning("向量通道启用但无可用 embedding 客户端，跳过向量通道")
+            return None
+        from storage.vector.in_memory import InMemoryVectorStore
+
+        return InMemoryVectorStore(embedding_service=embedding)
+
+    def _build_embedding_service(self, config: Any) -> Any:
+        """按 ai.yaml 构建路由式向量化服务（镜像 _build_chat_clients：已知 embedding provider + 缺 key 跳过）"""
+        from core.llm.embedding import RoutingEmbeddingService
+        from core.llm.model.health_store import ModelHealthStore
+        from core.llm.model.selector import ModelSelector
+        from core.llm.model.routing_executor import RoutingExecutor
+        from core.llm.providers.ollama_embedding import OllamaEmbeddingClient
+        from core.llm.providers.siliconflow_embedding import SiliconFlowEmbeddingClient
+
+        factory = {"ollama": OllamaEmbeddingClient, "siliconflow": SiliconFlowEmbeddingClient}
+        clients: list = []
+        for name, provider in config.providers.items():
+            client_cls = factory.get(name)
+            if client_cls is None:
+                continue
+            api_key = str(getattr(provider, "api_key", "") or "").strip()
+            if name != "ollama" and (not api_key or api_key.startswith("${")):
+                # 占位符未解析（如 ${SILICONFLOW_API_KEY} 未设环境变量）→ 视为无 key，不进入候选
+                continue
+            try:
+                clients.append(client_cls())
+            except Exception as ex:  # noqa: BLE001 —— 单 provider 构建失败不阻断其余
+                logger.warning("provider %s embedding client 构建失败: %s", name, ex)
+        if not clients:
+            return None
+        selection = getattr(config, "selection", None) or {}
+        health_store = ModelHealthStore(
+            failure_threshold=int(getattr(selection, "failure_threshold", 2) or 2),
+            open_duration_ms=int(getattr(selection, "open_duration_ms", 30000) or 30000),
+        )
+        return RoutingEmbeddingService(ModelSelector(config, health_store), RoutingExecutor(health_store), clients)
+
+    def _build_llm(self) -> Any:
+        """生产装配真实 LLM 路由栈（对应 Java LLM @Configuration）：ai.yaml + 熔断 + 按 provider 建 chat client
+
+        无可用 chat client（缺 API key / provider 无客户端实现）→ 返回 None，聊天链路不装配
+        （factory 条件挂载随之不暴露 C1，保持半装配防护语义）。
+        """
+        from core.llm.chat import RoutingLLMService
+        from core.llm.model.health_store import ModelHealthStore
+        from core.llm.model.selector import ModelSelector
+        from core.llm.model.routing_executor import RoutingExecutor
+
+        config = self.ai_config if self.ai_config is not None else _load_ai_config()
+        if config is None:
+            return None
+        clients = _build_chat_clients(config)
+        if not clients:
+            logger.warning("未装配到可用的 chat 客户端（检查 ai.yaml api_key），聊天链路不装配")
+            return None
+        selection = getattr(config, "selection", None) or {}
+        health_store = ModelHealthStore(
+            failure_threshold=int(getattr(selection, "failure_threshold", 2) or 2),
+            open_duration_ms=int(getattr(selection, "open_duration_ms", 30000) or 30000),
+        )
+        selector = ModelSelector(config, health_store)
+        executor = RoutingExecutor(health_store)
+        return RoutingLLMService(selector, health_store, executor, clients, config)
+
+    def _wire_history_chat_service(self) -> None:
+        """按 engine 组装 chat_service（M7 C14：真实记忆 + M6 queue_limiter）"""
+        from rag.dao.conversation_dao import ConversationDao
         from rag.service.chat_service import RAGChatService
         from rag.service.ratelimit import ChatQueueLimiter
         from rag.service.stream.callback_factory import StreamCallbackFactory
         from rag.service.stream.trace_runner import StreamChatTraceRunner
 
         conversation_dao = ConversationDao(self.db)
-        # 真实记忆服务（M6 起）：reject 落库（用户问题 + REJECTED 回复保留会话记录）+ 正常消息持久化；
-        # M7 engine 装配可复用同一服务加载历史（store 的 message_id 由共享计数器保证并发安全）
-        memory_properties = MemoryProperties()
-        memory_service = DefaultConversationMemoryService(
-            memory_store=DatabaseConversationMemoryStore(self.db, memory_properties),
-            summary_service=MemoryConversationMemorySummaryService(properties=memory_properties),
-        )
+        # 复用容器级记忆服务：handler 落库 + reject 落库与 engine 加载历史同一实例
         callback_factory = StreamCallbackFactory(
-            memory_service=memory_service,
+            memory_service=self.memory_service,
             task_manager=self.stream_task_manager,
             conversation_dao=conversation_dao,
         )
@@ -259,9 +547,8 @@ class AppContainer:
         queue_limiter = ChatQueueLimiter(
             rate_limiter=self._build_rate_limiter(),
             rate_limit_properties=self.rate_limit_properties,
-            memory_service=memory_service,
+            memory_service=self.memory_service,
             conversation_dao=conversation_dao,
-            memory_properties=memory_properties,
         )
         self.chat_service = RAGChatService(
             callback_factory=callback_factory,

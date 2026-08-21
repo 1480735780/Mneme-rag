@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
+from common.exception.business import ClientException
 from rag.graph.client import LightRagClient
 from rag.graph.vo import GraphEdge, GraphNode, GraphViewVO
 
@@ -81,7 +82,8 @@ class GraphQueryService:
 
     def _require_client(self) -> LightRagClient:
         if self._client is None:
-            raise RuntimeError("知识图谱通道未启用（rag.graph.type=none）")
+            # 业务异常：由 D0.8 全局异常处理器转码为统一 Result（而非 500），对齐 controller 文档
+            raise ClientException("知识图谱通道未启用")
         return self._client
 
     def _map_graph(

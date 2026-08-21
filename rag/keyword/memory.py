@@ -131,7 +131,9 @@ class MemoryKeywordRetrieverService(KeywordRetrieverService):
         for doc in self._store.docs.values():
             if filter_by_collection and doc.collection_name not in collection_names:
                 continue
-            score = sum(1 for term in terms if term in doc.content)
+            # 与 _tokenize 一致：查询词已小写化，文档内容也需小写比较（否则 ASCII（如 OA/API）大小写错配漏召回）
+            content = doc.content.lower()
+            score = sum(1 for term in terms if term in content)
             if score > 0:
                 scored.append((float(score), doc))
 

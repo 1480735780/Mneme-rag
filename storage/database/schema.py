@@ -389,8 +389,179 @@ _T_KNOWLEDGE_DOCUMENT = TableSchema(
     comment="知识库文档",
 )
 
+# ==================== P5 E0 0.1：摄取/调度域 7 张新表（对齐 schema_pg.sql 列名，E1 dao 数据源） ====================
+
+
+def _pk_col(name: str = "id") -> ColumnSpec:
+    """主键列（对齐既有表：VARCHAR(32)）"""
+    return ColumnSpec(name=name, data_type="VARCHAR(32)", primary_key=True)
+
+
+_T_KNOWLEDGE_DOCUMENT_CHUNK_LOG = TableSchema(
+    name="t_knowledge_document_chunk_log",
+    columns=(
+        _pk_col(),
+        *_cols(
+            ("doc_id", "VARCHAR(32)"),
+            ("status", "VARCHAR(16)"),
+            ("process_mode", "VARCHAR(16)"),
+            ("parse_profile", "VARCHAR(16)"),
+            ("pipeline_id", "VARCHAR(32)"),
+            ("extract_duration", "BIGINT"),
+            ("chunk_duration", "BIGINT"),
+            ("embed_duration", "BIGINT"),
+            ("persist_duration", "BIGINT"),
+            ("total_duration", "BIGINT"),
+            ("chunk_count", "INTEGER"),
+            ("error_message", "TEXT"),
+            ("start_time", "TIMESTAMP"),
+            ("end_time", "TIMESTAMP"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+        ),
+    ),
+    comment="知识库文档分块日志表（chunk-logs 12 端点之一的数据源）",
+)
+
+_T_KNOWLEDGE_DOCUMENT_SCHEDULE = TableSchema(
+    name="t_knowledge_document_schedule",
+    columns=(
+        _pk_col(),
+        *_cols(
+            ("doc_id", "VARCHAR(32)"),
+            ("kb_id", "VARCHAR(32)"),
+            ("cron_expr", "VARCHAR(64)"),
+            ("enabled", "INTEGER"),
+            ("next_run_time", "TIMESTAMP"),
+            ("last_run_time", "TIMESTAMP"),
+            ("last_success_time", "TIMESTAMP"),
+            ("last_status", "VARCHAR(16)"),
+            ("last_error", "VARCHAR(512)"),
+            ("last_etag", "VARCHAR(256)"),
+            ("last_modified", "VARCHAR(256)"),
+            ("last_content_hash", "VARCHAR(128)"),
+            ("lock_owner", "VARCHAR(128)"),
+            ("lock_until", "TIMESTAMP"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+        ),
+    ),
+    comment="知识库文档定时刷新任务表（ScheduleJob scan 扫描对象）",
+)
+
+_T_KNOWLEDGE_DOCUMENT_SCHEDULE_EXEC = TableSchema(
+    name="t_knowledge_document_schedule_exec",
+    columns=(
+        _pk_col(),
+        *_cols(
+            ("schedule_id", "VARCHAR(32)"),
+            ("doc_id", "VARCHAR(32)"),
+            ("kb_id", "VARCHAR(32)"),
+            ("status", "VARCHAR(16)"),
+            ("message", "VARCHAR(512)"),
+            ("start_time", "TIMESTAMP"),
+            ("end_time", "TIMESTAMP"),
+            ("file_name", "VARCHAR(512)"),
+            ("file_size", "BIGINT"),
+            ("content_hash", "VARCHAR(128)"),
+            ("etag", "VARCHAR(256)"),
+            ("last_modified", "VARCHAR(256)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+        ),
+    ),
+    comment="知识库文档定时刷新执行记录",
+)
+
+_T_INGESTION_PIPELINE = TableSchema(
+    name="t_ingestion_pipeline",
+    columns=(
+        _pk_col(),
+        *_cols(
+            ("name", "VARCHAR(100)"),
+            ("description", "TEXT"),
+            ("created_by", "VARCHAR(64)"),
+            ("updated_by", "VARCHAR(64)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="摄取流水线定义表",
+)
+
+_T_INGESTION_PIPELINE_NODE = TableSchema(
+    name="t_ingestion_pipeline_node",
+    columns=(
+        _pk_col(),
+        *_cols(
+            ("pipeline_id", "VARCHAR(32)"),
+            ("node_id", "VARCHAR(32)"),
+            ("node_type", "VARCHAR(16)"),
+            ("next_node_id", "VARCHAR(32)"),
+            ("settings_json", "JSONB"),
+            ("condition_json", "JSONB"),
+            ("created_by", "VARCHAR(64)"),
+            ("updated_by", "VARCHAR(64)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="摄取流水线节点连线表（settings/condition 按节点类型存 JSON）",
+)
+
+_T_INGESTION_TASK = TableSchema(
+    name="t_ingestion_task",
+    columns=(
+        _pk_col(),
+        *_cols(
+            ("pipeline_id", "VARCHAR(32)"),
+            ("source_type", "VARCHAR(20)"),
+            ("source_location", "TEXT"),
+            ("source_file_name", "VARCHAR(255)"),
+            ("status", "VARCHAR(16)"),
+            ("chunk_count", "INTEGER"),
+            ("error_message", "TEXT"),
+            ("logs_json", "JSONB"),
+            ("metadata_json", "JSONB"),
+            ("started_at", "TIMESTAMP"),
+            ("completed_at", "TIMESTAMP"),
+            ("created_by", "VARCHAR(64)"),
+            ("updated_by", "VARCHAR(64)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="摄取任务实例表",
+)
+
+_T_INGESTION_TASK_NODE = TableSchema(
+    name="t_ingestion_task_node",
+    columns=(
+        _pk_col(),
+        *_cols(
+            ("task_id", "VARCHAR(32)"),
+            ("pipeline_id", "VARCHAR(32)"),
+            ("node_id", "VARCHAR(32)"),
+            ("node_type", "VARCHAR(16)"),
+            ("node_order", "INTEGER"),
+            ("status", "VARCHAR(16)"),
+            ("duration_ms", "BIGINT"),
+            ("message", "TEXT"),
+            ("error_message", "TEXT"),
+            ("output_json", "TEXT"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="摄取任务节点运行记录（NodeLog 落库）",
+)
+
 # 当前消费方用到的全部 t_* 表（4.1 KB provider / 5.1 记忆 store / 摘要 / 5.5 AgentPromptResolver / ChunkMetadataResolver
-# / P4 会话/反馈/示例问题/追踪持久化）
+# / P4 会话/反馈/示例问题/追踪持久化 / P5 摄取与调度域）
 DEFAULT_TABLES: List[TableSchema] = [
     _T_CONVERSATION,
     _T_MESSAGE,
@@ -398,6 +569,13 @@ DEFAULT_TABLES: List[TableSchema] = [
     _T_KNOWLEDGE_BASE,
     _T_KNOWLEDGE_CHUNK,
     _T_KNOWLEDGE_DOCUMENT,
+    _T_KNOWLEDGE_DOCUMENT_CHUNK_LOG,
+    _T_KNOWLEDGE_DOCUMENT_SCHEDULE,
+    _T_KNOWLEDGE_DOCUMENT_SCHEDULE_EXEC,
+    _T_INGESTION_PIPELINE,
+    _T_INGESTION_PIPELINE_NODE,
+    _T_INGESTION_TASK,
+    _T_INGESTION_TASK_NODE,
     _T_AGENT_PROFILE,
     _T_AGENT_PROMPT,
     _T_INTENT_NODE,
