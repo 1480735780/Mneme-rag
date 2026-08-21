@@ -165,6 +165,22 @@ class KnowledgeDocumentService:
             raise ClientException("文档不存在")
         await self._dispatcher.dispatch(_build_event(doc_id, UserContext.get_username()))
 
+    def _cas_start_chunk(self, doc_id: str, operator: Optional[str]) -> None:
+        """CAS 事务体（dispatcher.start_chunk 回调；对齐 Java startChunk 的 sendInTransaction 事务体：
+        `status ne RUNNING → RUNNING` 命中才返回，未命中抛「正在分块中」；成功后登记调度（N4 接通））
+        """
+        if self._doc_dao.get_by_id(doc_id) is None:
+            raise ClientException("文档不存在")
+        updated = self._doc_dao.cas_update_status(
+            doc_id,
+            to_status=DocumentStatus.RUNNING.value,
+            from_status_not_equal=DocumentStatus.RUNNING.value,
+            operator=operator,
+        )
+        if not updated:
+            raise ClientException("文档分块操作正在进行中，请稍后再试")
+        # upsertSchedule：N4 schedule_service 接通后在此登记（对齐 Java startChunk 事务体末行）
+
     async def execute_chunk(self, doc_id: str) -> None:
         """异步执行分块全链（kernel → chunk_log 收尾；PIPELINE 抛「管道模式重构中」）"""
         doc = self._doc_dao.get_by_id(doc_id)
@@ -300,7 +316,7 @@ class KnowledgeDocumentService:
 
     # ===================== enable =====================
 
-    def enable(self, doc_id: str, enabled: bool) -> None:
+    async def enable(self, doc_id: str, enabled: bool) -> None:
         doc = self._require_doc(doc_id)
         if doc.get("status") == DocumentStatus.RUNNING.value:
             raise ClientException("文档正在分块中，无法修改")
@@ -310,15 +326,15 @@ class KnowledgeDocumentService:
         kb = self._require_kb(doc["kb_id"])
         updates: Dict = {"enabled": target, "updated_by": UserContext.get_username(),
                          "update_time": now_iso()}
-        # 向量同步：禁用删向量；启用重嵌入（embed_persisted_chunks 为 N3 chunk_service 能力）
-        # 未注入 N3 chunk_service 时仅落启用标记（N3 接入后补向量重建，见 plan N2 DoD ⑥）
+        # 向量同步：禁用删向量；启用重嵌入（N3 chunk_service 注入后生效）
         if enabled and self._chunk_service is not None:
             vector_target = self._resolver.resolve(kb)
-            chunks = self._chunk_service.embed_persisted_chunks(doc_id, vector_target)
-            if self._vector_store is not None:
-                self._vector_store.index_document_chunks(kb["collection_name"], doc_id, chunks)
+            chunks = await self._chunk_service.embed_persisted_chunks(doc_id, vector_target)
+            # 对齐 Java：启用时无任何 chunk 仅更新启用状态、跳过向量重建（L700-703 warn 继续）
+            if chunks and self._vector_store is not None:
+                await self._vector_store.index_document_chunks(kb["collection_name"], doc_id, chunks)
         elif not enabled and self._vector_store is not None:
-            self._vector_store.delete_document_vectors(kb["collection_name"], doc_id)
+            await self._vector_store.delete_document_vectors(kb["collection_name"], doc_id)
         if self._chunk_dao is not None:
             self._chunk_dao.update_enabled_by_doc(doc_id, enabled)
         self._doc_dao.update_by_id(doc_id, updates)

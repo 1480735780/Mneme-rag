@@ -202,9 +202,9 @@ async def page_documents(
 
 @router.patch("/docs/{doc_id}/enable", name="enable_document")
 async def enable_document(doc_id: str, request: Request, value: bool = Query(...)) -> dict:
-    """D9：启用/禁用文档（enable 双向向量同步）"""
+    """D9：启用/禁用文档（enable 双向向量同步；N3 chunk_service 注入后重嵌入生效）"""
     container = _container(request)
-    container.knowledge_document_service.enable(doc_id, value)
+    await container.knowledge_document_service.enable(doc_id, value)
     return result_to_dict(Results.success())
 
 

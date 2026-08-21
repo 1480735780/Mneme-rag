@@ -163,6 +163,11 @@ class AppContainer:
     stream_task_manager: Any = None
     idempotent_guard: Any = None
     chat_service: Any = None
+    # P5 knowledge 域（N1-N3：KB/文档/分块 service + 摄取配置 schema 提供器；N4 调度 / N5 流水线后续接入）
+    knowledge_base_service: Any = None
+    knowledge_document_service: Any = None
+    knowledge_chunk_service: Any = None
+    ingestion_spec_schema_provider: Any = None
     _owned: list = field(default_factory=list)
 
     # ==================== 双 profile 装配 ====================
@@ -182,6 +187,7 @@ class AppContainer:
         db.ensure_schema(DEFAULT_TABLES)
         container = cls(settings=settings, db=db, cache=MemoryCacheManager())
         container._wire_conversation_services()
+        container._wire_knowledge_services()
         container._wire_chat_services()
         return container
 
@@ -204,6 +210,7 @@ class AppContainer:
         db.ensure_schema(DEFAULT_TABLES)
         container = cls(settings=settings, db=db, cache=MemoryCacheManager())
         container._wire_conversation_services()
+        container._wire_knowledge_services()
         container._wire_chat_services()
         return container
 
@@ -588,6 +595,110 @@ class AppContainer:
         raise ValueError(f"未知限流后端：{backend}（允许 process|redis）")
 
     # ==================== 生命周期 ====================
+
+    def _wire_knowledge_services(self) -> None:
+        """组装 P5 knowledge 域（N1-N3：KB/文档/分块 service + 支撑组件，plan 5.3.5）
+
+        chunk_dao/chunk_service/vector_store 回注 document_service：enable 双向向量同步、
+        page 的 chunks_edited 标记随 N3 注入生效。embedding 复用 ai_config 构建的实例；
+        无可用 embedding 客户端时向量侧退化为「仅关系库落库」（分块/检索受限于无向量后端）。
+        """
+        from knowledge.dao.base import KnowledgeBaseDao
+        from knowledge.dao.chunk import KnowledgeChunkDao
+        from knowledge.dao.chunk_log import KnowledgeDocumentChunkLogDao
+        from knowledge.dao.document import KnowledgeDocumentDao
+        from knowledge.filter.upload_rate_limiter import UploadRateLimiter
+        from knowledge.handler.remote_file_fetcher import RemoteFileFetcher
+        from knowledge.mq.chunk_dispatcher import ProcessChunkTaskDispatcher
+        from knowledge.service.base import KnowledgeBaseService
+        from knowledge.service.chunk import KnowledgeChunkService
+        from knowledge.service.document import KnowledgeDocumentService
+        from knowledge.sink.relational_chunk_sink import RelationalChunkSink
+        from knowledge.support.ingestion_spec_codec import IngestionSpecCodec
+        from knowledge.support.ingestion_spec_schema import IngestionSpecSchemaProvider
+        from knowledge.support.vector_target_resolver import VectorTargetResolver
+        from rag.file_storage import DefaultFileStorageService
+        from rag.ingestion.kernel import ChunkEmbeddingService, DefaultIngestionKernel
+        from rag.ingestion.parser.markdown_parser import MarkdownDocumentParser
+        from rag.ingestion.parser.registry import ParserRegistry
+        from rag.ingestion.parser.text_parser import TextDocumentParser
+        from rag.ingestion.sink import ChunkIndexWriter
+        from rag.ingestion.splitter.base import ChunkingService
+        from storage.object import MemoryObjectStorageClient
+        from storage.object.config import RagStorageProperties
+        from storage.vector.in_memory import InMemoryVectorStore, InMemoryVectorStoreAdmin
+
+        # 解析器注册表 + 摄取配置 codec/schema（schema 档位推导依赖注册表）
+        parser_registry = ParserRegistry([TextDocumentParser(), MarkdownDocumentParser()])
+        codec = IngestionSpecCodec()
+        schema_provider = IngestionSpecSchemaProvider(parser_registry)
+
+        # 文件存储门面（Memory 后端；真实 S3/OSS P6）+ 远端拉取 + 上传限流
+        file_storage = DefaultFileStorageService(MemoryObjectStorageClient(), RagStorageProperties())
+        fetcher = RemoteFileFetcher(file_storage)
+        limiter = UploadRateLimiter()
+
+        # 向量/嵌入（复用 ai_config 构建 embedding；无可用 embedding → 向量侧退化）
+        ai_config = self.ai_config if self.ai_config is not None else _load_ai_config()
+        embedding = self._build_embedding_service(ai_config) if ai_config is not None else None
+        resolver = VectorTargetResolver(ai_config)
+        chunk_embedding = ChunkEmbeddingService(embedding) if embedding is not None else None
+        vector_store = InMemoryVectorStore(embedding_service=embedding) if embedding is not None else None
+        vector_admin = InMemoryVectorStoreAdmin()
+
+        # 扇出：向量 + 关系库 chunk（N0 RelationalChunkSink 并入；无向量后端仅关系库）
+        sinks = []
+        if vector_store is not None:
+            sinks.append(vector_store)
+        sinks.append(RelationalChunkSink(self.db))
+        chunk_index_writer = ChunkIndexWriter(sinks)
+
+        # 摄取内核：parser → chunk → embed → 扇出
+        ingest_kernel = DefaultIngestionKernel(
+            parser_registry, ChunkingService(), chunk_embedding, chunk_index_writer
+        )
+
+        # dao
+        kb_dao = KnowledgeBaseDao(self.db)
+        doc_dao = KnowledgeDocumentDao(self.db)
+        chunk_dao = KnowledgeChunkDao(self.db)
+        chunk_log_dao = KnowledgeDocumentChunkLogDao(self.db)
+
+        # 服务：dispatcher 的 start_chunk 事务体经延迟闭包引用 document_service（循环依赖：dispatcher ↔ doc_service）
+        document_service = None  # 先占位，闭包在 dispatch 时已绑定
+
+        def _dispatcher_start(doc_id: str, operator) -> None:
+            document_service._cas_start_chunk(doc_id, operator)
+
+        dispatcher = ProcessChunkTaskDispatcher(
+            start_chunk=_dispatcher_start,
+            execute_chunk=lambda doc_id: document_service.execute_chunk(doc_id),
+            max_concurrent=2,
+        )
+
+        self.knowledge_base_service = KnowledgeBaseService(
+            kb_dao, doc_dao, file_storage=file_storage, vector_admin=vector_admin
+        )
+        self.knowledge_chunk_service = KnowledgeChunkService(
+            chunk_dao=chunk_dao, doc_dao=doc_dao, kb_dao=kb_dao,
+            chunk_embedding_service=chunk_embedding,
+            vector_target_resolver=resolver,
+            vector_store=vector_store,
+        )
+        self.knowledge_document_service = KnowledgeDocumentService(
+            kb_dao=kb_dao, doc_dao=doc_dao, chunk_log_dao=chunk_log_dao,
+            parser_registry=parser_registry, codec=codec,
+            vector_target_resolver=resolver,
+            ingest_kernel=ingest_kernel, chunk_index_writer=chunk_index_writer,
+            file_storage=file_storage, fetcher=fetcher, dispatcher=dispatcher,
+            limiter=limiter,
+            chunk_dao=chunk_dao, chunk_service=self.knowledge_chunk_service,
+            vector_store=vector_store,
+            schedule_service=None,  # N4 接入
+            pipeline_service=None,  # N5 接入
+        )
+        document_service = self.knowledge_document_service
+        self.ingestion_spec_schema_provider = schema_provider
 
     def close(self) -> None:
         """释放容器持有的资源（lifespan 退出时调用）"""

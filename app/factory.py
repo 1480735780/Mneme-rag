@@ -81,6 +81,10 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
     from rag.controller.agent_profile_controller import router as agent_profile_router
     from rag.controller.settings_controller import router as settings_router
     from rag.controller.graph_controller import router as graph_router
+    # P5 knowledge 域（N1-N3：KB/文档/分块）；服务由 _wire_knowledge_services 装配
+    from knowledge.controller.chunk import router as knowledge_chunk_router
+    from knowledge.controller.document import router as knowledge_doc_router
+    from knowledge.controller.kb import router as knowledge_kb_router
 
     app.include_router(conversation_router)
     # M4 反馈与推荐追问域（C4/C5/C6）：与 engine 无关，常驻挂载
@@ -94,6 +98,10 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
     app.include_router(agent_profile_router)
     app.include_router(settings_router)
     app.include_router(graph_router)
+    # P5 knowledge 域：KB/文档/分块常驻挂载（N3 起服务已装配）
+    app.include_router(knowledge_kb_router)
+    app.include_router(knowledge_doc_router)
+    app.include_router(knowledge_chunk_router)
     # 聊天流式/停止（M3）经 lifespan 条件挂载（engine 就绪才暴露，见上）
 
     # 探活端点（对齐 M0 DoD：GET /health 返回统一 Result）

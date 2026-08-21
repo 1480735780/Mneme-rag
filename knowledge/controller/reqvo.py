@@ -11,7 +11,7 @@ pydantic 以 snake_case 属性承载；service 层不经此模型、感知 dict/
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -48,3 +48,29 @@ class KnowledgeDocumentUpdateRequest(BaseModel):
     source_location: Optional[str] = Field(default=None, alias="sourceLocation")
     schedule_enabled: Optional[int] = Field(default=None, alias="scheduleEnabled")
     schedule_cron: Optional[str] = Field(default=None, alias="scheduleCron")
+
+
+class KnowledgeChunkCreateRequest(BaseModel):
+    """新增 Chunk 请求（对齐 Java KnowledgeChunkCreateRequest：chunkId/content/index）"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    chunk_id: Optional[str] = Field(default=None, alias="chunkId")
+    content: Optional[str] = None
+    index: Optional[int] = None
+
+
+class KnowledgeChunkUpdateRequest(BaseModel):
+    """更新 Chunk 请求（对齐 Java KnowledgeChunkUpdateRequest：content）"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    content: Optional[str] = None
+
+
+class KnowledgeChunkBatchRequest(BaseModel):
+    """批量启停 Chunk 请求（对齐 Java KnowledgeChunkBatchRequest：chunkIds；body 可缺省）"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    chunk_ids: Optional[List[str]] = Field(default=None, alias="chunkIds")
