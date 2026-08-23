@@ -10,7 +10,9 @@ rag.ingestion.parser.mineru - MinerU SaaS 文档解析外接子包
 """
 from __future__ import annotations
 
-__all__ = ["MinerUDocumentParser"]
+from rag.ingestion.parser.mineru.client import MinerUClient
+
+__all__ = ["MinerUDocumentParser", "MinerUClient"]
 
 
 def __getattr__(name: str):
