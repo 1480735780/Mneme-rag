@@ -11,8 +11,9 @@ rag.ingestion.parser.mineru - MinerU SaaS 文档解析外接子包
 from __future__ import annotations
 
 from rag.ingestion.parser.mineru.client import MinerUClient
+from rag.ingestion.parser.mineru.polling import MinerUPollingExecutor
 
-__all__ = ["MinerUDocumentParser", "MinerUClient"]
+__all__ = ["MinerUDocumentParser", "MinerUClient", "MinerUPollingExecutor"]
 
 
 def __getattr__(name: str):
