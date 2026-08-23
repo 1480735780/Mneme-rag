@@ -80,12 +80,21 @@ class MarkdownDocumentParser(DocumentParser):
 # ===================== token 流 → Block =====================
 
 
-def _extract_blocks(tokens: List[Token], prov: Provenance) -> List[object]:
+def _extract_blocks(
+    tokens: List[Token],
+    prov: Provenance,
+    image_url_map: Optional[Dict[str, str]] = None,
+    image_description_map: Optional[Dict[str, str]] = None,
+) -> List[object]:
     """
     markdown-it-py token 流 → Block 列表
 
     只处理顶层 block（列表项内的段落归 ListBlock），与 Java 的
     BlockExtractingVisitor「只处理顶层 block，不递归进嵌套」一致。
+
+    image_url_map / image_description_map：MinerU 解包链路注入的
+    图片 URL 改写映射与图生文描述映射；均为 None 时保持旧行为（图片地址
+    原样保留、无描述）。
     """
     blocks: List[object] = []
     i = 0
@@ -105,9 +114,11 @@ def _extract_blocks(tokens: List[Token], prov: Provenance) -> List[object]:
             i += 2  # 跳过 inline；paragraph_close 会被普通循环跳过
             standalone = _as_standalone_image(children)
             if standalone is not None:
-                blocks.append(_to_image_block(standalone, prov))
+                blocks.append(
+                    _to_image_block(standalone, prov, image_url_map, image_description_map)
+                )
                 continue
-            text = _extract_inline_text(children)
+            text = _extract_inline_text(children, image_url_map)
             if text:
                 blocks.append(ParagraphBlock(prov, text))
         elif t.type == "html_block":
@@ -245,16 +256,71 @@ def _as_standalone_image(children: Optional[List[Token]]) -> Optional[Token]:
     return found
 
 
-def _to_image_block(image: Token, prov: Provenance) -> ImageBlock:
-    """图片 token → 图片块；地址是作者写的原样地址，不经过资产上传，因此没有图生文描述"""
-    url = image.attrGet("src") or ""
+def _to_image_block(
+    image: Token,
+    prov: Provenance,
+    image_url_map: Optional[Dict[str, str]] = None,
+    image_description_map: Optional[Dict[str, str]] = None,
+) -> ImageBlock:
+    """
+    图片 token → 图片块
+
+    无映射时地址是作者写的原样地址（旧行为）；注入 image_url_map 时地址改写为
+    已上传对象的公网 URL，命中 image_description_map 时带上图生文描述。
+    """
+    raw_url = image.attrGet("src") or ""
+    url = _resolve_image_url(raw_url, image_url_map)
+    zip_path = _resolve_zip_path(raw_url, image_url_map)
+    description = (
+        image_description_map.get(zip_path)
+        if zip_path and image_description_map
+        else None
+    )
     alt_text = image.content or ""
     return ImageBlock(
         prov,
         AssetRef(url, _guess_image_mime(url)),
         alt_text,
         alt_text,
+        description,
     )
+
+
+def _resolve_image_url(
+    raw_url: str, image_url_map: Optional[Dict[str, str]]
+) -> str:
+    """MinerU zip 路径 → 公网 URL；无 map 或未命中时原样返回（对齐 Java resolveZipPath 语义）"""
+    if not image_url_map:
+        return raw_url
+    if raw_url in image_url_map:
+        return image_url_map[raw_url]
+    stripped = raw_url
+    if stripped.startswith("./"):
+        stripped = stripped[2:]
+    if stripped in image_url_map:
+        return image_url_map[stripped]
+    # 文件名级兜底（zip 内路径可能带子目录前缀）
+    import os  # noqa: PLC0415
+
+    filename = os.path.basename(stripped.replace("\\", "/"))
+    for zip_path, public_url in image_url_map.items():
+        if os.path.basename(zip_path.replace("\\", "/")) == filename:
+            return public_url
+    return raw_url
+
+
+def _resolve_zip_path(
+    raw_url: str, image_url_map: Optional[Dict[str, str]]
+) -> Optional[str]:
+    """公网 URL 反查 zip 内路径（用于关联描述）；无命中返回 None"""
+    if not image_url_map:
+        return None
+    if raw_url in image_url_map:
+        return raw_url
+    stripped = raw_url[2:] if raw_url.startswith("./") else raw_url
+    if stripped in image_url_map:
+        return stripped
+    return None
 
 
 # ===================== 内联文本提取 =====================
@@ -267,7 +333,10 @@ _CONTAINER_CLOSE = {
 }
 
 
-def _extract_inline_text(children: Optional[List[Token]]) -> str:
+def _extract_inline_text(
+    children: Optional[List[Token]],
+    image_url_map: Optional[Dict[str, str]] = None,
+) -> str:
     """
     拼接内联 token 流中的可读文本
 
@@ -276,6 +345,8 @@ def _extract_inline_text(children: Optional[List[Token]]) -> str:
 
     注意：markdown-it-py 的内联 token 是扁平流（link_open ... link_close 平铺），
     需要用状态机跳过容器关闭标记，与 Java commonmark 的嵌套访问器不同。
+
+    image_url_map：非 None 时图片地址改写为已上传对象的公网 URL，否则保持原样。
     """
     if not children:
         return ""
@@ -290,7 +361,8 @@ def _extract_inline_text(children: Optional[List[Token]]) -> str:
         elif ctype == "code_inline":
             sb.append("`" + c.content + "`")
         elif ctype == "image":
-            url = c.attrGet("src") or ""
+            raw_url = c.attrGet("src") or ""
+            url = _resolve_image_url(raw_url, image_url_map)
             alt = c.content or ""
             sb.append("![" + alt + "](" + url + ")")
         elif ctype == "link_open":

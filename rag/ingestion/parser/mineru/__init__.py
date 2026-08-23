@@ -12,8 +12,14 @@ from __future__ import annotations
 
 from rag.ingestion.parser.mineru.client import MinerUClient
 from rag.ingestion.parser.mineru.polling import MinerUPollingExecutor
+from rag.ingestion.parser.mineru.unpacker import MinerUResultUnpacker
 
-__all__ = ["MinerUDocumentParser", "MinerUClient", "MinerUPollingExecutor"]
+__all__ = [
+    "MinerUDocumentParser",
+    "MinerUClient",
+    "MinerUPollingExecutor",
+    "MinerUResultUnpacker",
+]
 
 
 def __getattr__(name: str):

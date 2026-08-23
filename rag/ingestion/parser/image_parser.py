@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Set
 
 from common.exception.business import ServiceException
@@ -34,6 +34,7 @@ class ImageParseProperties:
 
     description_prompt: str = "请用中文描述这张图片的内容，并提取图中出现的全部文字。"
     max_output_tokens: Optional[int] = None
+    embedded_describe_enabled: bool = field(default=True)  # 对齐 Java isEmbeddedDescribeEnabled()
 
 
 class ImageDocumentParser(DocumentParser):
