@@ -324,16 +324,18 @@ class ChunkMetadata:
         outline_path: 章节层级路径（如 ["第3章", "3.1 节"]），Excel sheet 名也走这里
         source_file:  原始文件名（简化版，Java 的 Provenance.sourceFile）
         sheet_name:   所属 Excel sheet 名（如有）
+        assets:       引用的二进制资产（如图片的 AssetRef；Any 规避 core→rag 循环依赖，对齐 Java assets）
         extras:       开放扩展位：块级加工产出（摘要、关键词）与文档级元数据
     """
     outline_path: List[str] = field(default_factory=list)
     source_file: Optional[str] = None
     sheet_name: Optional[str] = None
+    assets: List[Any] = field(default_factory=list)
     extras: Dict[str, Any] = field(default_factory=dict)
 
     KEY_SOURCE_FILE = "source_file"
     KEY_SHEET_NAME = "sheet_name"
-    # Java 的 KEY_ASSETS 因简化版省略 assets 字段而不适用
+    KEY_ASSETS = "assets"
 
     @staticmethod
     def empty() -> "ChunkMetadata":
@@ -362,6 +364,7 @@ class ChunkMetadata:
             outline_path=list(self.outline_path),
             source_file=self.source_file,
             sheet_name=self.sheet_name,
+            assets=list(self.assets),
             extras=merged,
         )
 

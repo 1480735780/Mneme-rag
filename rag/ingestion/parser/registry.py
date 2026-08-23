@@ -19,10 +19,13 @@ WILDCARD_SUFFIX = "/*"
 
 # 启动自检清单：对外声明支持的扩展名，每个都必须被某个解析器在 FAST 档精准确认领。
 # 清单落在扩展名而非 MIME 上，因为 MIME 是探测器的产出，拿它校验它自己恒为真。
-# MVP 只声明当前解析器可覆盖的格式；pdf/doc/xls/csv/png 等复杂格式属 P6，解析器就绪后追加。
+# P1 3.6：随 Csv/Excel/Image 解析器就绪追加对应格式；pdf/doc 等复杂格式待 MinerU 接入后追加。
 SUPPORTED_EXTENSIONS: Set[str] = {
     "md", "markdown", "txt", "text",
     "html", "htm", "json", "xml", "rtf",
+    "csv",
+    "xls", "xlsx",
+    "png", "jpg", "jpeg", "svg",
 }
 
 # 扩展名 → Tika 探测 MIME 的等价映射（对应 Java Tika.detect("probe." + extension)）
@@ -36,6 +39,13 @@ _EXTENSION_TO_MIME: Dict[str, str] = {
     "json": "application/json",
     "xml": "application/xml",
     "rtf": "application/rtf",
+    "csv": "text/csv",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "svg": "image/svg+xml",
 }
 
 

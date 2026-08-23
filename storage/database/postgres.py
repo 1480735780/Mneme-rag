@@ -37,6 +37,11 @@ class SqlDatabaseClient(DatabaseClient):
         self._executor = executor
         self._dialect = dialect
 
+    @property
+    def executor(self) -> SqlExecutor:
+        """底层原始 SQL 执行器（供 PgVector 等需裸 SQL 的组件复用同一连接池/会话）"""
+        return self._executor
+
     # ── 读侧 ──────────────────────────────────────────────
 
     def select_rows(

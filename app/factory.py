@@ -46,11 +46,16 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
             from rag.controller.chat_controller import router as chat_router
 
             app.include_router(chat_router)
+        # P5 N4 调度任务：随 lifespan 启动 scan/recover 协程（优雅停止）
+        if container.knowledge_schedule_job is not None:
+            await container.knowledge_schedule_job.start()
         try:
             yield
         finally:
-            # 关闭：释放容器持有的资源
-            container.close()
+            # 关闭：先停调度协程，再释放容器持有的资源（含 redis 连接池优雅断开，P6 3.1）
+            if container.knowledge_schedule_job is not None:
+                await container.knowledge_schedule_job.stop()
+            await container.aclose()
             logger.info("应用资源已释放")
 
     app = FastAPI(title="ragent", version="0.1.0", lifespan=lifespan)
@@ -85,6 +90,9 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
     from knowledge.controller.chunk import router as knowledge_chunk_router
     from knowledge.controller.document import router as knowledge_doc_router
     from knowledge.controller.kb import router as knowledge_kb_router
+    # P5 N5 摄取流水线域（P1-P5 + T1-T5）；服务由 _wire_ingestion_services 装配
+    from ingestion.controller.pipeline import router as ingestion_pipeline_router
+    from ingestion.controller.task import router as ingestion_task_router
 
     app.include_router(conversation_router)
     # M4 反馈与推荐追问域（C4/C5/C6）：与 engine 无关，常驻挂载
@@ -102,6 +110,9 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
     app.include_router(knowledge_kb_router)
     app.include_router(knowledge_doc_router)
     app.include_router(knowledge_chunk_router)
+    # P5 N5 摄取流水线域：P1-P5 + T1-T5 常驻挂载
+    app.include_router(ingestion_pipeline_router)
+    app.include_router(ingestion_task_router)
     # 聊天流式/停止（M3）经 lifespan 条件挂载（engine 就绪才暴露，见上）
 
     # 探活端点（对齐 M0 DoD：GET /health 返回统一 Result）

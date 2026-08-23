@@ -65,6 +65,9 @@ from storage.database import (
 
 logger = logging.getLogger(__name__)
 
+# 跨域共享实例懒加载哨兵（对齐 Java 单例 bean：LLM/embedding/vector_store 全容器只建一份）
+_MISSING = object()
+
 # AI 模型配置文件（LLM 路由栈装配；与 core/llm/config/ai.yaml 对齐）
 _AI_CONFIG_YAML = str(Path(__file__).resolve().parent.parent / "core" / "llm" / "config" / "ai.yaml")
 
@@ -108,6 +111,44 @@ def _build_chat_clients(config: Any) -> list:
     return clients
 
 
+def _build_database(settings: AppSettings) -> SqlDatabaseClient:
+    """按 RAGENT_DATABASE_URL 装配关系库；未配置回落 sqlite 内存库兜底（对齐 M0 语义）
+
+    P6 0.1（决策 D2 env 驱动、逐项独立兜底）：显式配了连接串走真实后端（PG/MySQL，
+    pool_pre_ping 防断连），未配回落 sqlite 内存库——保证 real 栈不设 env 时行为与现状完全一致。
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import StaticPool
+
+    url = (settings.database_url or "").strip()
+    if url:
+        engine = create_engine(url, pool_pre_ping=True)
+    else:
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+    db = SqlDatabaseClient(SqlAlchemySqlExecutor(engine=engine))
+    db.ensure_schema(DEFAULT_TABLES)
+    return db
+
+
+def _build_cache(settings: AppSettings):
+    """按 RAGENT_REDIS_URL 装配缓存：非空 → RedisCacheManager + redis.asyncio 客户端（挂 container.redis）；空 → Memory 兜底
+
+    P6 0.1（决策 D2）：redis 客户端随 container.redis 注入，供 _build_rate_limiter 的
+    rate_limit_backend=redis 分支使用（RedisFairRateLimiter）；未配置回落 Memory。
+    """
+    url = (settings.redis_url or "").strip()
+    if not url:
+        return MemoryCacheManager(), None
+    import redis.asyncio as aioredis
+
+    client = aioredis.from_url(url)
+    return RedisCacheManager(client), client
+
+
 @dataclass
 class AppContainer:
     """
@@ -128,6 +169,9 @@ class AppContainer:
     # M7 引擎全链装配：memory/llm 注入槽（测试注入桩；生产由 _wire_memory/_build_llm 构建）
     memory_service: Any = None
     llm_service: Any = None
+    # 向量化注入槽：写侧（knowledge 域 chunk 落库）与读侧（检索 InMemoryVectorStore）共享同一实例，
+    # 无真实 key 环境经槽注入桩；生产由 _build_embedding_service 按 ai.yaml 构建
+    embedding_service: Any = None
     # AI 模型配置（ai.yaml 单次加载；settings ai 区块与 _build_llm 共享同一实例）
     ai_config: Any = None
     # 检索通道后端注入槽（快赢①：生产由 _build_retrieval_engine 按 RetrievalProperties 构建真实客户端；
@@ -168,6 +212,12 @@ class AppContainer:
     knowledge_document_service: Any = None
     knowledge_chunk_service: Any = None
     ingestion_spec_schema_provider: Any = None
+    # P5 N4 调度域：登记服务 + 调度任务（lifespan 挂载 start/stop 协程）
+    knowledge_schedule_service: Any = None
+    knowledge_schedule_job: Any = None
+    # P5 N5 摄取流水线域：pipeline/task 服务（intent_tree 复用 M5 IntentTreeAdminService）
+    ingestion_pipeline_service: Any = None
+    ingestion_task_service: Any = None
     _owned: list = field(default_factory=list)
 
     # ==================== 双 profile 装配 ====================
@@ -187,29 +237,27 @@ class AppContainer:
         db.ensure_schema(DEFAULT_TABLES)
         container = cls(settings=settings, db=db, cache=MemoryCacheManager())
         container._wire_conversation_services()
+        container._wire_ingestion_services()
         container._wire_knowledge_services()
         container._wire_chat_services()
         return container
 
     @classmethod
     def _build_real(cls, settings: AppSettings) -> "AppContainer":
-        """真实栈（SqlDatabaseClient + RedisCacheManager），env 驱动
+        """真实栈（P6 0.1 逐项装配：DB / Redis 按 env 注入，缺省逐项回落 sqlite / Memory）
 
-        M0 骨架：默认 SQLite 内存库兜底（SqlAlchemySqlExecutor），Redis 未注入时用 Memory 兜底，
-        真实 PG/Redis 连接串随 M1/M3 接线时经配置注入。LLM 路由（标题生成）M3 注入前回退默认标题。
+        - 关系库：RAGENT_DATABASE_URL 非空 → 该连接串（PG/MySQL）；空 → sqlite 内存库兜底；
+        - 缓存：  RAGENT_REDIS_URL 非空 → RedisCacheManager + container.redis（供 RedisFairRateLimiter）；
+                  空 → Memory 兜底；
+        - 向量 / 对象存储：经 _build_vector_store / _build_object_storage 分派
+          （向量：memory 兜底 / milvus 1.1 / pgvector 1.2；对象存储：memory 兜底 / s3 2.1 / oss 2.2 可选）。
+        LLM 路由（标题生成）M3 注入前回退默认标题。
         """
-        from sqlalchemy import create_engine
-        from sqlalchemy.pool import StaticPool
-
-        engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        db = SqlDatabaseClient(SqlAlchemySqlExecutor(engine=engine))
-        db.ensure_schema(DEFAULT_TABLES)
-        container = cls(settings=settings, db=db, cache=MemoryCacheManager())
+        db = _build_database(settings)
+        cache, redis_client = _build_cache(settings)
+        container = cls(settings=settings, db=db, cache=cache, redis=redis_client)
         container._wire_conversation_services()
+        container._wire_ingestion_services()
         container._wire_knowledge_services()
         container._wire_chat_services()
         return container
@@ -299,7 +347,7 @@ class AppContainer:
         # 容器级记忆：engine 加载历史 + handler 落库 + reject 落库共享同一实例（M7 ②）
         self._wire_memory()
         # LLM：注入槽（测试桩）优先；生产经 _build_llm 按 ai.yaml 装配路由栈（无可用客户端 → None）
-        llm = self.llm_service if self.llm_service is not None else self._build_llm()
+        llm = self._get_shared_llm()  # 跨域共享（ingestion/chat 同一 LLM 路由，熔断状态同源）
         if llm is not None:
             # 快赢②：回注推荐追问生成器（此前 `_wire_conversation_services` 先于 engine 装配，generator 缺省 None → 恒 FAILED）
             self.recommended_question_service.inject_llm(llm)
@@ -465,15 +513,13 @@ class AppContainer:
         )
 
     def _build_memory_vector_retriever(self) -> Any:
-        """构建内存向量读侧（InMemoryVectorStore + ai.yaml embedding 服务）；无 embedding 客户端 → None"""
-        config = self.ai_config if self.ai_config is not None else _load_ai_config()
-        embedding = self._build_embedding_service(config) if config is not None else None
+        """构建内存向量读侧：直接复用容器级共享向量库（写读同一单例，Java VectorStore 语义）；
+        无可用 embedding 客户端 → None"""
+        embedding = self._get_shared_embedding()
         if embedding is None:
             logger.warning("向量通道启用但无可用 embedding 客户端，跳过向量通道")
             return None
-        from storage.vector.in_memory import InMemoryVectorStore
-
-        return InMemoryVectorStore(embedding_service=embedding)
+        return self._get_shared_vector_store()
 
     def _build_embedding_service(self, config: Any) -> Any:
         """按 ai.yaml 构建路由式向量化服务（镜像 _build_chat_clients：已知 embedding provider + 缺 key 跳过）"""
@@ -533,6 +579,292 @@ class AppContainer:
         selector = ModelSelector(config, health_store)
         executor = RoutingExecutor(health_store)
         return RoutingLLMService(selector, health_store, executor, clients, config)
+
+    # ==================== 跨域共享实例（对齐 Java 单例 bean） ====================
+
+    def _get_shared_llm(self) -> Any:
+        """容器级共享 LLM 路由栈：knowledge/chat 与 ingestion 共用，避免熔断状态分裂
+
+        注入槽（self.llm_service，测试桩可后注入）优先且不缓存；否则首次调 _build_llm 并缓存，
+        保证全容器同一 LLM 实例（对齐 Java 单例 bean）。
+        """
+        if self.llm_service is not None:
+            return self.llm_service
+        cached = getattr(self, "_shared_llm", _MISSING)
+        if cached is _MISSING:
+            cached = self._build_llm()
+            self._shared_llm = cached
+        return cached
+
+    def _get_shared_embedding(self) -> Any:
+        """容器级共享 embedding 路由（懒建一次）：knowledge 与 ingestion 共用，杜绝重复建客户端"""
+        cached = getattr(self, "_shared_embedding", _MISSING)
+        if cached is _MISSING:
+            cached = self.embedding_service  # 注入槽（测试桩）优先
+            if cached is None:
+                config = self.ai_config if self.ai_config is not None else _load_ai_config()
+                cached = self._build_embedding_service(config) if config is not None else None
+            self._shared_embedding = cached
+        return cached
+
+    def _get_shared_vector_store(self) -> Any:
+        """容器级共享向量库（懒建一次）：knowledge 与 ingestion 共用，
+        保证流水线 IndexerNode 写入的向量在 knowledge 检索侧可见（Java 单例 VectorStore）
+
+        P6 0.1：经 _build_vector_store 按 RAGENT_VECTOR_STORE_TYPE 分派（memory 兜底；其余 fail-fast，决策 D3）。
+        """
+        cached = getattr(self, "_shared_vector_store", _MISSING)
+        if cached is _MISSING:
+            cached = self._build_vector_store()
+            self._shared_vector_store = cached
+        return cached
+
+    def _build_vector_store(self) -> Any:
+        """按 RAGENT_VECTOR_STORE_TYPE 装配向量后端写侧（读写双侧共享实例）
+
+        P6 1.1：memory 为默认兜底（现状行为不变）；milvus 走 _build_milvus_stack 真实接线
+        （探活 fail-fast + 集合自动创建）；1.2：pg/pgvector 走 _build_pgvector_stack 真实接线
+        （CREATE EXTENSION vector 前置检查 fail-fast + 共享 HNSW 索引幂等建），并把读侧
+        retriever 注入容器槽（检索引擎优先取用）。
+        """
+        backend = (self.settings.vector_store_type or "memory").lower()
+        if backend == "memory":
+            from storage.vector.in_memory import InMemoryVectorStore
+
+            embedding = self._get_shared_embedding()
+            return InMemoryVectorStore(embedding_service=embedding) if embedding is not None else None
+        if backend == "milvus":
+            store, retriever, _admin = self._build_milvus_stack()
+            # 读侧注入槽：检索通道 vector_enabled 时优先取用（避免回落内存读侧）
+            self.vector_retriever = retriever
+            return store
+        if backend in ("pg", "pgvector"):
+            store, retriever, _admin = self._build_pgvector_stack()
+            # 读侧注入槽：检索通道 vector_enabled 时优先取用（避免回落内存读侧）
+            self.vector_retriever = retriever
+            return store
+        raise ValueError(f"未知向量后端：{backend}（允许 memory|milvus|pgvector）")
+
+    def _build_milvus_client(self) -> Any:
+        """构建并探活 pymilvus 客户端（决策 D3：连接失败即启动 fail-fast，不静默回落内存）"""
+        from pymilvus import MilvusClient
+
+        from storage.vector.milvus import PymilvusClientAdapter
+
+        client = getattr(self, "_shared_milvus_client", _MISSING)
+        if client is _MISSING:
+            adapter = PymilvusClientAdapter(
+                MilvusClient(
+                    uri=f"http://{self.settings.milvus_host}:{self.settings.milvus_port}"
+                )
+            )
+            adapter.list_collections()  # 探活：Milvus 不可达在此抛异常 → fail-fast
+            self._shared_milvus_client = adapter
+        return self._shared_milvus_client
+
+    def _build_milvus_stack(self) -> tuple:
+        """构建 Milvus 读写管理三件套（client 单例缓存；集合自动创建幂等 ensure_vector_space）
+
+        Returns:
+            (store, retriever, admin)：写侧 / 读侧 / 管理侧，共享同一 MilvusClient
+        """
+        from storage.vector.config import VectorProperties
+        from storage.vector.milvus import (
+            MilvusVectorRetrieverService,
+            MilvusVectorStoreAdmin,
+            MilvusVectorStoreService,
+        )
+        from storage.vector.schema import VectorSpaceId, VectorSpaceSpec
+
+        cached = getattr(self, "_shared_milvus_stack", _MISSING)
+        if cached is _MISSING:
+            embedding = self._get_shared_embedding()
+            if embedding is None:
+                raise ValueError(
+                    "RAGENT_VECTOR_STORE_TYPE=milvus 需要可用的 embedding 服务（ai.yaml embedding provider）"
+                )
+            props = VectorProperties(
+                type="milvus",
+                collection_name=self.settings.milvus_collection,
+            )
+            client = self._build_milvus_client()
+            store = MilvusVectorStoreService(client, props)
+            retriever = MilvusVectorRetrieverService(client, embedding, props)
+            admin = MilvusVectorStoreAdmin(client, props)
+            # 集合自动创建（幂等：已存在则跳过；缺失则按共享 schema 建 collection + 索引）
+            admin.ensure_vector_space(
+                VectorSpaceSpec(space_id=VectorSpaceId(logical_name=props.collection_name))
+            )
+            cached = (store, retriever, admin)
+            self._shared_milvus_stack = cached
+        return cached
+
+    def _build_pgvector_stack(self) -> tuple:
+        """构建 PgVector 读写管理三件套（复用 DB 的 SqlExecutor；扩展前置检查 fail-fast）
+
+        前置（决策 D3：显式配置失败即报错，不静默回落内存）：
+            1. RAGENT_DATABASE_URL 必须是 PostgreSQL 连接串（共享表/HNSW 索引/`<=>` 算子
+               均为 PG + pgvector 专属，sqlite 兜底不可承载）；
+            2. `CREATE EXTENSION IF NOT EXISTS vector`：扩展缺失 / 权限不足 → 启动即报错
+               （含安装指引），不静默降级；
+        幂等：admin.ensure_vector_space 只确保共享 HNSW 索引存在（建表依赖迁移脚本，P6 不负责）。
+
+        Returns:
+            (store, retriever, admin)：写侧 / 读侧 / 管理侧，共享同一 SqlExecutor
+        """
+        from storage.vector.pg import (
+            PgVectorRetrieverService,
+            PgVectorStoreAdmin,
+            PgVectorStoreService,
+        )
+        from storage.vector.schema import VectorSpaceId, VectorSpaceSpec
+
+        cached = getattr(self, "_shared_pgvector_stack", _MISSING)
+        if cached is _MISSING:
+            url = (self.settings.database_url or "").strip()
+            if not url.lower().startswith("postgresql"):
+                raise ValueError(
+                    "RAGENT_VECTOR_STORE_TYPE=pgvector 需要 PostgreSQL 连接串"
+                    "（RAGENT_DATABASE_URL 指向装好 pgvector 扩展的 PG，如"
+                    " postgresql+psycopg://user:pwd@host:5432/db）"
+                )
+            if not isinstance(self.db, SqlDatabaseClient):
+                raise ValueError(
+                    "RAGENT_VECTOR_STORE_TYPE=pgvector 需要 real 栈的 SqlDatabaseClient"
+                    "（提供 SqlExecutor），当前为 %s" % type(self.db).__name__
+                )
+            executor = self.db.executor
+            # 前置检查：扩展 + 权限（缺失/无权限 → fail-fast，附安装指引；决策 D3）
+            try:
+                executor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            except Exception as ex:  # noqa: BLE001 —— 前置检查失败即启动失败
+                raise ValueError(
+                    "pgvector 扩展不可用或当前用户无 CREATE 权限，请先安装 pgvector"
+                    "（CREATE EXTENSION vector）后再启动；原始错误: %s" % ex
+                ) from ex
+            embedding = self._get_shared_embedding()
+            if embedding is None:
+                raise ValueError(
+                    "RAGENT_VECTOR_STORE_TYPE=pgvector 需要可用的 embedding 服务（ai.yaml embedding provider）"
+                )
+            store = PgVectorStoreService(executor)
+            retriever = PgVectorRetrieverService(executor, embedding)
+            admin = PgVectorStoreAdmin(executor)
+            # 幂等：确保共享 HNSW 索引存在（建表依赖迁移脚本，此处只建索引，对齐 Java Admin 步骤 7）
+            admin.ensure_vector_space(
+                VectorSpaceSpec(space_id=VectorSpaceId(logical_name="ragent"))
+            )
+            cached = (store, retriever, admin)
+            self._shared_pgvector_stack = cached
+        return cached
+
+    def _get_shared_vector_admin(self) -> Any:
+        """容器级共享向量管理侧（懒建一次）：milvus/pgvector 复用各自 stack 的 admin，其余 InMemory 兜底"""
+        cached = getattr(self, "_shared_vector_admin", _MISSING)
+        if cached is _MISSING:
+            backend = (self.settings.vector_store_type or "memory").lower()
+            if backend == "milvus":
+                cached = self._build_milvus_stack()[2]
+            elif backend in ("pg", "pgvector"):
+                cached = self._build_pgvector_stack()[2]
+            else:
+                from storage.vector.in_memory import InMemoryVectorStoreAdmin
+
+                cached = InMemoryVectorStoreAdmin()
+            self._shared_vector_admin = cached
+        return cached
+
+    def _build_object_storage(self) -> Any:
+        """按 RAGENT_OBJECT_STORAGE_BACKEND 装配对象存储客户端
+
+        P6 2.1：memory 为默认兜底（现状行为不变）；s3 走 _build_s3_client 真实接线
+        （探活 fail-fast + kb/asset 桶幂等自建）；oss 显式配置时 fail-fast（可选任务 2.2，
+        未实现不静默回落内存，决策 D3）。
+        """
+        backend = (self.settings.object_storage_backend or "memory").lower()
+        if backend == "memory":
+            from storage.object import MemoryObjectStorageClient
+
+            return MemoryObjectStorageClient()
+        if backend == "s3":
+            return self._build_s3_client()
+        if backend == "oss":
+            raise ValueError(
+                f"RAGENT_OBJECT_STORAGE_BACKEND=oss 后端实现待 P6 任务 2.2（可选），当前仅支持 memory|s3"
+            )
+        raise ValueError(f"未知对象存储后端：{backend}（允许 memory|s3|oss）")
+
+    def _build_storage_properties(self) -> Any:
+        """按 RAGENT_OBJECT_STORAGE_BACKEND / RAGENT_S3_* env 构建对象存储配置（memory 兜底默认）"""
+        from storage.object.config import RagStorageProperties
+
+        backend = (self.settings.object_storage_backend or "memory").lower()
+        if backend != "s3":
+            return RagStorageProperties()
+        return RagStorageProperties(
+            type="s3",
+            kb_bucket=self.settings.s3_bucket or "ragent-sources",
+            asset_bucket=self.settings.s3_asset_bucket or "ragent-assets",
+            s3=self._build_s3_config(),
+        )
+
+    def _build_s3_config(self) -> Any:
+        """按 RAGENT_S3_* env 构建 S3 配置（endpoint 留空走 AWS 默认链）"""
+        from storage.object.config import S3Config
+
+        return S3Config(
+            endpoint=self.settings.s3_endpoint,
+            access_key=self.settings.s3_access_key,
+            secret_key=self.settings.s3_secret_key,
+            region=self.settings.s3_region,
+            path_style=self.settings.s3_path_style,
+            public_url=self.settings.s3_public_url,
+        )
+
+    def _create_boto3_s3_client(self, config: Any) -> Any:
+        """创建 boto3 S3 客户端（endpoint/凭证/region/path-style 按配置；endpoint 留空走 AWS 默认链）"""
+        import boto3
+        from botocore.config import Config as BotoConfig
+
+        kwargs: dict = {
+            "region_name": config.region,
+            "config": BotoConfig(
+                s3={"addressing_style": "path" if config.path_style else "auto"},
+                retries={"max_attempts": 3},  # SDK 自动重试（reliable_put 依赖）
+            ),
+        }
+        if config.endpoint:
+            kwargs["endpoint_url"] = config.endpoint
+        if config.access_key:
+            kwargs["aws_access_key_id"] = config.access_key
+            kwargs["aws_secret_access_key"] = config.secret_key
+        return boto3.client("s3", **kwargs)
+
+    def _build_s3_client(self) -> Any:
+        """构建 S3 兼容存储客户端（boto3，容器级单例缓存）：探活 fail-fast + kb/asset 桶幂等自建
+
+        前置（决策 D3：显式配置失败即报错，不静默回落内存）：
+            1. list_buckets 探活：endpoint 可达 + 凭证有效（不可达/凭证错 → 启动即报错）；
+            2. kb/asset 桶幂等 create_bucket（已存在视为成功），对齐 Milvus 集合自动创建心智。
+        """
+        from storage.object.s3 import S3ObjectStorageClient
+
+        cached = getattr(self, "_shared_s3_client", _MISSING)
+        if cached is _MISSING:
+            config = self._build_s3_config()
+            client = self._create_boto3_s3_client(config)
+            # 探活：endpoint 可达 + 凭证有效（不可达/凭证错误在此抛 → fail-fast）
+            client.list_buckets()
+            s3_client = S3ObjectStorageClient(client, config)
+            # 幂等：确保 kb/asset 桶存在（首次启动自动建，对齐 Milvus ensure_vector_space 心智）
+            for bucket in (
+                self.settings.s3_bucket or "ragent-sources",
+                self.settings.s3_asset_bucket or "ragent-assets",
+            ):
+                s3_client.create_bucket(bucket)
+            cached = s3_client
+            self._shared_s3_client = cached
+        return cached
 
     def _wire_history_chat_service(self) -> None:
         """按 engine 组装 chat_service（M7 C14：真实记忆 + M6 queue_limiter）"""
@@ -607,12 +939,20 @@ class AppContainer:
         from knowledge.dao.chunk import KnowledgeChunkDao
         from knowledge.dao.chunk_log import KnowledgeDocumentChunkLogDao
         from knowledge.dao.document import KnowledgeDocumentDao
+        from knowledge.dao.schedule import KnowledgeDocumentScheduleDao
+        from knowledge.dao.schedule_exec import KnowledgeDocumentScheduleExecDao
         from knowledge.filter.upload_rate_limiter import UploadRateLimiter
         from knowledge.handler.remote_file_fetcher import RemoteFileFetcher
         from knowledge.mq.chunk_dispatcher import ProcessChunkTaskDispatcher
+        from knowledge.schedule.job import KnowledgeDocumentScheduleJob
+        from knowledge.schedule.lock_manager import ScheduleLockManager
+        from knowledge.schedule.refresh_processor import ScheduleRefreshProcessor
+        from knowledge.schedule.state_manager import ScheduleStateManager
+        from knowledge.schedule.status_helper import DocumentStatusHelper
         from knowledge.service.base import KnowledgeBaseService
         from knowledge.service.chunk import KnowledgeChunkService
         from knowledge.service.document import KnowledgeDocumentService
+        from knowledge.service.schedule import KnowledgeDocumentScheduleService
         from knowledge.sink.relational_chunk_sink import RelationalChunkSink
         from knowledge.support.ingestion_spec_codec import IngestionSpecCodec
         from knowledge.support.ingestion_spec_schema import IngestionSpecSchemaProvider
@@ -622,34 +962,34 @@ class AppContainer:
         from rag.ingestion.parser.markdown_parser import MarkdownDocumentParser
         from rag.ingestion.parser.registry import ParserRegistry
         from rag.ingestion.parser.text_parser import TextDocumentParser
-        from rag.ingestion.sink import ChunkIndexWriter
+        from rag.ingestion.sink import ChunkIndexWriter, VectorStoreSink
         from rag.ingestion.splitter.base import ChunkingService
-        from storage.object import MemoryObjectStorageClient
-        from storage.object.config import RagStorageProperties
-        from storage.vector.in_memory import InMemoryVectorStore, InMemoryVectorStoreAdmin
 
         # 解析器注册表 + 摄取配置 codec/schema（schema 档位推导依赖注册表）
         parser_registry = ParserRegistry([TextDocumentParser(), MarkdownDocumentParser()])
         codec = IngestionSpecCodec()
         schema_provider = IngestionSpecSchemaProvider(parser_registry)
 
-        # 文件存储门面（Memory 后端；真实 S3/OSS P6）+ 远端拉取 + 上传限流
-        file_storage = DefaultFileStorageService(MemoryObjectStorageClient(), RagStorageProperties())
+        # 文件存储门面（P6 2.1 按 RAGENT_OBJECT_STORAGE_BACKEND 分派；memory 兜底 / s3 真实接线 / oss 2.2 可选）+ 远端拉取 + 上传限流
+        file_storage = DefaultFileStorageService(
+            self._build_object_storage(), self._build_storage_properties()
+        )
         fetcher = RemoteFileFetcher(file_storage)
         limiter = UploadRateLimiter()
 
         # 向量/嵌入（复用 ai_config 构建 embedding；无可用 embedding → 向量侧退化）
         ai_config = self.ai_config if self.ai_config is not None else _load_ai_config()
-        embedding = self._build_embedding_service(ai_config) if ai_config is not None else None
+        embedding = self._get_shared_embedding()  # 跨域共享（knowledge/ingestion 同一实例）
         resolver = VectorTargetResolver(ai_config)
         chunk_embedding = ChunkEmbeddingService(embedding) if embedding is not None else None
-        vector_store = InMemoryVectorStore(embedding_service=embedding) if embedding is not None else None
-        vector_admin = InMemoryVectorStoreAdmin()
+        vector_store = self._get_shared_vector_store()  # 跨域共享（流水线写入可被检索读到）
+        vector_admin = self._get_shared_vector_admin()
 
-        # 扇出：向量 + 关系库 chunk（N0 RelationalChunkSink 并入；无向量后端仅关系库）
+        # 扇出：向量 + 关系库 chunk（N0 RelationalChunkSink 并入；无向量后端仅关系库）。
+        # 向量库须经 VectorStoreSink 桥接（裸 store 无 replace_document 契约）
         sinks = []
         if vector_store is not None:
-            sinks.append(vector_store)
+            sinks.append(VectorStoreSink(vector_store))
         sinks.append(RelationalChunkSink(self.db))
         chunk_index_writer = ChunkIndexWriter(sinks)
 
@@ -663,6 +1003,8 @@ class AppContainer:
         doc_dao = KnowledgeDocumentDao(self.db)
         chunk_dao = KnowledgeChunkDao(self.db)
         chunk_log_dao = KnowledgeDocumentChunkLogDao(self.db)
+        schedule_dao = KnowledgeDocumentScheduleDao(self.db)
+        schedule_exec_dao = KnowledgeDocumentScheduleExecDao(self.db)
 
         # 服务：dispatcher 的 start_chunk 事务体经延迟闭包引用 document_service（循环依赖：dispatcher ↔ doc_service）
         document_service = None  # 先占位，闭包在 dispatch 时已绑定
@@ -685,6 +1027,13 @@ class AppContainer:
             vector_target_resolver=resolver,
             vector_store=vector_store,
         )
+        # N4 调度域：登记服务 + 行锁 + 状态回写 + 状态机助手 + 刷新处理器 + 调度任务
+        self.knowledge_schedule_service = KnowledgeDocumentScheduleService(
+            schedule_dao, schedule_exec_dao, min_interval_seconds=60,
+        )
+        lock_manager = ScheduleLockManager(schedule_dao, lock_seconds=900)
+        status_helper = DocumentStatusHelper(self.db, doc_dao)
+        state_manager = ScheduleStateManager(schedule_dao, schedule_exec_dao)
         self.knowledge_document_service = KnowledgeDocumentService(
             kb_dao=kb_dao, doc_dao=doc_dao, chunk_log_dao=chunk_log_dao,
             parser_registry=parser_registry, codec=codec,
@@ -694,14 +1043,91 @@ class AppContainer:
             limiter=limiter,
             chunk_dao=chunk_dao, chunk_service=self.knowledge_chunk_service,
             vector_store=vector_store,
-            schedule_service=None,  # N4 接入
-            pipeline_service=None,  # N5 接入
+            schedule_service=self.knowledge_schedule_service,  # N4：delete/update 调度行清理
+            pipeline_service=getattr(self, "ingestion_pipeline_service", None),  # N5 接入：PIPELINE 模式校验 + pipelineName 回填
         )
         document_service = self.knowledge_document_service
+        refresh_processor = ScheduleRefreshProcessor(
+            schedule_dao=schedule_dao, exec_dao=schedule_exec_dao,
+            doc_dao=doc_dao, kb_dao=kb_dao,
+            document_service=document_service, file_storage=file_storage,
+            fetcher=fetcher, lock_manager=lock_manager,
+            state_manager=state_manager, status_helper=status_helper,
+        )
+        self.knowledge_schedule_job = KnowledgeDocumentScheduleJob(
+            schedule_dao=schedule_dao, lock_manager=lock_manager,
+            refresh_processor=refresh_processor, status_helper=status_helper,
+            scan_delay_ms=10000, batch_size=20, running_timeout_minutes=30,
+        )
         self.ingestion_spec_schema_provider = schema_provider
 
+    def _wire_ingestion_services(self) -> None:
+        """组装 P5 N5 摄取流水线域（plan 7.2：dao×4 → engine(7 节点) → pipeline/task 服务）
+
+        意图树管理（N5 5.5 IntentTreeService）复用 M5 既有 IntentTreeAdminService
+        （rag/service/intent_tree_admin_service.py，M5 5.4 已覆盖 CRUD + 缓存清理），不重复装配。
+
+        引擎节点条件装配：无可用 LLM → 跳过 enhancer/enricher；无可用 embedding → 跳过
+        chunker/indexer（流水线引用即报「未找到节点类型」，干净失败而非 AttributeError）。
+        """
+        from ingestion.dao.pipeline import IngestionPipelineDao
+        from ingestion.dao.pipeline_node import IngestionPipelineNodeDao
+        from ingestion.dao.task import IngestionTaskDao
+        from ingestion.dao.task_node import IngestionTaskNodeDao
+        from ingestion.engine.engine import IngestionEngine
+        from ingestion.node.chunker_node import ChunkerNode
+        from ingestion.node.enhancer_node import EnhancerNode
+        from ingestion.node.enricher_node import EnricherNode
+        from ingestion.node.fetcher_node import FetcherNode
+        from ingestion.node.indexer_node import IndexerNode
+        from ingestion.node.parser_node import ParserNode
+        from ingestion.service.pipeline import IngestionPipelineService
+        from ingestion.service.task import IngestionTaskService
+        from ingestion.strategy.fetcher.feishu_fetcher import FeishuFetcher
+        from ingestion.strategy.fetcher.http_url_fetcher import HttpUrlFetcher
+        from ingestion.util.http_client_helper import HttpClientHelper
+        from rag.ingestion.parser.markdown_parser import MarkdownDocumentParser
+        from rag.ingestion.parser.registry import ParserRegistry
+        from rag.ingestion.parser.text_parser import TextDocumentParser
+        from rag.ingestion.kernel import ChunkEmbeddingService
+        from rag.ingestion.splitter.base import ChunkingService
+
+        # dao ×4（pipeline/node/task/task_node）
+        pipeline_dao = IngestionPipelineDao(self.db)
+        pipeline_node_dao = IngestionPipelineNodeDao(self.db)
+        task_dao = IngestionTaskDao(self.db)
+        task_node_dao = IngestionTaskNodeDao(self.db)
+
+        # engine：7 节点条件装配（LLM / embedding 缺失时跳过对应节点）
+        ai_config = self.ai_config if self.ai_config is not None else _load_ai_config()
+        embedding = self._get_shared_embedding()  # 跨域共享（knowledge/ingestion 同一实例）
+        llm = self._get_shared_llm()  # 跨域共享（chat 引擎同一 LLM 路由，熔断状态同源）
+
+        parser_registry = ParserRegistry([TextDocumentParser(), MarkdownDocumentParser()])
+        chunk_embedding = ChunkEmbeddingService(embedding) if embedding is not None else None
+        vector_store = self._get_shared_vector_store()  # 跨域共享（写入可被 knowledge 检索读到）
+        vector_admin = self._get_shared_vector_admin()
+
+        http = HttpClientHelper()
+        fetchers = [HttpUrlFetcher(http), FeishuFetcher(http)]
+        nodes = [FetcherNode(fetchers), ParserNode(parser_registry)]
+        if chunk_embedding is not None:
+            nodes.append(ChunkerNode(ChunkingService(), chunk_embedding))
+        if llm is not None:
+            nodes.append(EnhancerNode(llm))
+            nodes.append(EnricherNode(llm))
+        if vector_store is not None:
+            nodes.append(IndexerNode(vector_store, vector_admin))
+        engine = IngestionEngine(nodes)
+
+        # 服务：task 依赖 pipeline_service（get_definition）
+        self.ingestion_pipeline_service = IngestionPipelineService(pipeline_dao, pipeline_node_dao)
+        self.ingestion_task_service = IngestionTaskService(
+            engine, self.ingestion_pipeline_service, task_dao, task_node_dao
+        )
+
     def close(self) -> None:
-        """释放容器持有的资源（lifespan 退出时调用）"""
+        """释放容器持有的同步资源（测试 / 非 async 场景直接调用）"""
         for obj in self._owned:
             closer = getattr(obj, "close", None)
             if callable(closer):
@@ -709,3 +1135,18 @@ class AppContainer:
                     closer()
                 except Exception:  # noqa: BLE001 释放失败不阻断关闭
                     logger.warning("装配对象释放失败: %s", obj, exc_info=True)
+
+    async def aclose(self) -> None:
+        """释放容器持有的全部资源（lifespan 退出调用）：同步 _owned + redis 连接池优雅断开
+
+        P6 3.1：redis.asyncio 客户端须经 aclose() 异步断开（redis-py>=5 `close()` 已废弃为协程），
+        无 redis 注入时与 close() 等价；释放失败不阻断关闭。
+        """
+        self.close()
+        if self.redis is not None:
+            acloser = getattr(self.redis, "aclose", None)
+            if callable(acloser):
+                try:
+                    await acloser()
+                except Exception:  # noqa: BLE001 释放失败不阻断关闭
+                    logger.warning("redis 连接池关闭失败", exc_info=True)

@@ -57,9 +57,13 @@ class KnowledgeChunkDao:
 
     def update_by_id(self, chunk_id: str, updates: Dict) -> bool:
         """按主键更新（物理更新）；返回是否命中行"""
+        payload = dict(updates)
+        # N-C1（对齐 Java MetaObjectHandler.updateFill 对 updateTime 的自动填充）：update 一律盖
+        # update_time，缺省兜底——R-A 保证 find_edited_doc_ids 的「update_time > create_time」判定生效。
+        payload.setdefault("update_time", now_iso())
         count = self._db.update_rows(
             KNOWLEDGE_CHUNK_TABLE,
-            updates,
+            payload,
             where=[Condition.eq("id", chunk_id)],
         )
         return count > 0

@@ -189,6 +189,12 @@ class KnowledgeDocumentService:
             return
         await self._run_chunk_task(doc)
 
+    async def chunk_document(self, doc: Dict) -> None:
+        """按给定文档行执行分块（对齐 Java chunkDocument：不重查，供调度刷新传入已更新元数据的运行时行）"""
+        if doc is None:
+            return
+        await self._run_chunk_task(doc)
+
     async def _run_chunk_task(self, doc: Dict) -> None:
         doc_id = doc["id"]
         mode = ProcessMode.normalize(doc.get("process_mode"))
@@ -205,7 +211,7 @@ class KnowledgeDocumentService:
             if mode == ProcessMode.PIPELINE:
                 # 管道模式重构中：显式失败，不静默改用默认分块（对齐 Java R5）
                 raise ClientException(f"管道模式重构中，暂不可用，请改用直接分块：docId={doc_id}")
-            outcome = self._kernel.run(doc, self._read_file_bytes(doc), spec, target)
+            outcome = await self._kernel.run(_doc_ref(doc), self._read_file_bytes(doc), spec, target)
             self._mark_chunk_success(doc_id, _chunk_count(outcome))
             total = int((time.monotonic() - start) * 1000)
             t = _timings(outcome)
@@ -346,11 +352,16 @@ class KnowledgeDocumentService:
         size_val = 10 if size is None else max(0, size)
         offset = (current - 1) * size_val if size_val > 0 else 0
         rows, total = self._chunk_log_dao.page_by_doc(doc_id, limit=size_val, offset=offset)
+        # 批取该页涉及的流水线名回填 pipelineName（对齐 Java selectByIds；缺失跳过）
+        name_map = {}
+        pipeline_ids = [r.get("pipeline_id") for r in rows if r.get("pipeline_id")]
+        if pipeline_ids and self._pipeline_service is not None:
+            name_map = self._pipeline_service.get_names(pipeline_ids)
         records = []
         for row in rows:
             vo = dict(row)
             vo["other_duration"] = _other_duration(row, row.get("total_duration"))
-            vo["pipeline_name"] = None  # N5 pipeline_service 接通后回填
+            vo["pipeline_name"] = name_map.get(str(row.get("pipeline_id"))) if row.get("pipeline_id") else None
             records.append(vo)
         return {"records": records, "total": total, "current": current, "size": size_val}
 
@@ -471,20 +482,32 @@ def _vo(row: Dict, kb_name: Optional[str] = None) -> Dict:
 
 
 def _chunk_count(outcome) -> int:
-    """分块数：outcome 支持 dict 或对象（.chunk_count）；缺失回落 0"""
+    """分块数：outcome 支持 dict（chunk_count 键）或 IngestionOutcome（chunk_count() 方法 / chunks 长度）"""
     if isinstance(outcome, dict):
         return int(outcome.get("chunk_count") or 0)
-    return int(getattr(outcome, "chunk_count", 0) or 0)
+    value = getattr(outcome, "chunk_count", None)
+    if callable(value):
+        return int(value() or 0)
+    if getattr(outcome, "chunks", None) is not None:
+        return len(outcome.chunks or [])
+    return int(value or 0)
 
 
 def _timings(outcome) -> Tuple[int, int, int, int]:
     """outcome 分阶段耗时 → (parse_ms, chunk_ms, embed_ms, index_ms)；缺失回落 0（对齐 Java outcome.timings）"""
+
     def get(d, *keys):
         for k in keys:
             v = d.get(k) if isinstance(d, dict) else getattr(d, k, None)
             if v is not None:
                 return int(v)
         return 0
+
+    # IngestionOutcome：耗时嵌套在 .timings（parse_millis/..._millis）
+    timings = getattr(outcome, "timings", None)
+    if timings is not None and not isinstance(timings, dict) and not callable(timings):
+        return (int(timings.parse_millis), int(timings.chunk_millis),
+                int(timings.embed_millis), int(timings.index_millis))
     return (get(outcome, "parse_ms", "parseMillis"), get(outcome, "chunk_ms", "chunkMillis"),
             get(outcome, "embed_ms", "embedMillis"), get(outcome, "index_ms", "indexMillis"))
 

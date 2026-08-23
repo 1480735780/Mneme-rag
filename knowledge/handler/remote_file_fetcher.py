@@ -20,6 +20,7 @@ knowledge.handler.remote_file_fetcher - 远程文件拉取（对应 Java RemoteF
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
@@ -185,6 +186,109 @@ class RemoteFileFetcher:
             content_type=_sanitize_content_type(result.content_type),
             size=len(result.data),
         )
+
+    async def fetch_if_changed(
+        self,
+        url: str,
+        last_etag: Optional[str],
+        last_modified: Optional[str],
+        last_content_hash: Optional[str],
+        fallback_file_name: Optional[str],
+    ) -> "RemoteFetchResult":
+        """定时刷新：拉取远程并检测变更（对齐 Java fetchIfChanged；返回 RemoteFetchResult）
+
+        变更判定顺序（对齐 Java）：
+            1. etag 可比（双方非空）且相等 → skipped「远程文件未变化」；
+            2. 否则 lastModified 相等 → skipped；
+            3. 否则 sha256 与 last_content_hash 相等 → skipped「内容哈希未变化」；
+            4. 否则 → changed（含字节/大小/contentType/fileName/哈希/etag/lastModified）。
+
+        偏离说明（与 Java 差异）：Java 先用 HEAD 预检 etag 决定**是否下载**；Python 复用现有
+        downloader（一次 GET 拿字节 + 响应头），下载后再判定。结果语义一致，仅多一次网络传输，
+        已登记。
+
+        Args:
+            url:                远端 URL
+            last_etag:          上次 etag（未记录传 None）
+            last_modified:      上次 Last-Modified
+            last_content_hash:  上次内容 sha256
+            fallback_file_name: 响应无文件名时的兜底名（通常取文档名）
+
+        Returns:
+            RemoteFetchResult：changed/skipped 两态；skipped 带 message
+        """
+        safe_url = _check_url(url)
+        result = await self._downloader(safe_url, self._max_file_bytes, self._total_seconds)
+        if not result.data:
+            raise ClientException("远程文件内容为空")  # 对齐 Java fetchIfChanged 空内容守卫
+        content_hash = hashlib.sha256(result.data).hexdigest()
+        etag = _trim_or_null(result.etag)
+        fetched_modified = _trim_or_null(result.last_modified)
+        previous_etag = _trim_or_null(last_etag)
+
+        etag_comparable = bool(etag) and bool(previous_etag)
+        if etag_comparable and etag == previous_etag:
+            return RemoteFetchResult.skipped("远程文件未变化", etag, fetched_modified, last_content_hash)
+        if not etag_comparable and fetched_modified and fetched_modified == _trim_or_null(last_modified):
+            return RemoteFetchResult.skipped("远程文件未变化", etag, fetched_modified, last_content_hash)
+        if content_hash and content_hash == _trim_or_null(last_content_hash):
+            return RemoteFetchResult.skipped("内容哈希未变化", etag, fetched_modified, content_hash)
+
+        file_name = _sanitize_file_name(result.file_name) or fallback_file_name or _fallback_name(url) or "remote-file"
+        return RemoteFetchResult.changed(
+            result.data,
+            len(result.data),
+            _sanitize_content_type(result.content_type),
+            file_name,
+            content_hash,
+            etag,
+            fetched_modified,
+        )
+
+
+@dataclass
+class RemoteFetchResult:
+    """fetch_if_changed 结果（对应 Java RemoteFetchResult；Python 以 bytes 替代临时文件）"""
+
+    changed: bool
+    data: Optional[bytes] = None
+    size: int = 0
+    content_type: Optional[str] = None
+    file_name: Optional[str] = None
+    content_hash: Optional[str] = None
+    etag: Optional[str] = None
+    last_modified: Optional[str] = None
+    message: Optional[str] = None
+
+    @classmethod
+    def skipped(cls, message: str, etag, last_modified, content_hash) -> "RemoteFetchResult":
+        """未变更态（对齐 Java RemoteFetchResult.skipped）"""
+        return cls(changed=False, content_hash=content_hash, etag=etag,
+                   last_modified=last_modified, message=message)
+
+    @classmethod
+    def changed(cls, data: bytes, size: int, content_type, file_name, content_hash, etag, last_modified) -> "RemoteFetchResult":
+        """已变更态（对齐 Java RemoteFetchResult.changed）"""
+        return cls(changed=True, data=data, size=size, content_type=content_type, file_name=file_name,
+                   content_hash=content_hash, etag=etag, last_modified=last_modified)
+
+    @property
+    def fetch_snapshot(self) -> dict:
+        """供 state_manager 回写的快照（content_hash/etag/last_modified/message）"""
+        return {
+            "content_hash": self.content_hash,
+            "etag": self.etag,
+            "last_modified": self.last_modified,
+            "message": self.message,
+        }
+
+
+def _trim_or_null(value: Optional[str]) -> Optional[str]:
+    """对齐 Java trimOrNull"""
+    if not value:
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 def _fallback_name(url: str) -> Optional[str]:

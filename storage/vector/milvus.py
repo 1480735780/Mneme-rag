@@ -368,3 +368,134 @@ class MilvusVectorStoreAdmin(VectorStoreAdmin):
                 "index_name": "collection_name",
             },
         ]
+
+
+# ── pymilvus 真实客户端适配层（P6 1.1，装配步补） ──────────────────────────
+
+
+def _milvus_field_schema(field: dict):
+    """driver 无关 dict 字段规格 → pymilvus FieldSchema（VarChar / JSON / FloatVector）"""
+    from pymilvus import DataType, FieldSchema
+
+    dtype = field["data_type"]
+    if dtype == "VarChar":
+        return FieldSchema(
+            name=field["name"],
+            dtype=DataType.VARCHAR,
+            max_length=field.get("max_length", 64),
+            is_primary=bool(field.get("is_primary_key")),
+            auto_id=bool(field.get("auto_id", False)),
+        )
+    if dtype == "JSON":
+        return FieldSchema(name=field["name"], dtype=DataType.JSON)
+    if dtype == "FloatVector":
+        return FieldSchema(
+            name=field["name"],
+            dtype=DataType.FLOAT_VECTOR,
+            dim=field.get("dimension", 1024),
+        )
+    raise ValueError(f"不支持的 Milvus 字段类型：{dtype}")
+
+
+def _milvus_index_param(idx: dict):
+    """driver 无关 dict 索引规格 → pymilvus IndexParam（metric_type 并入 params）"""
+    from pymilvus.milvus_client.index import IndexParam
+
+    params = dict(idx.get("extra_params") or {})
+    metric = idx.get("metric_type")
+    if metric:
+        params["metric_type"] = metric
+    return IndexParam(
+        field_name=idx["field_name"],
+        index_type=idx.get("index_type"),
+        index_name=idx.get("index_name") or idx["field_name"],
+        params=params,
+    )
+
+
+class PymilvusClientAdapter:
+    """
+    pymilvus 真实客户端适配层（对应 milvus.py 顶部注释「适配在装配步补」）
+
+    各 Milvus 服务类以 driver 无关契约调用客户端：
+        - create_collection(fields=[dict], index_params=[dict], ...) → 适配为 pymilvus
+          CollectionSchema / IndexParam（VarChar→VARCHAR、JSON→JSON、FloatVector→FLOAT_VECTOR）；
+        - search(...) 返回 List[List[Hit]] → 转为 List[List[dict]] 扁平行（含 score，供 _search_shared）；
+        - insert / upsert / delete / has_collection / list_collections 透传（pymilvus 签名兼容）。
+
+    仅经 wiring 装配真实 Milvus 时使用；桩测试仍直接注入 dict 契约客户端，不经本适配层。
+    """
+
+    def __init__(self, milvus_client):
+        self._client = milvus_client
+
+    # ── 透传（pymilvus MilvusClient 签名兼容） ──
+
+    def has_collection(self, collection_name=None, **kwargs):
+        return self._client.has_collection(collection_name=collection_name)
+
+    def insert(self, collection_name=None, data=None, **kwargs):
+        return self._client.insert(collection_name=collection_name, data=data)
+
+    def upsert(self, collection_name=None, data=None, **kwargs):
+        return self._client.upsert(collection_name=collection_name, data=data)
+
+    def delete(self, collection_name=None, filter=None, **kwargs):
+        return self._client.delete(collection_name=collection_name, filter=filter)
+
+    def list_collections(self, **kwargs):
+        return self._client.list_collections()
+
+    # ── create_collection：dict 规格 → pymilvus CollectionSchema / IndexParam ──
+
+    def create_collection(
+        self,
+        collection_name=None,
+        fields=None,
+        index_params=None,
+        primary_field_name=None,
+        vector_field_name=None,
+        metric_type=None,
+        consistency_level=None,
+        description=None,
+        **kwargs,
+    ):
+        from pymilvus import CollectionSchema
+
+        schema = CollectionSchema(
+            fields=[_milvus_field_schema(f) for f in fields or []],
+            description=description,
+            primary_field=primary_field_name,
+        )
+        indexes = [_milvus_index_param(i) for i in index_params or []]
+        self._client.create_collection(
+            collection_name=collection_name,
+            schema=schema,
+            index_params=indexes,
+            consistency_level=consistency_level,
+        )
+
+    # ── search：pymilvus Hit → 纯 dict 扁平行（含 score） ──
+
+    def search(
+        self,
+        collection_name=None,
+        data=None,
+        limit=None,
+        filter=None,
+        output_fields=None,
+        anns_field=None,
+        search_params=None,
+        **kwargs,
+    ):
+        results = self._client.search(
+            collection_name=collection_name,
+            data=data,
+            limit=limit,
+            filter=filter,
+            output_fields=output_fields,
+            anns_field=anns_field,
+            search_params=search_params,
+        )
+        return [[dict(hit) for hit in group] for group in results]
+

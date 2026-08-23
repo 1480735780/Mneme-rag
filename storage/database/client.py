@@ -50,6 +50,8 @@ class Condition:
     当前支持操作符：eq（等值）、ne（不等）、in（属于集合）、gt / lt / le（比较）。
     单行判定规则：行中缺该列按「不匹配」处理；in 空集合恒不匹配（对齐 SQL `IN ()`）；
     比较类操作符两侧能数值化时按数值比较（对齐数字串主键的 SQL 语义），否则按原生序。
+    列值自身为 `None`（SQL NULL）时不参与比较——`ne` 显式返回不匹配（对齐 SQL 三值逻辑
+    `NULL <> x` 结果未知 → 行排除），InMemory 与 SQL 后端一致排除 NULL 行。
     """
 
     field: str
@@ -88,6 +90,10 @@ class Condition:
         if self.op == "eq":
             return actual == self.value
         if self.op == "ne":
+            # N-C3（R-C）：SQL 三值逻辑下 NULL <> x 结果为未知 → 行被排除。
+            # 此处显式避让 NULL，使 InMemory 与 SQL(SQLite/PG) 后端在 NULL 列上一并排除、行为一致。
+            if actual is None:
+                return False
             return actual != self.value
         if self.op == "in":
             return actual in self.value
