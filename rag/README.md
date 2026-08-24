@@ -28,6 +28,8 @@ rag/
 │   │   ├── base.py                    #     DocumentParser 抽象接口
 │   │   ├── markdown_parser.py         #     Markdown 解析
 │   │   ├── text_parser.py             #     纯文本解析
+│   │   ├── mineru/                    #     MinerU 外接解析（可选，需 RAGENT_MINERU_API_KEY）
+│   │   │   └── __init__.py            #       懒加载导出 MinerUDocumentParser
 │   │   └── pdf_parser.py              #     PDF 解析
 │   ├── splitter/                      #   文本切分（← core/chunk/）
 │   │   ├── __init__.py
@@ -114,7 +116,7 @@ engine.py   ──► retrieval/ + prompt/ + source/ + core/llm（对话）─�
 ```
 
 - **依赖**：`core/llm`（Embedding / 对话 / Rerank）、`storage/`（向量与业务数据持久化）、`common/`（异常）；
-- **被依赖**：`agent/`（检索工具）、`mcp/server/tools/search.py`（检索工具）、`scripts/ingest.py`（入库入口）。
+- **被依赖**：`agent/`（检索工具）、`ragent_mcp/server/tools/search.py`（检索工具）、`scripts/ingest.py`（入库入口）。
 
 ## 分阶段实施
 
@@ -132,4 +134,16 @@ engine.py   ──► retrieval/ + prompt/ + source/ + core/llm（对话）─�
 1. **入库链路**：loader → parser → splitter → embedding → `storage/vector` 写入，可先实现 `scripts/ingest.py` 驱动端到端；
 2. **来源追踪**：检索结果需保留文档级来源（`schema.SourceRef`）与片段级证据（`schema.GroundingChunk`），供答案溯源与推荐追问使用；
 3. **切分参数**：chunk 大小/重叠需与 Embedding 模型的上下文窗口（见 `config/ai.yaml` 中 `dimension` 与模型能力）匹配；
-4. 混合检索的权重融合策略建议做成可配置项，便于评估调优（与 `evaluation/` 联动）。
+4. 混合检索的权重融合策略建议做成可配置项，便于评估调优（可经 `rag/eval` 检索评测端点验证，见 `docs/rag/eval-guide.md`）；
+5. **Agent 闭环（P1 Agent MVP）**：`POST /agent/chat` 提供 plan-execute-observe-answer 最小闭环，
+   工具源 = MCP registry（weather/sales/ticket/search 等）+ 内置 `knowledge_search`；输出协议、终止语义与端点示例见
+   `docs/rag/agent-guide.md`。实现：[rag/service/agent_service.py](service/agent_service.py)（门面）+
+   [rag/controller/agent_controller.py](controller/agent_controller.py)（端点）；管线在
+   [core/pipeline/agent_pipeline.py](../core/pipeline/agent_pipeline.py)。
+6. **MinerU 外接解析（P1，可选）**：PDF/Word/PPT 复杂文档解析（FAST 档 `pdf` / `doc`,`docx` / `ppt`,`pptx`,`ppsx`；
+   FIDELITY 档 `xlsx`,`xls` 优先 MinerU、FAST 回落 openpyxl）。需 `RAGENT_MINERU_API_KEY`（无 key 不注册，
+   PDF 回落基础解析）；其余 `RAGENT_MINERU_API_URL` / `_POLL_INTERVAL_SECONDS` / `_TIMEOUT_SECONDS` /
+   `_MAX_WAIT_SECONDS` / `_CONCURRENCY_LIMIT` / `_ENABLE_TABLE` / `_ENABLE_FORMULA` / `_OCR` / `_LANGUAGE`
+   可选。环境变量清单、支持格式、VLM 降级与已知限制见 `docs/rag/mineru-guide.md`。
+   实现：[rag/ingestion/parser/mineru/](../rag/ingestion/parser/mineru/)（properties/model/client/polling/unpacker/parser）。
+   流程 requestUpload → uploadFile → 轮询 DONE → downloadZip → unpack（Markdown+图片→对象存储→Blocks）。

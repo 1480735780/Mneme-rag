@@ -46,6 +46,14 @@ ai:
         embedding: /v1/embeddings
         rerank: /v1/rerank
 
+    # AIHubMix（推理聚合网关，OpenAI 兼容）
+    aihubmix:
+      url: https://aihubmix.com
+      api_key: ${AIHUBMIX_API_KEY}
+      endpoints:
+        chat: /v1/chat/completions
+        embedding: /v1/embeddings
+
   # ==========================================================
   # 2. 聊天模型组配置（对应 ModelGroup，包含 candidates + tiers）
   # ==========================================================
@@ -106,6 +114,13 @@ ai:
         enabled: true
         supports_thinking: true
         priority: 10
+
+      - id: aihubmix-gpt-4o
+        provider: aihubmix
+        model: gpt-4o
+        enabled: true
+        supports_thinking: false
+        priority: 40
 
     # ---- 2.2 档位配置（对应 TierConfig） ----
     tiers:

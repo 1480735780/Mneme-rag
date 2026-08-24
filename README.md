@@ -31,7 +31,7 @@
 | 故障转移与熔断 | 候选逐个回退、失败阈值熔断、半开自动恢复 | ✅ 已实现 |
 | 流式首包探测 | `ProbeStreamBridge` 首包超时（TTFT）fallback | ✅ 已实现 |
 | 供应商客户端 | OpenAI 风格适配基类（openai/qwen）；ollama/siliconflow/aihubmix chat 按需补齐 | 🚧 部分待补 |
-| 工具/清理 | `LLMResponseCleaner` 输出清洗 + `LogSafe` 日志脱敏 | 🚧 延后至上线前 |
+| 工具/清理 | `LLMResponseCleaner` 输出清洗 + `LogSafe` 日志脱敏 | ✅ 已实现（P2） |
 | RAG 入库与检索 | 文档加载/解析/切分，向量/混合检索 | 🚧 占位待实现 |
 | Agent 能力 | 规划 / 执行 / 记忆 / 工具 | 🚧 占位待实现 |
 | MCP 工具层 | 服务端工具（检索/数据库）+ 客户端接入 | 🚧 占位待实现 |
@@ -54,12 +54,11 @@ mneme-rag/
 ├── core/             # AI 基础设施层
 │   ├── llm/          # 模型层：抽象接口、对话门面、配置、供应商、路由
 │   └── pipeline/     # 流水线：RAG 流水线 / Agent 流水线
-├── rag/              # RAG 核心：离线入库（ingestion）、在线检索（retrieval）、Prompt
-├── agent/            # Agent 能力：规划 / 执行 / 记忆 / 工具
-├── mcp/              # MCP 工具层：客户端 + 服务端
+├── rag/              # RAG 核心：离线入库（ingestion）、在线检索（retrieval）、Prompt、评测端点（/rag/eval）
+├── agent/            # Agent 能力骨架（⛔ P8 显式放弃：能力由 rag/mcp + rag/memory 承载）
+├── ragent_mcp/       # MCP 协议层：独立 mcp-server（四工具）+ 客户端（McpHttpClient）
 ├── storage/          # 数据存储抽象：向量库 / 关系库 / 缓存
-├── evaluation/       # AI 评估：指标 / 基准 / 数据集
-├── scripts/          # 运维脚本：入库、评估
+├── scripts/          # 运维脚本：入库
 ├── docker/           # 容器化与中间件编排
 ├── docs/             # 项目文档与架构资产
 └── requirements.txt  # 依赖清单

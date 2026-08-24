@@ -40,6 +40,7 @@ _EXTENSION_TO_MIME: Dict[str, str] = {
     "xml": "application/xml",
     "rtf": "application/rtf",
     "csv": "text/csv",
+    "pdf": "application/pdf",
     "xls": "application/vnd.ms-excel",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "png": "image/png",

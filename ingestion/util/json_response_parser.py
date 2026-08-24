@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
+from common.util.llm_response_cleaner import strip_markdown_code_fence
+
 
 def parse_string_list(raw: Optional[str]) -> List[str]:
     """解析为字符串列表：非数组/失败回退 []（对齐 Java parseStringList）"""
@@ -49,15 +51,8 @@ def _parse_json_element(raw: Optional[str]) -> Any:
 
 
 def _strip_markdown_code_fence(raw: str) -> str:
-    """剥离 markdown 代码围栏（```json ... ``` / ``` ... ```，对齐 Java stripMarkdownCodeFence）"""
-    text = raw.strip()
-    if text.startswith("```"):
-        first_newline = text.find("\n")
-        if first_newline > 0:
-            text = text[first_newline + 1:]
-        if text.endswith("```"):
-            text = text[:-3]
-    return text
+    """剥离 markdown 代码围栏（委托 common.util.llm_response_cleaner，对齐 Java stripMarkdownCodeFence）"""
+    return strip_markdown_code_fence(raw) or ""
 
 
 def _extract_json_body(raw: str) -> str:

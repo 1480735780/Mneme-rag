@@ -17,11 +17,53 @@ Postgres/MySQL 关系库实现（SqlDatabaseClient，对应 Java MyBatis-Plus Ba
 """
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from typing import Any, List, Optional, Sequence, Tuple
 
 from storage.database.client import Condition, DatabaseClient, Row
 from storage.database.executor import SqlExecutor
+from storage.database.meta import fill_insert_fields, fill_update_fields
 from storage.database.schema import TableSchema
+from common.util.snowflake import default_generator
+
+# 元数据自动填充的时间列（兜底；表 ensure_schema 后按 data_type 登记完整时间列集，见 _time_columns）
+_TIME_COLUMNS = ("create_time", "update_time")
+
+
+def _is_time_type(data_type: str) -> bool:
+    """SQL 类型是否时间类（timestamp/datetime）：PG 侧这些列需 datetime 对象绑定，字符串会类型不匹配"""
+    lowered = data_type.lower()
+    return "timestamp" in lowered or "datetime" in lowered
+
+
+def _coerce_time_value(value: Any) -> Any:
+    """把可解析的 ISO 时间字符串归一为 datetime（psycopg 正确绑定 timestamp 列）；其余原样返回"""
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _coerce_time_fields(row: dict, time_columns=_TIME_COLUMNS) -> None:
+    """原地转换时间列值（默认兜底自动填充两列；表已登记时间列集时传该集，覆盖 start_time/last_time 等）"""
+    for col in time_columns:
+        if col in row:
+            row[col] = _coerce_time_value(row[col])
+
+
+def _coerce_jsonb_fields(row: dict, jsonb_columns=()) -> None:
+    """jsonb 列绑定前归一：业务可能存了 JSON 字符串（psycopg3 对 str 不自动序列化 jsonb，
+    绑定会当 varchar 而类型不匹配）；可解析则回转为对象，交由 psycopg3 正确序列化"""
+    for col in jsonb_columns:
+        value = row.get(col)
+        if isinstance(value, str):
+            try:
+                row[col] = json.loads(value)
+            except (ValueError, TypeError):
+                pass
 
 
 class SqlDatabaseClient(DatabaseClient):
@@ -36,6 +78,15 @@ class SqlDatabaseClient(DatabaseClient):
     def __init__(self, executor: SqlExecutor, dialect: str = "postgresql"):
         self._executor = executor
         self._dialect = dialect
+        # 表列集合（ensure_schema 登记；供元数据自动填充列感知裁剪）
+        self._columns: dict = {}
+        # 表 → 时间列集合（ensure_schema 按 data_type 登记；绑定前字符串→datetime 归一，见 _coerce_time_fields）
+        self._time_columns: dict = {}
+        # 表 → jsonb 列集合（绑定前 JSON 字符串→对象归一，见 _coerce_jsonb_fields）
+        self._jsonb_columns: dict = {}
+        # 表 → 主键列（insert 缺主键时自动生成雪花 id，对齐 Java MyBatis-Plus ASSIGN_ID；
+        # 多个 dao insert 依赖此兜底——memory 栈无 NOT NULL 约束，PG id 列必填）
+        self._pk_columns: dict = {}
 
     @property
     def executor(self) -> SqlExecutor:
@@ -80,6 +131,14 @@ class SqlDatabaseClient(DatabaseClient):
     ) -> Any:
         if not table or not table.strip():
             raise ValueError("表名不能为空")
+        # 元数据自动填充（对齐 Java MyMetaObjectHandler insertFill；列感知裁剪，避免未知列报错）
+        fill_insert_fields(row, columns=self._columns.get(table))
+        _coerce_time_fields(row, self._time_columns.get(table, ()))  # PG timestamp 列绑定前归一为 datetime
+        _coerce_jsonb_fields(row, self._jsonb_columns.get(table, ()))  # jsonb 列 JSON 字符串→对象
+        # 主键缺失兜底：自动生成雪花 id（对齐 Java ASSIGN_ID；PG id 列 NOT NULL 必填）
+        for pk in self._pk_columns.get(table, ()):
+            if pk not in row:
+                row[pk] = str(default_generator.next_id())
         columns = list(row.keys())
         if not columns:
             raise ValueError("插入行不能为空")
@@ -96,6 +155,10 @@ class SqlDatabaseClient(DatabaseClient):
         values: Row,
         where: Sequence[Condition],
     ) -> int:
+        # 元数据自动填充（对齐 Java MyMetaObjectHandler updateFill：update_time 强制刷新）
+        fill_update_fields(values, columns=self._columns.get(table))
+        _coerce_time_fields(values, self._time_columns.get(table, ()))  # PG timestamp 列绑定前归一为 datetime
+        _coerce_jsonb_fields(values, self._jsonb_columns.get(table, ()))  # jsonb 列 JSON 字符串→对象
         conditions = list(where or [])
         if not conditions:
             raise ValueError("update_rows 至少需要一个条件")
@@ -122,6 +185,17 @@ class SqlDatabaseClient(DatabaseClient):
     def ensure_schema(self, tables: Sequence[TableSchema]) -> None:
         for table in tables:
             self._executor.execute(self._build_create_table(table))
+            # 登记列集合（元数据自动填充列感知裁剪）+ 时间列集（绑定前 datetime 归一）+ jsonb 列集
+            self._columns[table.name] = set(table.column_names())
+            self._time_columns[table.name] = {
+                c.name for c in table.columns if _is_time_type(c.data_type)
+            }
+            self._jsonb_columns[table.name] = {
+                c.name for c in table.columns if c.data_type.lower() == "jsonb"
+            }
+            self._pk_columns[table.name] = [
+                c.name for c in table.columns if c.primary_key
+            ]
 
     # ── SQL 构造 ─────────────────────────────────────────
 
@@ -177,6 +251,8 @@ class SqlDatabaseClient(DatabaseClient):
             return f"{field} < ?", [cond.value]
         if op == "le":
             return f"{field} <= ?", [cond.value]
+        if op == "gte":
+            return f"{field} >= ?", [cond.value]
         raise ValueError(f"不支持的查询操作符: {op}")
 
     def _build_create_table(self, table: TableSchema) -> str:

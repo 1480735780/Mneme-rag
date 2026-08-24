@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from functools import cmp_to_key
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from storage.database.meta import fill_insert_fields, fill_update_fields
 from storage.database.schema import TableSchema
 
 # 行：列名 → 值（等价 Java DO / Map）
@@ -82,6 +83,10 @@ class Condition:
     def le(cls, field: str, value: Any) -> "Condition":
         return cls(field=field, op="le", value=value)
 
+    @classmethod
+    def gte(cls, field: str, value: Any) -> "Condition":
+        return cls(field=field, op="gte", value=value)
+
     def matches(self, row: Row) -> bool:
         """单行是否满足本条件（缺列按不匹配处理）"""
         if self.field not in row:
@@ -97,13 +102,15 @@ class Condition:
             return actual != self.value
         if self.op == "in":
             return actual in self.value
-        if self.op in ("gt", "lt", "le"):
+        if self.op in ("gt", "lt", "le", "gte"):
             left, right = _comparable(actual, self.value)
             if self.op == "gt":
                 return left > right
             if self.op == "lt":
                 return left < right
-            return left <= right
+            if self.op == "le":
+                return left <= right
+            return left >= right
         raise ValueError(f"不支持的查询操作符: {self.op}")
 
 
@@ -235,6 +242,8 @@ class InMemoryDatabaseClient(DatabaseClient):
         # RLock 保护 _tables 的并发读写（后台压缩线程与前台 append/load 共享同一实例）
         self._lock = threading.RLock()
         self._tables: Dict[str, List[Row]] = {}
+        # 表列集合（ensure_schema 登记；供元数据自动填充列感知裁剪，register_table 不登记）
+        self._columns: Dict[str, set] = {}
         for name, rows in (tables or {}).items():
             self.register_table(name, rows)
 
@@ -249,11 +258,12 @@ class InMemoryDatabaseClient(DatabaseClient):
         """幂等：按表结构规格登记缺失的表（已存在的表不覆盖，保留既有数据）"""
         with self._lock:
             for table in tables:
-                if table.name in self._tables:
-                    continue
-                if not table.name or not table.name.strip():
-                    raise ValueError("表名不能为空")
-                self._tables[table.name] = []
+                if table.name not in self._tables:
+                    if not table.name or not table.name.strip():
+                        raise ValueError("表名不能为空")
+                    self._tables[table.name] = []
+                # 登记列集合（自动填充列感知；已登记表可重复调用覆盖为同值）
+                self._columns[table.name] = set(table.column_names())
 
     def select_rows(
         self,
@@ -303,6 +313,8 @@ class InMemoryDatabaseClient(DatabaseClient):
         if not table or not table.strip():
             raise ValueError("表名不能为空")
         with self._lock:
+            # 元数据自动填充（对齐 Java MyMetaObjectHandler insertFill；列感知裁剪）
+            fill_insert_fields(row, columns=self._columns.get(table))
             inserted = dict(row)
             self._tables.setdefault(table, []).append(inserted)
             return inserted.get(id_column)
@@ -314,6 +326,8 @@ class InMemoryDatabaseClient(DatabaseClient):
         where: Sequence[Condition],
     ) -> int:
         with self._lock:
+            # 元数据自动填充（对齐 Java MyMetaObjectHandler updateFill：update_time 强制刷新）
+            fill_update_fields(values, columns=self._columns.get(table))
             conditions = list(where or [])
             updated = 0
             for row in self._tables.get(table, []):

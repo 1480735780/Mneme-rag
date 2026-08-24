@@ -1,0 +1,21 @@
+# docker/mcp-server.compose.yml —— 独立 MCP Server 编排（轻量，不随主栈必启）
+# 用法：docker compose -f docker/mcp-server.compose.yml up -d --build
+# 主应用连接：RAGENT_MCP_SERVERS_JSON='{"servers":[{"name":"ragent-mcp","url":"http://<HOST>:9099/mcp"}]}'
+services:
+  mcp-server:
+    build:
+      context: ..
+      dockerfile: docker/mcp.Dockerfile
+    image: ragent-mcp:latest
+    container_name: ragent-mcp
+    ports:
+      - "9099:9099"
+    environment:
+      YDC_API_KEY: "${YDC_API_KEY:-}"   # 可选：youcom_search 工具随 key 存在而注册
+    # 第一版无独立 /health 端点 → TCP 探测（后续可在 main.py 补独立 health 端点）
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; sys.exit(0 if socket.create_connection(('127.0.0.1',9099),2) else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped

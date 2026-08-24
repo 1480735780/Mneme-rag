@@ -23,10 +23,19 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from common.context.user_context import UserContext
 from common.exception.business import ClientException, ServiceException
+from common.idempotent.submit import idempotent_submit
+from audit.support.context import BizChangeLogContext
+from audit.support.decorator import record_biz_change
 from rag.dao.support import DELETED, now_iso
 from storage.vector.schema import VectorSpaceId, VectorSpaceSpec
 
 logger = logging.getLogger(__name__)
+
+
+def _kb_create_submit_key(args: tuple, kwargs: dict) -> str:
+    """知识库创建幂等键：以 name 为稳定键（同名称并发双击互斥，F2 接线）"""
+    name = args[1] if len(args) > 1 else kwargs.get("name")
+    return f"kb:create:{_normalize_name(name or '')}"
 
 
 def _normalize_name(name: str) -> str:
@@ -54,6 +63,7 @@ class KnowledgeBaseService:
 
     # ===================== create =====================
 
+    @idempotent_submit(key_fn=_kb_create_submit_key)  # F2：防并发双击建库（同名称互斥）
     def create(self, name: str, embedding_model: str, collection_name: str) -> str:
         """创建知识库（名称去空白重名校验 → collection 重名校验 → insert → 建目录幂等 → 建向量空间）"""
         # embedding_model 必填护栏：Java 靠 DB NOT NULL 当场失败；Python mock schema 无该约束，
@@ -103,6 +113,7 @@ class KnowledgeBaseService:
 
     # ===================== delete =====================
 
+    @record_biz_change("KNOWLEDGE_BASE", "DELETE", "删除知识库")
     def delete(self, kb_id: str) -> None:
         """删除（存在校验 → 有未删文档拒绝 → 软删 → best-effort 物理清理，对齐 R6）"""
         kb = self._require(kb_id)
@@ -112,6 +123,8 @@ class KnowledgeBaseService:
             kb_id,
             {"deleted": DELETED, "updated_by": UserContext.get_username(), "update_time": now_iso()},
         )
+        # 审计快照：before 为删除前行，after 为空（对齐 Java put(kbId, before, null)）
+        BizChangeLogContext().put(kb_id, kb, None)
         # R6：软删成功后异步清理物理资源；best-effort，失败仅记 warn 不阻断
         try:
             self._cleanup(kb["collection_name"])

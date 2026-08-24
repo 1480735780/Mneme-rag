@@ -287,7 +287,10 @@ class DefaultIngestionKernel(IngestionKernel):
         # ② parse：(MIME × 档位) → 解析器
         parse_start = time.time()
         parser: DocumentParser = self._parser_registry.require(mime_type, effective_spec.parse_profile)
-        parsed: ParsedDocument = parser.parse_structured(content, mime_type, self._parser_options(doc))
+        if hasattr(parser, "async_parse_structured"):
+            parsed: ParsedDocument = await parser.async_parse_structured(content, mime_type, self._parser_options(doc))
+        else:
+            parsed: ParsedDocument = parser.parse_structured(content, mime_type, self._parser_options(doc))
         blocks: List[Block] = parsed.blocks if parsed.blocks is not None else []
         parse_millis = _elapsed(parse_start)
 

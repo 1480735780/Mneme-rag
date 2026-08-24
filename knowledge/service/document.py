@@ -27,6 +27,8 @@ from typing import Dict, List, Optional, Tuple
 
 from common.context.user_context import UserContext
 from common.exception.business import ClientException
+from audit.support.context import BizChangeLogContext
+from audit.support.decorator import record_biz_change
 from knowledge.dao.chunk_log import KnowledgeDocumentChunkLogDao
 from knowledge.dao.document import KnowledgeDocumentDao
 from knowledge.enums import DocumentStatus, ProcessMode, SourceType
@@ -134,7 +136,9 @@ class KnowledgeDocumentService:
                 "kb_id": kb_id,
                 "doc_name": stored.original_filename,
                 "source_type": st.value,
-                "source_location": stored  # 占位防 lint，下述覆盖
+                # 占位（合法空串）拿主键，真实字段下述 update 覆盖；勿放 stored 对象——
+                # memory 栈可存任意对象，PG timestamp/varchar 列绑定 DTO 会类型错（real 栈缺陷）
+                "source_location": "",
             })
             # 真实字段组装
             self._doc_dao.update_by_id(doc_id, {})  # noop 占位避免未提交时误用
@@ -230,6 +234,7 @@ class KnowledgeDocumentService:
 
     # ===================== delete / update =====================
 
+    @record_biz_change("KNOWLEDGE_DOCUMENT", "DELETE", "删除文档")
     async def delete(self, doc_id: str) -> None:
         doc = self._require_doc(doc_id)
         if doc.get("status") == DocumentStatus.RUNNING.value:
@@ -243,6 +248,8 @@ class KnowledgeDocumentService:
         target = self._resolver.resolve(kb)
         await self._chunk_index_writer.delete_document(target, _doc_ref(doc))
         self._delete_stored_file_quietly(doc)
+        # 审计快照：before 为删除前行，after 为空（对齐 Java put(docId, before, null)）
+        BizChangeLogContext().put(doc_id, doc, None)
 
     def update(
         self,

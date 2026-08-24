@@ -208,24 +208,31 @@ class SqlAlchemySqlExecutor(SqlExecutor):
 
     @staticmethod
     def _text(sql: str, params: Optional[Sequence[Any]]):
-        """`?` 占位符 → SQLAlchemy 具名绑定（:pN）并内联参数"""
-        from sqlalchemy import text
+        """`?` 占位符 → SQLAlchemy 具名绑定（:pN）并内联参数；容器参数用 JSON 类型（jsonb 列）"""
+        from sqlalchemy import JSON, bindparam, text
 
         if not params:
             return text(sql)
-        compiled_sql, named = _bind_params(sql, params)
-        return text(compiled_sql).bindparams(**named)
+        compiled_sql, named, json_keys = _bind_params(sql, params)
+        binds = [
+            bindparam(k, value=v, type_=JSON if k in json_keys else None)
+            for k, v in named.items()
+        ]
+        return text(compiled_sql).bindparams(*binds)
 
 
-def _bind_params(sql: str, params: Sequence[Any]) -> Tuple[str, dict]:
+def _bind_params(sql: str, params: Sequence[Any]) -> Tuple[str, dict, set]:
     """
-    把 SQL 中的 `?` 按序替换为 :pN，返回 (编译后 SQL, {pN: value})
+    把 SQL 中的 `?` 按序替换为 :pN，返回 (编译后 SQL, {pN: value}, json_keys)
 
-    PostgreSQL cast 简写 `?::type`（如 `?::jsonb` / `?::vector`）翻译为语义等价的
-    `CAST(:pN AS type)`——SQLAlchemy text() 的绑定参数正则对紧跟 `:` 的名字不生效
-    （`:pN::type` 中的 `:pN` 不被识别），CAST 形式才能正确绑定。
+    - 容器值（dict/list/tuple）原样保留并记入 json_keys——JSONB 列需 SQLAlchemy JSON 类型绑定
+      （直接 json.dumps 成字符串会被当 varchar，jsonb 列类型不匹配，见 _text）；
+    - PostgreSQL cast 简写 `?::type`（如 `?::jsonb` / `?::vector`）翻译为语义等价的
+      `CAST(:pN AS type)`——SQLAlchemy text() 的绑定参数正则对紧跟 `:` 的名字不生效
+      （`:pN::type` 中的 `:pN` 不被识别），CAST 形式才能正确绑定。
     """
     named: dict = {}
+    json_keys: set = set()
     compiled: List[str] = []
     i = 0
     pos = 0
@@ -239,7 +246,10 @@ def _bind_params(sql: str, params: Sequence[Any]) -> Tuple[str, dict]:
         if i >= len(params):
             raise ValueError(f"占位符多于参数：SQL 含 {sql.count('?')} 个 ?，参数 {len(params)} 个")
         key = f"p{i}"
-        named[key] = _to_bindable(params[i])
+        value = params[i]
+        named[key] = value
+        if isinstance(value, (dict, list, tuple)):
+            json_keys.add(key)
         i += 1
         # 后续紧跟 `::type` → cast 简写，翻译为 CAST(:pN AS type) 并吞掉该段
         if sql.startswith("::", pos + 1):
@@ -255,14 +265,7 @@ def _bind_params(sql: str, params: Sequence[Any]) -> Tuple[str, dict]:
         pos += 1
     if i != len(params):
         raise ValueError(f"参数({len(params)})多于占位符({i})")
-    return "".join(compiled), named
-
-
-def _to_bindable(value: Any) -> Any:
-    """容器值 JSON 序列化（JSONB 列绑定用；向量以字符串字面量传入，不受影响）"""
-    if isinstance(value, (dict, list, tuple)):
-        return json.dumps(value)
-    return value
+    return "".join(compiled), named, json_keys
 
 
 def _copy_params(params: Optional[Sequence[Any]]) -> Optional[Sequence[Any]]:

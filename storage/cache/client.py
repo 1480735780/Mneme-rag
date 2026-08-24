@@ -137,9 +137,15 @@ class RedisCacheManager(CacheManager):
     Args:
         redis: redis.asyncio.Redis 客户端实例（必须注入，连接串等经配置/环境变量）
         codec: 序列化编解码器，默认 JSON
+        key_prefix: 物理 Redis 键前缀（经 RedisKeySerializer 统一加前缀，默认空 = 行为不变）
     """
 
-    def __init__(self, redis: Any = None, codec: Optional[CacheCodec] = None):
+    def __init__(
+        self,
+        redis: Any = None,
+        codec: Optional[CacheCodec] = None,
+        key_prefix: str = "",
+    ):
         if redis is None:
             raise ValueError("RedisCacheManager 需要注入 redis.asyncio.Redis 客户端")
         try:
@@ -155,9 +161,13 @@ class RedisCacheManager(CacheManager):
         self._redis_error = RedisError
         self._connection_error = RedisConnectionError
 
+        from storage.cache.key_serializer import RedisKeySerializer
+
+        self._key_serializer = RedisKeySerializer(key_prefix)
+
     async def get(self, key: str) -> Optional[Any]:
         try:
-            raw = await self._redis.get(key)
+            raw = await self._redis.get(self._real_key(key))
         except (self._redis_error, self._connection_error):
             return None
         if raw is None:
@@ -178,17 +188,21 @@ class RedisCacheManager(CacheManager):
             return False
         try:
             if ttl is None:
-                await self._redis.set(key, raw)
+                await self._redis.set(self._real_key(key), raw)
             else:
                 # EX 仅支持整秒；TTL 已在上面排除 <=0，int() 后仍 >0 才合法
-                await self._redis.set(key, raw, ex=int(ttl))
+                await self._redis.set(self._real_key(key), raw, ex=int(ttl))
         except (self._redis_error, self._connection_error, ValueError):
             return False
         return True
 
     async def delete(self, key: str) -> bool:
         try:
-            result = await self._redis.delete(key)
+            result = await self._redis.delete(self._real_key(key))
             return bool(result)
         except (self._redis_error, self._connection_error):
             return False
+
+    def _real_key(self, key: str) -> str:
+        """物理 Redis 键：经 RedisKeySerializer 加前缀（空前缀 = 原键，行为不变）"""
+        return self._key_serializer.serialize(key).decode("utf-8")

@@ -1,0 +1,6 @@
+# docker/requirements-mcp.txt —— MCP Server 独立最小依赖（不复制主应用 requirements，
+# 避免 Milvus/boto3/OSS/openpyxl 等大依赖撑大镜像）
+mcp>=2.0,<3.0
+uvicorn>=0.30
+httpx>=0.27
+pydantic>=2.8

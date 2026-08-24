@@ -87,12 +87,21 @@ def _build_chat_clients(config: Any) -> list:
     """按 config.providers 实例化 chat 客户端（仅支持已知 chat client 的 provider）。
 
     缺 API key 的 provider 跳过（客户端 requires_api_key 时调用会失败，不应进入候选）；
-    Ollama / SiliconFlow 暂无 chat 客户端实现 → 跳过（对应模型候选会因无客户端而在路由时 fail-over）。
+    Ollama 无需 API key（ai.yaml api_key 为空）→ 单独放行；其余 provider 未配 key 时跳过。
     """
+    from core.llm.providers.aihubmix import AIHubMixChatClient
+    from core.llm.providers.ollama import OllamaChatClient
     from core.llm.providers.openai import OpenAIChatClient
     from core.llm.providers.qwen import QwenChatClient
+    from core.llm.providers.siliconflow import SiliconFlowChatClient
 
-    factory = {"qwen": QwenChatClient, "openai": OpenAIChatClient}
+    factory = {
+        "qwen": QwenChatClient,
+        "openai": OpenAIChatClient,
+        "ollama": OllamaChatClient,
+        "siliconflow": SiliconFlowChatClient,
+        "aihubmix": AIHubMixChatClient,
+    }
     clients: list = []
     for name, provider in config.providers.items():
         client_cls = factory.get(name)
@@ -100,7 +109,7 @@ def _build_chat_clients(config: Any) -> list:
             logger.warning("provider %s 暂无 chat client 实现，跳过", name)
             continue
         api_key = str(getattr(provider, "api_key", "") or "").strip()
-        if not api_key or api_key.startswith("${"):
+        if name != "ollama" and (not api_key or api_key.startswith("${")):
             # 占位符未解析（如 ${QWEN_API_KEY} 未设环境变量）→ 视为无 key，不进入候选
             logger.info("provider %s 未配置有效 api_key（占位符未解析），跳过", name)
             continue
@@ -147,6 +156,31 @@ def _build_cache(settings: AppSettings):
 
     client = aioredis.from_url(url)
     return RedisCacheManager(client), client
+
+
+def build_parser_registry(file_storage, vlm_service=None):
+    """构造 ParserRegistry：MinerU 仅在配置了 RAGENT_MINERU_API_KEY 时条件注册。
+
+    对齐 youcom 工具条件注册先例：无 key 时 PDF/DOC/PPT 保持现状（上传前校验拒绝）。
+    """
+    from rag.ingestion.parser.image_parser import ImageParseProperties
+    from rag.ingestion.parser.markdown_parser import MarkdownDocumentParser
+    from rag.ingestion.parser.mineru.client import MinerUClient
+    from rag.ingestion.parser.mineru.parser import MinerUDocumentParser
+    from rag.ingestion.parser.mineru.polling import MinerUPollingExecutor
+    from rag.ingestion.parser.mineru.properties import MinerUProperties
+    from rag.ingestion.parser.mineru.unpacker import MinerUResultUnpacker
+    from rag.ingestion.parser.registry import ParserRegistry
+    from rag.ingestion.parser.text_parser import TextDocumentParser
+
+    parsers = [TextDocumentParser(), MarkdownDocumentParser()]
+    mineru_props = MinerUProperties.from_env()
+    if mineru_props.api_key:
+        client = MinerUClient(mineru_props)
+        polling = MinerUPollingExecutor(client, mineru_props)
+        unpacker = MinerUResultUnpacker(file_storage, vlm_service, ImageParseProperties())
+        parsers.append(MinerUDocumentParser(client, polling, unpacker, mineru_props))
+    return ParserRegistry(parsers)
 
 
 @dataclass
@@ -218,6 +252,21 @@ class AppContainer:
     # P5 N5 摄取流水线域：pipeline/task 服务（intent_tree 复用 M5 IntentTreeAdminService）
     ingestion_pipeline_service: Any = None
     ingestion_task_service: Any = None
+    # P7 认证域：用户 DAO + 会话管理 + 认证服务（AuthController 依赖）
+    user_dao: Any = None
+    session_manager: Any = None
+    auth_service: Any = None
+    user_service: Any = None
+    # P7 审计域：日志查询服务（BizChangeLogController 依赖）
+    change_log_query_service: Any = None
+    # P7 D 组大盘域：聚合服务（DashboardController 依赖）
+    dashboard_service: Any = None
+    # P8 E 组评测域：检索评测服务（EvalController 依赖；引擎就绪才装配，否则 None）
+    eval_service: Any = None
+    # P1 Agent MVP：Agent 门面 + MCP 注册表注入槽（AgentController 依赖；引擎就绪才装配，否则 None）
+    agent_service: Any = None
+    mcp_tool_registry: Any = None
+    _mcp_autoconfig: Any = None
     _owned: list = field(default_factory=list)
 
     # ==================== 双 profile 装配 ====================
@@ -240,6 +289,12 @@ class AppContainer:
         container._wire_ingestion_services()
         container._wire_knowledge_services()
         container._wire_chat_services()
+        container._wire_eval_services()
+        container._wire_agent_services()   # P1 Agent MVP：须在 _wire_chat_services 之后（engine 已装配）
+        container._wire_idempotent_framework()
+        container._wire_auth_services()
+        container._wire_audit_services()
+        container._wire_dashboard_services()
         return container
 
     @classmethod
@@ -260,6 +315,12 @@ class AppContainer:
         container._wire_ingestion_services()
         container._wire_knowledge_services()
         container._wire_chat_services()
+        container._wire_eval_services()
+        container._wire_agent_services()   # P1 Agent MVP：须在 _wire_chat_services 之后（engine 已装配）
+        container._wire_idempotent_framework()
+        container._wire_auth_services()
+        container._wire_audit_services()
+        container._wire_dashboard_services()
         return container
 
     # ==================== service 装配 ====================
@@ -335,6 +396,124 @@ class AppContainer:
         )
         # M5 5.7 图谱可视化（C12，委托既有 GraphQueryService）
         self.graph_service = GraphQueryService()
+
+    def _wire_auth_services(self) -> None:
+        """组装 P7 认证域：用户 DAO + 会话管理 + 认证服务（AuthController 依赖）
+
+        - 会话存储复用容器 cache（内存兜底 / Redis 一致，D1/D2 决策）
+        - user_dao 面向容器 db（t_user 已入 DEFAULT_TABLES）
+        """
+        from user.dao.user_dao import UserDao
+        from user.service.auth_service import AuthService
+        from user.service.session_manager import SessionManager
+        from user.service.user_service import UserService
+
+        self.user_dao = UserDao(self.db)
+        self.session_manager = SessionManager(cache=self.cache)
+        self.auth_service = AuthService(self.user_dao, self.session_manager)
+        self.user_service = UserService(self.user_dao)
+
+    def _wire_audit_services(self) -> None:
+        """组装 P7 审计域：日志查询服务 + 落库服务（BizChangeLogController / @record_biz_change 消费）"""
+        from audit.dao.change_log_dao import BizChangeLogDao
+        from audit.service.change_log_query_service import BizChangeLogQueryService
+        from audit.service.record_service import BizChangeLogRecordService
+        from audit.support.decorator import set_record_service
+
+        change_log_dao = BizChangeLogDao(self.db)
+        self.change_log_query_service = BizChangeLogQueryService(change_log_dao)
+        # 业务变更审计落库服务（A5 起 @record_biz_change 装饰器消费，与查询服务共享同一 DAO）
+        set_record_service(BizChangeLogRecordService(dao=change_log_dao))
+
+    def _wire_dashboard_services(self) -> None:
+        """组装 P7 D 组大盘服务：DashboardService（DashboardController 依赖）
+
+        面向容器 db 聚合 user/conversation/message/trace_run 四表统计（InMemory / Sql 无感知）。
+        """
+        from admin.service.dashboard_service import DashboardService
+
+        self.dashboard_service = DashboardService(self.db)
+
+    def _wire_eval_services(self) -> None:
+        """P8 E 组：评测检索服务（EvalController 依赖）
+
+        从装配好的引擎提取 rewrite/intent/retrieval 组件（D9 前置：评测环境须 LLM 就绪 +
+        检索通道启用——引擎未就绪（无 LLM）时 eval_service 保持 None，端点不挂载）。
+        须在 _wire_chat_services 之后调用（engine 在其中装配）。
+        """
+        if self.engine is None:
+            return
+        from knowledge.dao.chunk import KnowledgeChunkDao
+        from rag.service.eval_service import EvalRetrievalService
+
+        self.eval_service = EvalRetrievalService(
+            query_rewrite_service=self.engine._query_rewrite_service,
+            intent_resolver=self.engine._intent_resolver,
+            retrieval_engine=self.engine._retrieval_engine,
+            budget=self.engine._budget,
+            scope_resolver=self.engine._scope_resolver,
+            chunk_dao=KnowledgeChunkDao(self.db),
+            db=self.db,
+        )
+
+    def _wire_agent_services(self) -> None:
+        """P1 Agent MVP：AgentChatService（AgentController 依赖）
+
+        复用 _wire_eval_services 的「引擎组件提取」先例：从 engine 取 retrieval_engine/budget/
+        scope_resolver；LLM 用共享路由（_get_shared_llm）。MCP registry 注入槽优先，
+        否则 McpClientAutoConfiguration 自动装配（无配置 → 空注册表，仅内置 knowledge_search）。
+        引擎/LLM 未就绪 → agent_service=None，端点不挂载（半装配防护）。
+        须在 _wire_chat_services 之后调用（engine 在其中装配）。
+        """
+        llm = self._get_shared_llm()
+        if llm is None or self.engine is None:
+            return
+        from core.pipeline.agent_pipeline import AgentPipeline
+        from rag.mcp import McpClientAutoConfiguration, McpClientProperties, DefaultMcpToolRegistry
+        from rag.service.agent_service import AgentChatService
+
+        registry = self.mcp_tool_registry  # 注入槽优先（测试/外部装配）
+        if registry is None:
+            registry = DefaultMcpToolRegistry()
+            # P2 部署资源：从 RAGENT_MCP_SERVERS_JSON 解析 MCP Server（空 → 空注册表，仅内置 knowledge_search；
+            # 兼容 {"servers":[...]} 与裸数组两种形态；解析失败告警跳过远程工具注册）
+            properties = McpClientProperties()
+            raw_servers = (self.settings.mcp_servers_json or "").strip()
+            if raw_servers:
+                import json
+
+                try:
+                    parsed = json.loads(raw_servers)
+                    if isinstance(parsed, list):  # 裸数组形态 → 包一层
+                        parsed = {"servers": parsed}
+                    properties = McpClientProperties.from_dict(parsed)
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "RAGENT_MCP_SERVERS_JSON 解析失败，MCP 远程工具跳过注册: %s", raw_servers
+                    )
+            autoconfig = McpClientAutoConfiguration(properties, registry)
+            autoconfig.init()  # servers 为空 → 空注册表；失败 server 跳过
+            self._mcp_autoconfig = autoconfig
+            self._owned.append(_McpAutoconfigCloser(autoconfig))  # aclose 时 destroy 客户端
+
+        pipeline = AgentPipeline(
+            llm,
+            tool_registry=registry,
+            retrieval_engine=self.engine._retrieval_engine,
+            budget=self.engine._budget,
+            scope_resolver=self.engine._scope_resolver,
+        )
+        self.agent_service = AgentChatService(pipeline)
+
+    def _wire_idempotent_framework(self) -> None:
+        """P7 F 组：把容器级幂等守卫注入装饰器全局槽（@idempotent_submit 消费）
+
+        复用 chat 域的 IdempotentSubmitGuard（与流式端点同一 cache，内存/Redis 一致），
+        需在 _wire_chat_services 之后调用（guard 已创建）。未装配 chat 域时装饰器走内存兜底。
+        """
+        from common.idempotent.submit import set_guard
+
+        set_guard(self.idempotent_guard)
 
     def _wire_chat_services(self) -> None:
         """组装流式/聊天依赖（M3 切片 + M6 限流 + M7 引擎全链）：
@@ -439,6 +618,12 @@ class AppContainer:
         from rag.retrieval.postprocessor.metadata_enrichment import MetadataEnrichmentPostProcessor
 
         props = self.retrieval_properties or RetrievalProperties.from_env()
+        # 检索通道配置一致性校验（对齐 Java RetrievalConfigFailureAnalyzer；告警不阻断，保持既有装配行为）
+        from rag.retrieval.config_validation import RetrievalConfigException, validate_env
+
+        _violations = validate_env()
+        if _violations:
+            logger.warning("检索通道配置矛盾（启动不阻断）: %s", RetrievalConfigException(_violations).format_failure())
         channels = []
 
         # 向量：读侧优先注入槽；生产用 InMemoryVectorStore + ai.yaml embedding 服务（无则跳过，Milvus/Pg 由 P6 接线）
@@ -528,9 +713,16 @@ class AppContainer:
         from core.llm.model.selector import ModelSelector
         from core.llm.model.routing_executor import RoutingExecutor
         from core.llm.providers.ollama_embedding import OllamaEmbeddingClient
+        from core.llm.providers.openai_embedding import OpenAIEmbeddingClient
+        from core.llm.providers.qwen_embedding import QwenEmbeddingClient
         from core.llm.providers.siliconflow_embedding import SiliconFlowEmbeddingClient
 
-        factory = {"ollama": OllamaEmbeddingClient, "siliconflow": SiliconFlowEmbeddingClient}
+        factory = {
+            "ollama": OllamaEmbeddingClient,
+            "siliconflow": SiliconFlowEmbeddingClient,
+            "qwen": QwenEmbeddingClient,
+            "openai": OpenAIEmbeddingClient,
+        }
         clients: list = []
         for name, provider in config.providers.items():
             client_cls = factory.get(name)
@@ -774,6 +966,16 @@ class AppContainer:
             self._shared_vector_admin = cached
         return cached
 
+    def _get_shared_file_storage(self) -> Any:
+        """跨域共享文件存储门面（懒构建缓存；memory 兜底 / s3 真实接线）"""
+        if getattr(self, "_shared_file_storage", None) is None:
+            from rag.file_storage import DefaultFileStorageService
+
+            self._shared_file_storage = DefaultFileStorageService(
+                self._build_object_storage(), self._build_storage_properties()
+            )
+        return self._shared_file_storage
+
     def _build_object_storage(self) -> Any:
         """按 RAGENT_OBJECT_STORAGE_BACKEND 装配对象存储客户端
 
@@ -957,23 +1159,17 @@ class AppContainer:
         from knowledge.support.ingestion_spec_codec import IngestionSpecCodec
         from knowledge.support.ingestion_spec_schema import IngestionSpecSchemaProvider
         from knowledge.support.vector_target_resolver import VectorTargetResolver
-        from rag.file_storage import DefaultFileStorageService
         from rag.ingestion.kernel import ChunkEmbeddingService, DefaultIngestionKernel
-        from rag.ingestion.parser.markdown_parser import MarkdownDocumentParser
-        from rag.ingestion.parser.registry import ParserRegistry
-        from rag.ingestion.parser.text_parser import TextDocumentParser
         from rag.ingestion.sink import ChunkIndexWriter, VectorStoreSink
         from rag.ingestion.splitter.base import ChunkingService
 
-        # 解析器注册表 + 摄取配置 codec/schema（schema 档位推导依赖注册表）
-        parser_registry = ParserRegistry([TextDocumentParser(), MarkdownDocumentParser()])
+        # 解析器注册表 + 摄取配置 codec/schema（schema 档位推导依赖注册表；MinerU 条件注册见 build_parser_registry）
+        parser_registry = build_parser_registry(self._get_shared_file_storage())
         codec = IngestionSpecCodec()
         schema_provider = IngestionSpecSchemaProvider(parser_registry)
 
         # 文件存储门面（P6 2.1 按 RAGENT_OBJECT_STORAGE_BACKEND 分派；memory 兜底 / s3 真实接线 / oss 2.2 可选）+ 远端拉取 + 上传限流
-        file_storage = DefaultFileStorageService(
-            self._build_object_storage(), self._build_storage_properties()
-        )
+        file_storage = self._get_shared_file_storage()
         fetcher = RemoteFileFetcher(file_storage)
         limiter = UploadRateLimiter()
 
@@ -1086,9 +1282,6 @@ class AppContainer:
         from ingestion.strategy.fetcher.feishu_fetcher import FeishuFetcher
         from ingestion.strategy.fetcher.http_url_fetcher import HttpUrlFetcher
         from ingestion.util.http_client_helper import HttpClientHelper
-        from rag.ingestion.parser.markdown_parser import MarkdownDocumentParser
-        from rag.ingestion.parser.registry import ParserRegistry
-        from rag.ingestion.parser.text_parser import TextDocumentParser
         from rag.ingestion.kernel import ChunkEmbeddingService
         from rag.ingestion.splitter.base import ChunkingService
 
@@ -1103,7 +1296,7 @@ class AppContainer:
         embedding = self._get_shared_embedding()  # 跨域共享（knowledge/ingestion 同一实例）
         llm = self._get_shared_llm()  # 跨域共享（chat 引擎同一 LLM 路由，熔断状态同源）
 
-        parser_registry = ParserRegistry([TextDocumentParser(), MarkdownDocumentParser()])
+        parser_registry = build_parser_registry(self._get_shared_file_storage())
         chunk_embedding = ChunkEmbeddingService(embedding) if embedding is not None else None
         vector_store = self._get_shared_vector_store()  # 跨域共享（写入可被 knowledge 检索读到）
         vector_admin = self._get_shared_vector_admin()
@@ -1150,3 +1343,13 @@ class AppContainer:
                     await acloser()
                 except Exception:  # noqa: BLE001 释放失败不阻断关闭
                     logger.warning("redis 连接池关闭失败", exc_info=True)
+
+
+class _McpAutoconfigCloser:
+    """把 McpClientAutoConfiguration.destroy() 适配为容器 _owned 的 close() 约定"""
+
+    def __init__(self, autoconfig: Any) -> None:
+        self._autoconfig = autoconfig
+
+    def close(self) -> None:
+        self._autoconfig.destroy()

@@ -1,21 +1,23 @@
 # scripts — 运维与入口脚本
 
-命令行入口脚本：用一条命令驱动关键业务链路（知识入库、评估运行），便于人工操作与 CI 自动化。
+命令行入口脚本：用一条命令驱动关键业务链路（知识入库），便于人工操作与 CI 自动化。
 
 ## 主要脚本
 
 | 文件 | 说明 | 状态 |
 |------|------|------|
 | `ingest.py` | 知识入库脚本：加载文档 → 解析 → 切分 → Embedding → 写入向量库（驱动 `rag/ingestion/` 链路） | 🚧 占位待实现 |
-| `evaluate.py` | 评估脚本：运行基准测试并输出报告（驱动 `evaluation/benchmark.py`） | 🚧 占位待实现 |
+| `eval/runner.py` | P1 评测最小闭环：读 JSONL 评测集 → 并发调 `/rag/eval` → 输出 HitRate/MRR/NDCG/Intent@1 报告（`python -m scripts.eval.runner`） | ✅ P1 已交付 |
 
 > 🚧 = 文件结构已就绪，待编写实现
+>
+> 注：原 `evaluate.py` 空占位已在 P8 M5' 删除（评估证据端点见 `rag/controller/eval_controller.py` 的
+> `/rag/eval`，`docs/rag/eval-guide.md`）；P1 起评测运行器落位于 `scripts/eval/`（指标/加载/运行三模块）。
 
 ## 与其他模块的关系
 
 ```
 scripts/ingest.py   ──► rag/ingestion + storage/vector
-scripts/evaluate.py ──► evaluation/benchmark + rag/（被测链路）
 ```
 
 ## 使用说明与注意事项

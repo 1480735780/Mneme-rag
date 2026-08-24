@@ -54,6 +54,13 @@ class AppSettings:
     s3_path_style: bool = True      # RAGENT_S3_PATH_STYLE（MinIO/兼容须 true；AWS 虚拟主机寻址可 false）
     s3_public_url: str = ""         # RAGENT_S3_PUBLIC_URL：浏览器可直连公开基址（留空回退 endpoint）
     schedule_lock_backend: str = "db"  # RAGENT_SCHEDULE_LOCK_BACKEND：db（默认）| redis（P6 3.2 可选）
+    # P7 U6 认证开关（D2）：False = X-User-Id 直填（默认，匿名兜底）；True = Bearer token → 会话 → UserContext
+    auth_enabled: bool = False  # RAGENT_AUTH_ENABLED
+    # P8 E1 评测开关（D5/D9）：False（默认）不挂载 /rag/eval 端点，零运行时开销；True 且引擎就绪时挂载
+    eval_enabled: bool = False  # RAGENT_EVAL_ENABLED
+    # P2 部署资源：MCP Server 列表（env RAGENT_MCP_SERVERS_JSON，形如
+    # {"servers":[{"name":"ragent-mcp","url":"http://host:9099/mcp"}]} 或裸数组；空 → 不注册远程工具）
+    mcp_servers_json: str = ""  # RAGENT_MCP_SERVERS_JSON
 
     def is_memory(self) -> bool:
         """是否内存栈（对齐 Java @ConditionalOnProperty 语义）"""
@@ -85,6 +92,9 @@ class AppSettings:
             s3_path_style=_env_bool("RAGENT_S3_PATH_STYLE", True),
             s3_public_url=os.environ.get("RAGENT_S3_PUBLIC_URL", ""),
             schedule_lock_backend=os.environ.get("RAGENT_SCHEDULE_LOCK_BACKEND", "db"),
+            auth_enabled=_env_bool("RAGENT_AUTH_ENABLED", False),
+            eval_enabled=_env_bool("RAGENT_EVAL_ENABLED", False),
+            mcp_servers_json=os.environ.get("RAGENT_MCP_SERVERS_JSON", ""),
         )
 
 

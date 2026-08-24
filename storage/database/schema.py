@@ -560,6 +560,57 @@ _T_INGESTION_TASK_NODE = TableSchema(
     comment="摄取任务节点运行记录（NodeLog 落库）",
 )
 
+# ==================== P7 U1：用户域 t_user（对齐 Java UserDO） ====================
+
+_T_USER = TableSchema(
+    name="t_user",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("username", "VARCHAR(64)"),
+            ("password", "VARCHAR(255)"),
+            ("avatar", "VARCHAR(500)"),
+            ("role", "VARCHAR(16)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="用户",
+)
+
+
+# ==================== P7 A1：审计日志域 t_biz_change_log（对齐 Java BizChangeLogDO） ====================
+
+_T_BIZ_CHANGE_LOG = TableSchema(
+    name="t_biz_change_log",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("biz_type", "VARCHAR(64)"),
+            ("biz_id", "VARCHAR(64)"),
+            ("operation_type", "VARCHAR(32)"),
+            ("action_desc", "VARCHAR(500)"),
+            # JSONB 快照列：Python 侧以 TEXT 承载 JSON 串（见 tika-porting 决策，InMemory 只登记列名）
+            ("before_snapshot", "TEXT"),
+            ("after_snapshot", "TEXT"),
+            ("change_diff", "TEXT"),
+            ("operator_id", "VARCHAR(64)"),
+            ("operator_name", "VARCHAR(64)"),
+            ("operator_role", "VARCHAR(16)"),
+            ("success", "INTEGER"),
+            ("error_message", "TEXT"),
+            ("class_name", "VARCHAR(128)"),
+            ("method_name", "VARCHAR(128)"),
+            ("ip", "VARCHAR(64)"),
+            ("user_agent", "VARCHAR(500)"),
+            ("create_time", "TIMESTAMP"),
+        ),
+    ),
+    comment="业务变更审计日志",
+)
+
+
 # 当前消费方用到的全部 t_* 表（4.1 KB provider / 5.1 记忆 store / 摘要 / 5.5 AgentPromptResolver / ChunkMetadataResolver
 # / P4 会话/反馈/示例问题/追踪持久化 / P5 摄取与调度域）
 DEFAULT_TABLES: List[TableSchema] = [
@@ -584,4 +635,6 @@ DEFAULT_TABLES: List[TableSchema] = [
     _T_SAMPLE_QUESTION,
     _T_RAG_TRACE_RUN,
     _T_RAG_TRACE_NODE,
+    _T_USER,
+    _T_BIZ_CHANGE_LOG,
 ]

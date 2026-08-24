@@ -107,7 +107,30 @@ def resolve_dimension(config: AIModelConfig, model: str) -> int:
 
 def build_ingestion_chain(embedding_service: EmbeddingService):
     """组装五步链路：解析器注册表 → 切分 → 向量化 → 落库扇出"""
-    registry = ParserRegistry([TextDocumentParser(), MarkdownDocumentParser()])
+    from rag.ingestion.parser import MarkdownDocumentParser, ParserRegistry, TextDocumentParser
+
+    parsers = [TextDocumentParser(), MarkdownDocumentParser()]
+    from rag.ingestion.parser.image_parser import ImageParseProperties
+    from rag.ingestion.parser.mineru.client import MinerUClient
+    from rag.ingestion.parser.mineru.parser import MinerUDocumentParser
+    from rag.ingestion.parser.mineru.polling import MinerUPollingExecutor
+    from rag.ingestion.parser.mineru.properties import MinerUProperties
+    from rag.ingestion.parser.mineru.unpacker import MinerUResultUnpacker
+    from rag.file_storage import DefaultFileStorageService
+    from storage.object import MemoryObjectStorageClient
+    from storage.object.config import RagStorageProperties
+
+    props = MinerUProperties.from_env()
+    if props.api_key:
+        client = MinerUClient(props)
+        polling = MinerUPollingExecutor(client, props)
+        unpacker = MinerUResultUnpacker(
+            DefaultFileStorageService(MemoryObjectStorageClient(), RagStorageProperties()),
+            None,
+            ImageParseProperties(),
+        )
+        parsers.append(MinerUDocumentParser(client, polling, unpacker, props))
+    registry = ParserRegistry(parsers)
     registry.self_check()
 
     store = InMemoryVectorStore(embedding_service)

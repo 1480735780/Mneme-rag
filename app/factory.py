@@ -46,6 +46,16 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
             from rag.controller.chat_controller import router as chat_router
 
             app.include_router(chat_router)
+        # P8 E 组评测端点（D5/D9）：eval_enabled 且引擎就绪（eval_service 装配）才挂载
+        if app_settings.eval_enabled and container.eval_service is not None:
+            from rag.controller.eval_controller import router as eval_router
+
+            app.include_router(eval_router)
+        # P1 Agent MVP 端点（D8）：agent_service 装配（引擎/LLM 就绪）才挂载
+        if container.agent_service is not None:
+            from rag.controller.agent_controller import router as agent_router
+
+            app.include_router(agent_router)
         # P5 N4 调度任务：随 lifespan 启动 scan/recover 协程（优雅停止）
         if container.knowledge_schedule_job is not None:
             await container.knowledge_schedule_job.start()
@@ -61,7 +71,8 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
     app = FastAPI(title="ragent", version="0.1.0", lifespan=lifespan)
 
     # 中间件顺序：UserContext 先于 CORS 均可（无依赖），保持可读
-    app.add_middleware(UserContextMiddleware)
+    # P7 U6：认证开关（D2）——False（默认）走 X-User-Id 直填；True 走 Bearer token → 会话
+    app.add_middleware(UserContextMiddleware, auth_enabled=app_settings.auth_enabled)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -93,6 +104,13 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
     # P5 N5 摄取流水线域（P1-P5 + T1-T5）；服务由 _wire_ingestion_services 装配
     from ingestion.controller.pipeline import router as ingestion_pipeline_router
     from ingestion.controller.task import router as ingestion_task_router
+    # P7 认证域（登录/登出）；服务由 _wire_auth_services 装配
+    from user.controller.auth_controller import router as auth_router
+    from user.controller.user_controller import router as user_router
+    # P7 审计域（日志查询）；服务由 _wire_audit_services 装配
+    from audit.controller.change_log_controller import router as change_log_router
+    # P7 D 组大盘域（总览/性能/趋势）；服务由 _wire_dashboard_services 装配
+    from admin.controller.dashboard_controller import router as dashboard_router
 
     app.include_router(conversation_router)
     # M4 反馈与推荐追问域（C4/C5/C6）：与 engine 无关，常驻挂载
@@ -106,6 +124,13 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
     app.include_router(agent_profile_router)
     app.include_router(settings_router)
     app.include_router(graph_router)
+    # P7 认证域（登录/登出）：服务已装配，常驻挂载
+    app.include_router(auth_router)
+    app.include_router(user_router)
+    # P7 审计域（日志查询）：服务已装配，常驻挂载
+    app.include_router(change_log_router)
+    # P7 D 组大盘域（总览/性能/趋势）：服务已装配，常驻挂载
+    app.include_router(dashboard_router)
     # P5 knowledge 域：KB/文档/分块常驻挂载（N3 起服务已装配）
     app.include_router(knowledge_kb_router)
     app.include_router(knowledge_doc_router)

@@ -92,7 +92,7 @@ class MinerUResultUnpacker:
             content_type = _IMAGE_MIME.get(ext, "application/octet-stream")
             try:
                 self._storage.upload_asset(
-                    data=data, object_name=object_name, content_type=content_type
+                    content=data, original_filename=object_name, content_type=content_type
                 )
                 url_map[zip_path] = self._storage.get_public_url(object_name)
             except Exception as e:  # 单张图片上传失败不中断整文档

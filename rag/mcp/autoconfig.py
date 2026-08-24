@@ -6,8 +6,8 @@ MCP 客户端装配/生命周期管理（对应 Java McpClientAutoConfiguration�
 
 MVP 差异（相对 Java）：
     - 客户端工厂：Java 用官方 SDK McpClient.sync(transport).build()；
-      Python 注入 client_factory 回调，默认使用 MemoryMcpClient（进程内占位），
-      真实 HTTP 客户端待协议层实现后注入替换。
+      Python 注入 client_factory 回调（M3'）——按 server.url 分派：http(s):// → 真实
+      McpHttpClient（Streamable HTTP/JSON-RPC，长会话）；其余 → MemoryMcpClient（进程内占位兜底）。
     - 工具定义转换：Java 直接复用官方 SDK 的 Tool；Python 把 McpToolDefinition 包装为
       McpClientToolExecutor（编排层已定义），注册到 DefaultMcpToolRegistry。
 
@@ -26,9 +26,9 @@ from rag.mcp.registry import McpToolRegistry
 if TYPE_CHECKING:
     # 仅类型标注用：协议层 client 会反引 rag.mcp.model（编排模型），运行期 import 会构成导入环；
     # 配合 from __future__ import annotations 注解延迟求值，类型检查在此解析、运行时不执行
-    from mcp.client import McpClient
+    from ragent_mcp.client import McpClient
 
-# 注意：顶部不 import mcp.client —— 默认工厂在调用时延迟导入（运行时各模块已加载完毕，无环）。
+# 注意：顶部不 import ragent_mcp.client —— 默认工厂在调用时延迟导入（运行时各模块已加载完毕，无环）。
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +97,12 @@ class McpClientAutoConfiguration:
 
     @staticmethod
     def _default_client_factory(server: McpServerConfig) -> "McpClient":
-        """默认客户端工厂（MVP 内存占位）；延迟导入规避 mcp.client ↔ rag.mcp 导入环"""
-        from mcp import MemoryMcpClient
+        """默认客户端工厂（M3'）：按 server.url 分派——http(s):// → 真实 McpHttpClient；
+        其余（如内存占位 server）→ MemoryMcpClient。延迟导入规避 ragent_mcp ↔ rag.mcp 导入环"""
+        from ragent_mcp import MemoryMcpClient
+        from ragent_mcp.client import McpHttpClient
 
+        url = (server.url or "").strip()
+        if url.startswith("http://") or url.startswith("https://"):
+            return McpHttpClient(url)
         return MemoryMcpClient()

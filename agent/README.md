@@ -1,40 +1,15 @@
-# agent — Agent 能力
+# agent — Agent 能力骨架
 
-面向任务的智能体模块：将用户目标拆解为可执行步骤，调用检索/工具完成子任务，并维护跨轮记忆。
+> ⛔ **P8 显式放弃（D3）**：本骨架不实现独立 Agent 框架。
 
-## 功能说明
+**原因**：Java 侧无 `agent/` 包（工具编排由 `rag/core/mcp` 在引擎内闭环完成）；Python 侧等价能力已由既有模块承载，不为「移植」发明需求。
 
-- **规划（planner）**：把用户问题拆解为子任务序列（是否检索、是否调用工具、生成顺序）；
-- **执行（executor）**：按规划逐步执行，编排 LLM 调用与工具调用，处理中间结果；
-- **记忆（memory）**：会话内/跨会话的状态与历史管理（短期上下文 + 长期知识引用）；
-- **工具（tools）**：工具注册与调用分发（检索知识库、查询数据库等，通常经由 `mcp/` 暴露）。
+**等价能力落点**：
+- **工具编排 / 参数提取 / 工具调用**：[rag/mcp/](../rag/mcp/)（McpToolRegistry / McpClientToolExecutor / LLM 参数提取，已交付）
+- **多轮会话记忆**：[rag/memory/](../rag/memory/)（store / service / summary，已交付）
+- **流水线骨架**：`core/pipeline/agent_pipeline.py`（占位，未实现）
+- **MCP 工具接入**：[ragent_mcp/](../ragent_mcp/)（server 四工具 weather/sales/ticket/youcom_search + McpHttpClient）
 
-## 主要模块
+**占位文件**：`executor.py` / `planner.py` / `memory.py` / `tools.py` 为空占位（无实现、无引用），保留以标记曾规划的骨架。
 
-| 文件 | 说明 | 状态 |
-|------|------|------|
-| `planner.py` | 任务规划器：目标拆解与步骤编排（依赖 LLM 的规划能力） | 🚧 占位待实现 |
-| `executor.py` | 执行器：步骤循环执行、结果拼接、异常回退 | 🚧 占位待实现 |
-| `memory.py` | 记忆管理：对话历史 / 检索缓存 / 长期记忆持久化 | 🚧 占位待实现 |
-| `tools.py` | 工具注册表：工具声明（名称/参数/描述）与执行分发 | 🚧 占位待实现 |
-
-> 🚧 = 文件结构已就绪，待编写实现
-
-## 与其他模块的关系
-
-```
-planner / executor ──► core/llm（对话门面 RoutingLLMService）
-tools.py           ──► mcp/server/tools（检索 / 数据库工具）
-memory.py          ──► storage/（缓存 / 数据库） + rag/（检索证据）
-agent_pipeline     ──► core/pipeline/agent_pipeline.py（流水线骨架）
-```
-
-- **依赖**：`core/llm`（对话）、`rag/`（检索工具实现）、`mcp/`（工具通道）、`storage/`（记忆持久化）；
-- **被依赖**：`core/pipeline/agent_pipeline.py` 编排本层组件。
-
-## 使用说明与注意事项
-
-1. **工具边界**：agent 不应直接实现检索/数据库访问细节，应通过 `tools.py` 注册并复用 `rag/` 与 `mcp/` 的既有能力；
-2. **记忆分级**：建议区分"会话内记忆"（内存）与"长期记忆"（持久化），避免把全量历史塞入每次请求的上下文；
-3. **可观测性**：规划与执行的每一步建议输出可追踪的结构化日志（配合 `common/tracing/`），便于排查多轮失败；
-4. 工具调用协议参考 OpenAI Function Calling / MCP 规范设计 `tools.py` 的声明格式。
+> 若后续出现真实的多轮自主 Agent 需求（规划→执行循环），应在 `core/pipeline/agent_pipeline.py` 之上另立项，复用 `rag/mcp` + `rag/memory` 能力。

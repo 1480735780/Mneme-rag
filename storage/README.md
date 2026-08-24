@@ -23,13 +23,12 @@
 ```
 rag/retrieval/vector_store.py ──► storage/vector（向量读写）
 rag/ingestion/                ──► storage/vector + storage/database（入库落盘）
-mcp/server/tools/database.py  ──► storage/database（查询工具）
+ragent_mcp/server/tools/database.py  ──► storage/database（查询工具）
 agent/memory.py               ──► storage/cache + storage/database（记忆持久化）
-evaluation/                   ──► storage/（评估结果落盘）
 ```
 
 - **依赖**：`common/`（异常、日志）；具体中间件连接信息建议经配置/环境变量注入；
-- **被依赖**：`rag/`、`agent/`、`mcp/`、`evaluation/`。
+- **被依赖**：`rag/`、`agent/`（骨架）、`ragent_mcp/`。
 
 ## 使用说明与注意事项
 
