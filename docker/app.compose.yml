@@ -1,0 +1,62 @@
+# Mneme-rag 应用编排：后端 FastAPI + 前端 Nginx
+#
+# 两种用法：
+#   1) 仅应用（memory 栈，无需中间件）：
+#        docker compose -f app.compose.yml up -d --build
+#      访问 http://<VM-IP>:8080（admin/admin123，可用 RAGENT_ADMIN_USERNAME/PASSWORD 覆盖）
+#   2) 应用 + 外部中间件（PG/Redis/MinIO，real 栈）：
+#       docker compose -f docker-compose.yml -f app.compose.yml up -d --build
+#      并在同目录 .env 中设置 RAGENT_DATABASE_URL / RAGENT_REDIS_URL / RAGENT_VECTOR_STORE_TYPE 等
+#
+# 说明：
+#   - backend 构建上下文为仓库根（../ 相对本文件），使用根目录 Dockerfile；
+#   - frontend 使用 frontend/Dockerfile（node 构建 → nginx），nginx.conf 已配 SSE 无缓冲反代 backend:8000；
+#   - 默认所有 RAGENT_* 为空/内存 → 单起 app.compose.yml 即 memory 栈可用（数据不持久，重启即丢）。
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: mneme-rag-backend:latest
+    container_name: ragent-backend
+    environment:
+      RAGENT_HOST: 0.0.0.0
+      RAGENT_PORT: "8000"
+      RAGENT_AUTH_ENABLED: "true"
+      RAGENT_RETRIEVAL_VECTOR: "on"
+      RAGENT_INIT_ADMIN_USERNAME: ${RAGENT_ADMIN_USERNAME:-admin}
+      RAGENT_INIT_ADMIN_PASSWORD: ${RAGENT_ADMIN_PASSWORD:-admin123}
+      # ---- 中间件（real 栈）：与 docker-compose.yml 合并启动时在 .env 覆盖，默认空回落 memory/sqlite ----
+      RAGENT_DATABASE_URL: ${RAGENT_DATABASE_URL:-}
+      RAGENT_REDIS_URL: ${RAGENT_REDIS_URL:-}
+      RAGENT_VECTOR_STORE_TYPE: ${RAGENT_VECTOR_STORE_TYPE:-memory}
+      RAGENT_OBJECT_STORAGE_BACKEND: ${RAGENT_OBJECT_STORAGE_BACKEND:-memory}
+      RAGENT_S3_ENDPOINT: ${RAGENT_S3_ENDPOINT:-}
+      RAGENT_S3_ACCESS_KEY: ${RAGENT_S3_ACCESS_KEY:-}
+      RAGENT_S3_SECRET_KEY: ${RAGENT_S3_SECRET_KEY:-}
+      RAGENT_S3_PATH_STYLE: "true"
+      # 可选：远程 MCP Server（如 mcp-server.compose.yml 起的 9099）
+      RAGENT_MCP_SERVERS_JSON: ${RAGENT_MCP_SERVERS_JSON:-}
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    image: mneme-rag-frontend:latest
+    container_name: ragent-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

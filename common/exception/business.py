@@ -67,6 +67,12 @@ class TooManyRequestsException(ClientException):
     DEFAULT_ERROR_CODE = BaseErrorCode.TOO_MANY_REQUESTS
 
 
+class UnauthorizedException(ClientException):
+    """未认证 / 登录已过期（对应 HTTP 401；全局处理器映射 A000401 → HTTP 401，前端据此跳登录）"""
+
+    DEFAULT_ERROR_CODE = BaseErrorCode.UNAUTHORIZED
+
+
 class ServiceException(AbstractException):
     """服务端异常：请求运行过程中不符合业务预期的异常（对应 Java ServiceException）"""
 

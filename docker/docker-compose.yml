@@ -1,6 +1,6 @@
 # Mneme-rag 外部中间件编排（P6 real 栈 / pgvector 方案）
 #
-# 一键起 PG(带 pgvector) + Redis + MinIO，供 real 栈接线与复测使用。
+# 一键起 PG(带 pgvector) + Redis + MinIO + Neo4j + LightRAG。
 # 用法（本目录下）：
 #   docker compose up -d          # 启动全部服务
 #   docker compose ps             # 查看状态
@@ -15,10 +15,9 @@
 #   RAGENT_S3_SECRET_KEY = minioadmin
 #
 # 向量后端：RAGENT_VECTOR_STORE_TYPE=pgvector。
-#   - pgvector 扩展由镜像内置（pgvector/pgvector:pg16），wiring 启动时
-#     `CREATE EXTENSION IF NOT EXISTS vector` 自动启用（见 app/wiring.py _build_pgvector_stack）；
-#   - MinIO 桶由 minio-init 一次性任务预建（ragent-sources 私有 / ragent-assets 公共读），
-#     代码侧 create_bucket 亦幂等兜底。
+#
+# 知识图谱：LightRAG server (9621) + Neo4j 5 (7474/7687)。
+#   ⚠️ 使用前必须在同目录 .env 文件中设置 DASHSCOPE_API_KEY=sk-xxx
 
 services:
   postgres:
@@ -59,8 +58,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Web 控制台
+      - "9000:9000"
+      - "9001:9001"
     volumes:
       - minio-data:/data
     healthcheck:
@@ -70,7 +69,6 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # 一次性初始化：预建知识库桶（私有）与资产桶（公共读），跑完即退出
   minio-init:
     image: minio/mc
     container_name: ragent-minio-init
@@ -86,6 +84,57 @@ services:
       "
     restart: "no"
 
+  # ==================== 知识图谱（LightRAG + Neo4j）====================
+
+  neo4j:
+    image: neo4j:5
+    container_name: ragent-neo4j
+    environment:
+      # ⚠️ 自行设定：Neo4j 密码（生产环境请改为强密码，并同步修改下方 lightrag 的 NEO4J_PASSWORD）
+      NEO4J_AUTH: neo4j/ragent-neo4j-pass
+    ports:
+      - "7474:7474"   # Web UI（浏览器访问 http://<VM-IP>:7474）
+      - "7687:7687"   # Bolt 协议（LightRAG 连接用）
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  lightrag:
+    image: ghcr.io/hkuds/lightrag:latest
+    container_name: ragent-lightrag
+    ports:
+      - "9621:9621"   # LightRAG Web API
+    environment:
+      # ---- LLM 配置（实体抽取/关系构建）----
+      LIGHTRAG_LLM_BINDING: openai
+      # ⚠️ 自行设定：模型名称（按你实际使用的 provider 修改）
+      LIGHTRAG_LLM_MODEL: qwen-plus
+      # ⚠️ 自行设定：LLM API 地址（通义千问示例；OpenAI 改为 https://api.openai.com/v1）
+      OPENAI_API_BASE: https://dashscope.aliyuncs.com/compatible-mode/v1
+      # ⚠️ 必填：在同目录 .env 文件中设置 DASHSCOPE_API_KEY=sk-xxx
+      OPENAI_API_KEY: ${DASHSCOPE_API_KEY:-}
+
+      # ---- Embedding 配置 ----
+      LIGHTRAG_EMBEDDING_BINDING: openai
+      LIGHTRAG_EMBEDDING_MODEL: text-embedding-v3
+
+      # ---- 存储后端 ----
+      LIGHTRAG_GRAPH_STORAGE: Neo4JStorage
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USERNAME: neo4j
+      # 与上方 neo4j service 的 NEO4J_AUTH 保持一致
+      NEO4J_PASSWORD: ragent-neo4j-pass
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
   minio-data:
+  neo4j_data:

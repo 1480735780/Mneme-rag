@@ -61,7 +61,9 @@ def register_exception_handlers(app: Any) -> None:
                 request.method, _request_url(request), exc, _stack_preview(exc),
             )
         result = Results.failure(exc.error_code, exc.error_message)
-        return JSONResponse(status_code=200, content=result_to_dict(result))
+        # 未认证（A000401）映射 HTTP 401，供前端认证过期跳登录；其余业务错误保持 HTTP 200 + 业务码
+        http_status = 401 if exc.error_code == BaseErrorCode.UNAUTHORIZED.code else 200
+        return JSONResponse(status_code=http_status, content=result_to_dict(result))
 
     @app.exception_handler(Exception)
     async def _default_error_handler(request: Request, exc: Exception) -> JSONResponse:

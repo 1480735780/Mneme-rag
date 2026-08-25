@@ -103,7 +103,7 @@ ai:
 
       - id: llama3
         provider: ollama
-        model: llama3:latest
+        model: qwen2.5:3b
         enabled: true
         supports_thinking: false
         priority: 30
@@ -132,13 +132,14 @@ ai:
           - llama3
         timeout_ms: 5000                # 5 秒超时
 
-      # 标准档：平衡质量和速度
+      # 标准档：平衡质量和速度（追加 llama3/Ollama 兜底候选，无云 key 的本地部署可用）
       standard:
         candidates:
           - qwen-max
           - gpt-4o
           - deepseek-v3
-        timeout_ms: 30000               # 30 秒超时
+          - llama3
+        timeout_ms: 120000              # 120 秒超时（本地 Ollama CPU 推理慢，30s 易触发意图识别超时）
 
       # 深度思考档：高质量，长超时，支持 thinking
       deep:
@@ -167,8 +168,8 @@ ai:
 
       - id: bge-embedding
         provider: ollama
-        model: nomic-embed-text
-        dimension: 768
+        model: bge-m3
+        dimension: 1024
         enabled: true
 
   # ==========================================================

@@ -28,12 +28,16 @@ function CreateDialog({ open, onOpenChange, onCreated }: { open: boolean; onOpen
   const [collectionName, setCollectionName] = useState("");
   const [embeddingModel, setEmbeddingModel] = useState<string | undefined>(undefined);
   const [candidates, setCandidates] = useState<ModelCandidate[]>([]);
+  const [defaultModel, setDefaultModel] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   // 打开时（条件渲染即挂载）拉取 Embedding 模型候选（异步回调，不触发同步 setState）
   useEffect(() => {
     void getSystemSettings()
-      .then((s) => setCandidates(s.ai?.embedding?.candidates ?? []))
+      .then((s) => {
+        setCandidates(s.ai?.embedding?.candidates ?? []);
+        setDefaultModel(s.ai?.embedding?.defaultModel ?? null);
+      })
       .catch(() => setCandidates([]));
   }, []);
 
@@ -44,7 +48,8 @@ function CreateDialog({ open, onOpenChange, onCreated }: { open: boolean; onOpen
       await createKnowledgeBase({
         name: name.trim(),
         collectionName: collectionName.trim(),
-        embeddingModel: embeddingModel || null,
+        // 后端 embedding_model 必填：用户未显式选择时回落系统默认嵌入模型，避免提交 null 必失败
+        embeddingModel: embeddingModel || defaultModel || null,
       });
       toast.success("知识库创建成功");
       onOpenChange(false);

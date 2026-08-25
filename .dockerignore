@@ -1,0 +1,13 @@
+# 后端镜像构建上下文排除（减小镜像 + 避免污染构建缓存）
+.git
+.gitignore
+docs/
+frontend/
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+playwright-report/
+test-results/
+.dockerignore
+*.md

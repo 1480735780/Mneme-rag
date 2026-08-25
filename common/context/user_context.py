@@ -16,7 +16,7 @@ import contextvars
 from dataclasses import dataclass
 from typing import Optional
 
-from common.exception.business import ClientException
+from common.exception.business import ClientException, UnauthorizedException
 
 # 缺省用户 ID（P7 前无认证，请求未带用户头时兜底；对齐 P4 决策 D3）
 DEFAULT_ANONYMOUS_USER_ID = "anonymous"
@@ -56,10 +56,10 @@ class UserContext:
 
     @staticmethod
     def require_user() -> LoginUser:
-        """获取当前用户，不存在则抛客户端异常（对应 Java requireUser）"""
+        """获取当前用户，不存在则抛未授权异常（对应 Java requireUser，未登录映射 HTTP 401）"""
         user = _CONTEXT.get()
         if user is None:
-            raise ClientException("未获取到当前登录用户")
+            raise UnauthorizedException("未获取到当前登录用户")
         return user
 
     @staticmethod

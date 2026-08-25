@@ -11,18 +11,17 @@ from functools import wraps
 from typing import Any, Callable
 
 from common.context.user_context import UserContext
-from common.exception.business import ClientException
+from common.exception.business import ClientException, UnauthorizedException
 
 
 def require_role(role: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """要求当前用户具备指定角色，否则抛 ClientException
-
-    用法：@router.get("/users"); @require_role("admin") async def ...(...)
-    """
+    """要求当前用户具备指定角色，否则抛异常（未登录 → 401 UnauthorizedException；角色不符 → 无权限 ClientException）"""
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
             current_role = UserContext.get_role()
+            if current_role is None:
+                raise UnauthorizedException("未登录或登录已过期")
             if current_role != role:
                 raise ClientException("无权限执行该操作")
             return await func(*args, **kwargs)
