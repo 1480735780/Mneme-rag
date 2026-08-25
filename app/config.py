@@ -61,6 +61,10 @@ class AppSettings:
     # P2 部署资源：MCP Server 列表（env RAGENT_MCP_SERVERS_JSON，形如
     # {"servers":[{"name":"ragent-mcp","url":"http://host:9099/mcp"}]} 或裸数组；空 → 不注册远程工具）
     mcp_servers_json: str = ""  # RAGENT_MCP_SERVERS_JSON
+    # P2 部署资源：初始管理员播种（env RAGENT_INIT_ADMIN_USERNAME / RAGENT_INIT_ADMIN_PASSWORD；
+    # 两者齐备才在装配时确保管理员存在，幂等；任一为空则不播种）
+    init_admin_username: str = ""
+    init_admin_password: str = ""
 
     def is_memory(self) -> bool:
         """是否内存栈（对齐 Java @ConditionalOnProperty 语义）"""
@@ -95,6 +99,8 @@ class AppSettings:
             auth_enabled=_env_bool("RAGENT_AUTH_ENABLED", False),
             eval_enabled=_env_bool("RAGENT_EVAL_ENABLED", False),
             mcp_servers_json=os.environ.get("RAGENT_MCP_SERVERS_JSON", ""),
+            init_admin_username=os.environ.get("RAGENT_INIT_ADMIN_USERNAME", ""),
+            init_admin_password=os.environ.get("RAGENT_INIT_ADMIN_PASSWORD", ""),
         )
 
 

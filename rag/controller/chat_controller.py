@@ -82,7 +82,16 @@ async def chat(
         )
 
     await container.idempotent_guard.execute(idempotent_key, submit, message=CHAT_SUBMIT_MESSAGE)
-    return StreamingResponse(_stream_response(queue), media_type="text/event-stream")
+    # P3 Phase 0：SSE 防代理 buffer——no-cache + X-Accel-Buffering（Nginx/网关）+ keep-alive
+    return StreamingResponse(
+        _stream_response(queue),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ==================== 停止任务 ====================

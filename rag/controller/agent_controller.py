@@ -8,13 +8,12 @@ JSON（非流式）：question + 可选 history → camelCase AgentResult
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
-
 from fastapi import APIRouter, Body, HTTPException, Request
 
 from app.wiring import AppContainer
 from common.response.result import Results
 from common.web.serializer import result_to_dict
+from rag.controller.request import AgentChatRequest
 from rag.controller.vo import camelize
 
 router = APIRouter(tags=["agent"])
@@ -27,13 +26,18 @@ def _container(request: Request) -> AppContainer:
 @router.post("/agent/chat", name="agent_chat")
 async def agent_chat(
     request: Request,
-    payload: Dict[str, Any] = Body(...),
+    payload: AgentChatRequest = Body(...),
 ) -> dict:
     """POST /agent/chat：Agent 闭环（plan-execute-observe-answer）"""
-    question = str(payload.get("question") or "").strip()
+    question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="question 不能为空")
-    history: Optional[List[Dict[str, Any]]] = payload.get("history")
+    # history 由 Pydantic 结构化校验（AgentTurn role/content 必填）；转回 dict 供 service 消费
+    history = (
+        [{"role": t.role, "content": t.content} for t in payload.history]
+        if payload.history is not None
+        else None
+    )
     container = _container(request)
     data = await container.agent_service.chat(question, history)
     return result_to_dict(Results.success(camelize(data)))

@@ -146,3 +146,24 @@ class IntentNodeBatchRequest(BaseModel):
     """批量操作请求（ids 必填）"""
 
     ids: List[str]
+
+
+# ==================== Agent 对话（POST /agent/chat，P3 前端 Phase 0 补 Pydantic 校验） ====================
+
+
+class AgentTurn(BaseModel):
+    """Agent 对话历史单轮（role ∈ user/assistant，service 层 _to_messages 消费）"""
+
+    role: str
+    content: str
+
+
+class AgentChatRequest(BaseModel):
+    """POST /agent/chat 请求体：question + 可选 history（history 项结构化校验）
+
+    question 用默认空串而非必填：空值/缺失由 controller 显式 400（保留既有语义，
+    避免 Pydantic 必填把缺失变 422）。
+    """
+
+    question: str = ""
+    history: Optional[List[AgentTurn]] = None

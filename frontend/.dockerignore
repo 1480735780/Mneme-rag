@@ -1,0 +1,14 @@
+# M5 T4 Docker 构建上下文排除
+node_modules
+dist
+dist-ssr
+test-results
+playwright-report
+.e2e-browsers
+.playwright-browsers
+e2e
+*.log
+.git
+.gitignore
+Dockerfile
+.dockerignore

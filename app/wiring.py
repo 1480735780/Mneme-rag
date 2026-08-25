@@ -159,11 +159,14 @@ def _build_cache(settings: AppSettings):
 
 
 def build_parser_registry(file_storage, vlm_service=None):
-    """构造 ParserRegistry：MinerU 仅在配置了 RAGENT_MINERU_API_KEY 时条件注册。
+    """构造 ParserRegistry：Csv/Excel/Image 全量注册；MinerU 仅在配置了 RAGENT_MINERU_API_KEY 时条件注册。
 
-    对齐 youcom 工具条件注册先例：无 key 时 PDF/DOC/PPT 保持现状（上传前校验拒绝）。
+    对齐 youcom 工具条件注册先例：无 key 时 PDF/DOC/PPT 保持现状（上传前校验拒绝）；
+    Csv/Excel/Image 无需外部服务，始终注册（含无 key 环境）。
     """
-    from rag.ingestion.parser.image_parser import ImageParseProperties
+    from rag.ingestion.parser.csv_parser import CsvDocumentParser
+    from rag.ingestion.parser.excel.excel_parser import ExcelDocumentParser
+    from rag.ingestion.parser.image_parser import ImageDocumentParser, ImageParseProperties
     from rag.ingestion.parser.markdown_parser import MarkdownDocumentParser
     from rag.ingestion.parser.mineru.client import MinerUClient
     from rag.ingestion.parser.mineru.parser import MinerUDocumentParser
@@ -173,7 +176,13 @@ def build_parser_registry(file_storage, vlm_service=None):
     from rag.ingestion.parser.registry import ParserRegistry
     from rag.ingestion.parser.text_parser import TextDocumentParser
 
-    parsers = [TextDocumentParser(), MarkdownDocumentParser()]
+    parsers = [
+        TextDocumentParser(),
+        MarkdownDocumentParser(),
+        CsvDocumentParser(),
+        ExcelDocumentParser(),
+        ImageDocumentParser(vlm_service, file_storage, ImageParseProperties()),
+    ]
     mineru_props = MinerUProperties.from_env()
     if mineru_props.api_key:
         client = MinerUClient(mineru_props)
@@ -276,8 +285,40 @@ class AppContainer:
         """按配置选择装配栈（对齐 Java @ConditionalOnProperty 语义）"""
         settings = settings or AppSettings.from_env()
         if settings.is_memory():
-            return cls._build_memory(settings)
-        return cls._build_real(settings)
+            container = cls._build_memory(settings)
+        else:
+            container = cls._build_real(settings)
+        cls._ensure_init_admin(container, settings)
+        return container
+
+    @classmethod
+    def _ensure_init_admin(cls, container: "AppContainer", settings: AppSettings) -> None:
+        """P2 部署资源：RAGENT_INIT_ADMIN_USERNAME/PASSWORD 齐备时确保管理员存在（幂等）
+
+        两个 env 均非空才播种；已存在同名用户则跳过。默认（env 未设置）无任何行为变化。
+        """
+        username = (settings.init_admin_username or "").strip()
+        password = settings.init_admin_password or ""
+        if not username or not password:
+            return
+        dao = getattr(container, "user_dao", None)
+        if dao is None or dao.find_by_username(username) is not None:
+            return
+        from rag.dao.support import NOT_DELETED
+        from user.enums import UserRole
+        from user.service.password import hash_password
+
+        dao.insert(
+            {
+                "id": f"init-{username}",
+                "username": username,
+                "password": hash_password(password),
+                "avatar": "",
+                "role": UserRole.ADMIN.value,
+                "deleted": NOT_DELETED,
+            }
+        )
+        logging.getLogger(__name__).info("已播种初始管理员: %s", username)
 
     @classmethod
     def _build_memory(cls, settings: AppSettings) -> "AppContainer":
