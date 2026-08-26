@@ -119,6 +119,12 @@ services:
       # ⚠️ 必填：在同目录 .env 文件中设置 DASHSCOPE_API_KEY=sk-xxx
       OPENAI_API_KEY: ${DASHSCOPE_API_KEY:-}
 
+      # 兼容不带前缀的变量名（LightRAG 部分版本读取不带 LIGHTRAG_ 前缀的 env）
+      LLM_BINDING: openai
+      LLM_MODEL: qwen-plus
+      EMBEDDING_BINDING: openai
+      EMBEDDING_MODEL: text-embedding-v3
+
       # ---- Embedding 配置 ----
       LIGHTRAG_EMBEDDING_BINDING: openai
       LIGHTRAG_EMBEDDING_MODEL: text-embedding-v3

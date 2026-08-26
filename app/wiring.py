@@ -13,6 +13,7 @@ M0 仅含配置与健康检查依赖（DatabaseClient + CacheManager）：
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -435,8 +436,10 @@ class AppContainer:
             orchestration_mode=orchestration_mode.value,  # 与 5.5 槽位生效集同源
             rate_limit=self.rate_limit_properties,  # 单真源：直接收 RateLimitProperties
         )
-        # M5 5.7 图谱可视化（C12，委托既有 GraphQueryService）
-        self.graph_service = GraphQueryService()
+        # M5 5.7 图谱可视化（C12，委托既有 GraphQueryService；图谱通道开启时注入共享客户端，否则保持「通道未启用」）
+        self.graph_service = GraphQueryService(
+            light_rag_client=self._shared_light_rag_client() if self._graph_sync_enabled() else None
+        )
 
     def _wire_auth_services(self) -> None:
         """组装 P7 认证域：用户 DAO + 会话管理 + 认证服务（AuthController 依赖）
@@ -606,12 +609,32 @@ class AppContainer:
 
         # 改写：LLM 开关关闭时走「术语归一化 + 规则拆分」兜底，不依赖真实模型
         query_rewrite = MultiQuestionRewriteService(llm_service, enabled=False)
-        # 意图：LLM 分类 + 容器级意图树缓存（admin 写后清缓存与分类器读同源）
-        classifier = DefaultIntentClassifier(
-            llm_service,
-            cache_manager=self.intent_tree_cache,
-            tree_loader=IntentTreeFactory.build_intent_tree,  # 静态 demo 树；DB 树由后续接线替换
-        )
+        # 意图：LLM 分类 / 向量分类按 RAGENT_INTENT_CLASSIFIER 选择（默认 llm 保持现状）；
+        # 向量模式依赖可用 embedding 服务，缺失时回落 LLM 分类器
+        classifier_type = os.environ.get("RAGENT_INTENT_CLASSIFIER", "llm").strip().lower()
+        if classifier_type == "vector":
+            from rag.intent.classifier import VectorIntentClassifier
+
+            vector_embedding = self._get_shared_embedding()
+            if vector_embedding is None:
+                logger.warning("RAGENT_INTENT_CLASSIFIER=vector 但无可用 embedding 服务，回落 LLM 分类器")
+                classifier = DefaultIntentClassifier(
+                    llm_service,
+                    cache_manager=self.intent_tree_cache,
+                    tree_loader=IntentTreeFactory.build_intent_tree,
+                )
+            else:
+                classifier = VectorIntentClassifier(
+                    embedding_service=vector_embedding,
+                    cache_manager=self.intent_tree_cache,
+                    tree_loader=IntentTreeFactory.build_intent_tree,
+                )
+        else:
+            classifier = DefaultIntentClassifier(
+                llm_service,
+                cache_manager=self.intent_tree_cache,
+                tree_loader=IntentTreeFactory.build_intent_tree,  # 静态 demo 树；DB 树由后续接线替换
+            )
         intent_resolver = IntentResolver(classifier)
         guidance = IntentGuidanceService(
             GuidanceProperties(),
@@ -694,7 +717,7 @@ class AppContainer:
                 from rag.graph.config import LightRagProperties
 
                 client = HttpLightRagClient(
-                    LightRagProperties(base_url=props.lightrag_url, api_key=props.lightrag_api_key)
+                    properties=LightRagProperties(base_url=props.lightrag_url, api_key=props.lightrag_api_key)
                 )
             if client is not None:
                 channels.append(GraphSearchChannel(client, enabled=True))
@@ -865,7 +888,14 @@ class AppContainer:
             from storage.vector.in_memory import InMemoryVectorStore
 
             embedding = self._get_shared_embedding()
-            return InMemoryVectorStore(embedding_service=embedding) if embedding is not None else None
+            store = InMemoryVectorStore(embedding_service=embedding) if embedding is not None else None
+            # 图谱同步接线：RAGENT_RETRIEVAL_GRAPH=on 时，写侧包 GraphSyncing 装饰器
+            # （分块写入→insert_text、文档删除→delete_by_doc）；读侧经透传仍可作检索器
+            if store is not None and self._graph_sync_enabled():
+                from storage.vector.decorator import GraphSyncingVectorStoreService
+
+                store = GraphSyncingVectorStoreService(store, self._shared_light_rag_client())
+            return store
         if backend == "milvus":
             store, retriever, _admin = self._build_milvus_stack()
             # 读侧注入槽：检索通道 vector_enabled 时优先取用（避免回落内存读侧）
@@ -877,6 +907,28 @@ class AppContainer:
             self.vector_retriever = retriever
             return store
         raise ValueError(f"未知向量后端：{backend}（允许 memory|milvus|pgvector）")
+
+    def _graph_sync_enabled(self) -> bool:
+        """图谱同步接线开关：RAGENT_RETRIEVAL_GRAPH=on（注入槽优先，测试可注入）"""
+        from rag.retrieval.config import RetrievalProperties
+
+        props = self.retrieval_properties or RetrievalProperties.from_env()
+        return bool(props.graph_enabled)
+
+    def _shared_light_rag_client(self) -> Any:
+        """容器级共享 LightRAG 客户端（写侧装饰器 / 读侧检索引擎 / KB 删除共用同一实例）"""
+        if self.light_rag_client is not None:
+            return self.light_rag_client
+        from rag.graph.client import HttpLightRagClient
+        from rag.graph.config import LightRagProperties
+        from rag.retrieval.config import RetrievalProperties
+
+        props = self.retrieval_properties or RetrievalProperties.from_env()
+        client = HttpLightRagClient(
+            properties=LightRagProperties(base_url=props.lightrag_url, api_key=props.lightrag_api_key)
+        )
+        self.light_rag_client = client
+        return client
 
     def _build_milvus_client(self) -> Any:
         """构建并探活 pymilvus 客户端（决策 D3：连接失败即启动 fail-fast，不静默回落内存）"""
@@ -1256,7 +1308,13 @@ class AppContainer:
         )
 
         self.knowledge_base_service = KnowledgeBaseService(
-            kb_dao, doc_dao, file_storage=file_storage, vector_admin=vector_admin
+            kb_dao, doc_dao, file_storage=file_storage, vector_admin=vector_admin,
+            # 图谱清理：KB 删除 → delete_by_collection（RAGENT_RETRIEVAL_GRAPH=on 时注入，其余 None）
+            graph_cleaner=(
+                self._shared_light_rag_client().delete_by_collection
+                if self._graph_sync_enabled()
+                else None
+            ),
         )
         self.knowledge_chunk_service = KnowledgeChunkService(
             chunk_dao=chunk_dao, doc_dao=doc_dao, kb_dao=kb_dao,

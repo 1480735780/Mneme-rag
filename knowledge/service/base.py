@@ -53,6 +53,7 @@ class KnowledgeBaseService:
         file_storage,
         vector_admin,
         cleanup_fn: Optional[Callable[[str], None]] = None,
+        graph_cleaner: Optional[Callable[[str], "object"]] = None,
     ):
         self._kb_dao = kb_dao
         self._doc_dao = doc_dao
@@ -60,6 +61,8 @@ class KnowledgeBaseService:
         self._vector_admin = vector_admin
         # R6：删除后的物理清理；缺省走本地 best-effort（wiring 可注入异步调度器）
         self._cleanup = cleanup_fn or self._cleanup_local
+        # 图谱清理（KB 删除 → delete_by_collection，异步；wiring 注入，缺省 None 不清理）
+        self.graph_cleaner = graph_cleaner
 
     # ===================== create =====================
 

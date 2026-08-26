@@ -41,12 +41,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from core.llm.chat import LLMService
+from core.llm.embedding import EmbeddingService
 from core.llm.schema import ChatRequest, Message
 from rag.intent.model import IntentKind, IntentNode, NodeScore
 from rag.intent.tree import IntentTreeCacheManager, IntentTreeFactory, flatten_intent_tree
@@ -514,3 +516,130 @@ class IntentResolver:
             SubQuestionIntent(original.sub_question, grouped_by_index.get(index, []))
             for index, original in enumerate(original_sub_intents)
         ]
+
+
+class VectorIntentClassifier(IntentClassifier, IntentNodeRegistry):
+    """
+    向量意图分类器（对应 ragent VectorIntentClassifier，高并发 / 大意图树场景）
+
+    预计算叶子节点向量，分类时只做「问题向量 vs 节点向量」余弦相似度，全程不调 LLM：
+        - 懒初始化：首次 classify_targets 时加载意图树并批量向量化叶子，结果缓存，
+          避免启动期阻塞（embedding 可能涉及网络调用）；
+        - 节点向量优先取 IntentNode.embedding（预计算字段），缺失时对 build_node_text
+          批量 embed；
+        - 纯 Python 余弦相似度，零额外依赖。
+
+    Args:
+        embedding_service: EmbeddingService（embed / embed_batch）
+        cache_manager:     意图树缓存（与 DefaultIntentClassifier 同源，admin 写后清缓存语义一致）
+        tree_loader:       意图树来源，默认 IntentTreeFactory.build_intent_tree
+    """
+
+    def __init__(
+        self,
+        embedding_service: EmbeddingService,
+        cache_manager: Optional[IntentTreeCacheManager] = None,
+        tree_loader: Optional[Callable[[], List[IntentNode]]] = None,
+    ):
+        self._embedding = embedding_service
+        self._cache_manager = cache_manager or IntentTreeCacheManager()
+        self._tree_loader = tree_loader or IntentTreeFactory.build_intent_tree
+        # 懒初始化缓存：List[(leaf_node, vector)]；None 表示尚未初始化
+        self._leaf_vectors: Optional[List[Tuple[IntentNode, List[float]]]] = None
+        # 运行期按 ID 查节点（IntentNodeRegistry）
+        self._id2_node: Dict[str, IntentNode] = {}
+
+    # ==================== 意图树加载 ====================
+
+    def _load_leaf_nodes(self) -> List[IntentNode]:
+        """走「缓存 → 回源 → 落缓存」取叶子节点；同时维护 id2_node 供 get_node_by_id"""
+        roots = self._cache_manager.get_intent_tree_from_cache()
+        if not roots:
+            roots = self._tree_loader()
+            if roots:
+                self._cache_manager.save_intent_tree_to_cache(roots)
+        if not roots:
+            self._id2_node = {}
+            return []
+        all_nodes = flatten_intent_tree(roots)
+        self._id2_node = {n.id: n for n in all_nodes}
+        return [n for n in all_nodes if n.is_leaf()]
+
+    def get_node_by_id(self, node_id: str) -> Optional[IntentNode]:
+        if not node_id or not node_id.strip():
+            return None
+        if not self._id2_node:
+            self._load_leaf_nodes()
+        return self._id2_node.get(node_id)
+
+    # ==================== 懒初始化：批量向量化叶子 ====================
+
+    async def _ensure_initialized(self) -> List[IntentNode]:
+        if self._leaf_vectors is not None:
+            return [n for n, _ in self._leaf_vectors]
+        leaves = self._load_leaf_nodes()
+        if not leaves:
+            self._leaf_vectors = []
+            return []
+
+        vectors: List[Tuple[IntentNode, List[float]]] = []
+        need_embed: List[IntentNode] = []
+        for node in leaves:
+            if node.embedding:
+                vectors.append((node, node.embedding))
+            else:
+                need_embed.append(node)
+        if need_embed:
+            try:
+                embeds = await self._embedding.embed_batch(
+                    [self.build_node_text(n) for n in need_embed]
+                )
+            except Exception:  # noqa: BLE001 —— 向量化失败降级：仅保留预计算向量的叶子
+                logger.warning("向量意图叶子批量向量化失败，仅保留预计算向量节点", exc_info=True)
+                embeds = []
+            vectors.extend((n, v) for n, v in zip(need_embed, embeds) if v)
+        self._leaf_vectors = vectors
+        return [n for n, _ in self._leaf_vectors]
+
+    @staticmethod
+    def build_node_text(node: IntentNode) -> str:
+        """叶子语义文本：full_path + description + examples（与上游一致）"""
+        parts = [node.full_path or "", node.description or ""]
+        if node.examples:
+            parts.append(" ".join(node.examples))
+        return "\n".join(p for p in parts if p and p.strip())
+
+    # ==================== 分类主流程 ====================
+
+    async def classify_targets(self, question: str) -> List[NodeScore]:
+        leaves = await self._ensure_initialized()
+        if not leaves or not question or not question.strip():
+            return []
+        try:
+            query_vector = await self._embedding.embed(question)
+        except Exception:  # noqa: BLE001 —— 分类失败返回空意图（下游兜底）
+            logger.warning("向量意图识别问题向量化失败，返回空意图", exc_info=True)
+            return []
+
+        scores: List[NodeScore] = []
+        for node, vector in self._leaf_vectors:
+            scores.append(NodeScore(node=node, score=_cosine_similarity(query_vector, vector)))
+        scores.sort(key=lambda ns: ns.score, reverse=True)
+        return scores
+
+    async def top_k_above_threshold(
+        self, question: str, top_n: int, min_score: float
+    ) -> List[NodeScore]:
+        return [ns for ns in await self.classify_targets(question) if ns.score >= min_score][:top_n]
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    """纯 Python 余弦相似度；长度不匹配或零向量返回 0.0"""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)

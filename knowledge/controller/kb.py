@@ -66,7 +66,12 @@ async def rename_knowledge_base(kb_id: str, request: Request, body: KnowledgeBas
 async def delete_knowledge_base(kb_id: str, request: Request) -> dict:
     """DELETE /knowledge-base/{kb-id}：删除知识库（有未删文档拒绝）"""
     container = _container(request)
+    # 删除前取 collection（软删后不可查）；删除后 best-effort 清图谱（RAGENT_RETRIEVAL_GRAPH=on 时注入）
+    kb = container.knowledge_base_service.query_by_id(kb_id)
     container.knowledge_base_service.delete(kb_id)
+    graph_cleaner = container.knowledge_base_service.graph_cleaner
+    if graph_cleaner is not None:
+        await graph_cleaner(kb["collection_name"])
     return result_to_dict(Results.success())
 
 
