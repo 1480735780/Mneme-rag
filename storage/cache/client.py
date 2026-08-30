@@ -23,10 +23,33 @@ catch(Exception) 语义）。消费方无感知介质差异，见「5.0 步骤 2
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+class _RedisSubscription:
+    """Redis 订阅句柄：close() 取消消费任务并关闭 pubsub 连接（幂等）"""
+
+    def __init__(self, listen_task, pubsub):
+        self._task = listen_task
+        self._pubsub = pubsub
+        self._closed = False
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._task.cancel()
+        try:
+            await self._pubsub.aclose()
+        except Exception:  # noqa: BLE001 —— 关闭失败仅告警
+            logger.warning("关闭 Redis pubsub 连接失败", exc_info=True)
 
 
 class CacheCodec:
@@ -81,6 +104,32 @@ class CacheManager(ABC):
             bool: 键存在且删除成功返回 True；键不存在 / 后端异常 → False
         """
         ...
+
+    async def publish(self, channel: str, message: str) -> bool:
+        """
+        向频道发布一条消息（P3-2 跨节点广播能力；可选能力，默认不支持）
+
+        Args:
+            channel: 频道名（原样使用，不加缓存键前缀——频道与键是两类命名空间）
+            message: 字符串载荷
+
+        Returns:
+            bool: 发布成功返回 True；后端不支持广播 / 后端异常 → False（调用方自行兜底）
+        """
+        return False
+
+    async def subscribe(self, channel: str, handler: Callable[[str], None]) -> Optional[Any]:
+        """
+        订阅频道，收到消息后在订阅侧回调 handler（P3-2；可选能力，默认不支持）
+
+        Args:
+            channel: 频道名（原样使用，不加缓存键前缀）
+            handler: 同步回调 Callable[[str], None]（消费循环内同步执行，自行兜异常）
+
+        Returns:
+            订阅句柄（须支持 ``await handle.close()``）；后端不支持广播 / 订阅失败 → None
+        """
+        return None
 
 
 class MemoryCacheManager(CacheManager):
@@ -202,6 +251,51 @@ class RedisCacheManager(CacheManager):
             return bool(result)
         except (self._redis_error, self._connection_error):
             return False
+
+    async def publish(self, channel: str, message: str) -> bool:
+        """Redis Pub/Sub 发布（频道原样使用，不加缓存键前缀；对齐 Java RTopic.publish）"""
+        try:
+            receivers = await self._redis.publish(channel, message)
+            return receivers is not None
+        except (self._redis_error, self._connection_error):
+            return False
+
+    async def subscribe(self, channel: str, handler: Callable[[str], None]) -> Optional[Any]:
+        """
+        Redis Pub/Sub 订阅：后台消费循环任务逐条派发给 handler（同步回调，异常仅告警）
+
+        Redis Pub/Sub 语义：发布者自身若已订阅同样收到（对齐 Java RTopic 监听器统一处理）；
+        返回的句柄 close() 会取消消费任务并关闭 pubsub 连接。订阅失败（后端异常）→ None，
+        调用方须自带本地兜底。
+        """
+        try:
+            pubsub = self._redis.pubsub()
+            await pubsub.subscribe(channel)
+        except (self._redis_error, self._connection_error):
+            logger.warning("Redis 订阅频道失败: %s", channel, exc_info=True)
+            return None
+
+        async def _listen() -> None:
+            while True:
+                try:
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                except (self._redis_error, self._connection_error):
+                    logger.warning("Redis 订阅消费异常，频道: %s", channel, exc_info=True)
+                    await asyncio.sleep(1.0)
+                    continue
+                if message is None:
+                    continue
+                if message.get("type") != "message":
+                    continue
+                data = message.get("data")
+                if isinstance(data, (bytes, bytearray)):
+                    data = data.decode("utf-8")
+                try:
+                    handler(data)
+                except Exception:  # noqa: BLE001 —— 单条派发失败不终止消费循环
+                    logger.warning("订阅回调执行失败，频道: %s", channel, exc_info=True)
+
+        return _RedisSubscription(asyncio.create_task(_listen()), pubsub)
 
     def _real_key(self, key: str) -> str:
         """物理 Redis 键：经 RedisKeySerializer 加前缀（空前缀 = 原键，行为不变）"""

@@ -256,12 +256,17 @@ class SqlDatabaseClient(DatabaseClient):
         raise ValueError(f"不支持的查询操作符: {op}")
 
     def _build_create_table(self, table: TableSchema) -> str:
+        # 单主键内联 PRIMARY KEY（对齐既有表）；复合主键用表级约束——
+        # SQL 标准不允许一表多个内联 PRIMARY KEY（如 t_agent_state 三列复合主键）
+        pk_columns = [col.name for col in table.columns if col.primary_key]
         col_defs = []
         for col in table.columns:
             definition = f"{col.name} {col.data_type}"
-            if col.primary_key:
+            if col.primary_key and len(pk_columns) == 1:
                 definition += " PRIMARY KEY"
             col_defs.append(definition)
+        if len(pk_columns) > 1:
+            col_defs.append(f"PRIMARY KEY ({', '.join(pk_columns)})")
         return f"CREATE TABLE IF NOT EXISTS {table.name} ({', '.join(col_defs)})"
 
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -31,6 +32,13 @@ from rag.mcp import McpToolExecutor, McpToolRegistry
 from rag.retrieval.schema import RetrievalBudget
 
 logger = logging.getLogger(__name__)
+
+# 本 run 的近期历史（工具层经 ContextVar 读取，Task 隔离；管线实例跨请求共享不串会话）
+# 对齐 Java KnowledgeSearchTool：改写只用近期轮次消解指代，取 2 轮（4 条消息）
+_REWRITE_CONTEXT_MESSAGES = 4
+_recent_history: ContextVar[Optional[List[Message]]] = ContextVar(
+    "agent_recent_history", default=None
+)
 
 
 @dataclass
@@ -104,6 +112,9 @@ class AgentPipeline:
         context_top_k:       knowledge_search 返回的片段数上限（默认 5）
         max_iterations:      循环上限（默认 5）
         extra_tools:         测试/扩展注入的自定义 AgentTool 列表（可选）
+        knowledge_facade:    知识检索门面（可选；注入后 knowledge_search 走完整 RAG 管线
+                             ——改写/意图/歧义引导/检索/KB_ANSWER 合成，对应 Java KnowledgeSearchTool；
+                             未注入时保留裸检索兜底）
     """
 
     def __init__(
@@ -117,6 +128,7 @@ class AgentPipeline:
         context_top_k: int = 5,
         max_iterations: int = 5,
         extra_tools: Optional[List[AgentTool]] = None,
+        knowledge_facade: Any = None,
     ) -> None:
         self._llm_service = llm_service
         self._max_iterations = max_iterations
@@ -124,6 +136,7 @@ class AgentPipeline:
         self._retrieval_engine = retrieval_engine
         self._budget = budget or RetrievalBudget()
         self._scope_resolver = scope_resolver
+        self._knowledge_facade = knowledge_facade
         self._tools: Dict[str, AgentTool] = {}
         self._load_extra_tools(extra_tools)
         self._load_mcp_tools(tool_registry)
@@ -152,7 +165,7 @@ class AgentPipeline:
             )
 
     def _load_knowledge_tool(self) -> None:
-        if self._retrieval_engine is None:
+        if self._retrieval_engine is None and self._knowledge_facade is None:
             return
         self._tools["knowledge_search"] = AgentTool(
             name="knowledge_search",
@@ -169,6 +182,10 @@ class AgentPipeline:
         question = str(params.get("question") or params.get("query") or "").strip()
         if not question:
             return "knowledge_search 需要参数 question"
+        if self._knowledge_facade is not None:
+            # 完整管线：改写（带近期轮次做指代消解）→ 意图 → 歧义引导 → 检索 → KB_ANSWER 合成
+            return await self._knowledge_facade.search(question, _recent_history.get())
+        # 降级：未注入门面时保留裸检索兜底（MVP 兼容）
         sub_intent = SubQuestionIntent(sub_question=question)
         result = await self._retrieval_engine.retrieve_knowledge_channels(
             sub_intent, self._budget, self._scope_resolver
@@ -212,7 +229,26 @@ class AgentPipeline:
     ) -> AgentResult:
         limit = max_iterations if max_iterations is not None else self._max_iterations
         messages = self._build_messages(question, history)
+        # 本 run 的近期历史挂 ContextVar：knowledge_search 走门面时仅用于改写阶段的指代消解
+        history_token = _recent_history.set(list(history or [])[-_REWRITE_CONTEXT_MESSAGES:])
         steps: List[AgentStep] = []
+        answer = ""
+        iterations = 0
+        try:
+            return await self._run_loop(
+                question, messages, history, limit, steps
+            )
+        finally:
+            _recent_history.reset(history_token)
+
+    async def _run_loop(
+        self,
+        question: str,
+        messages: List[Message],
+        history: Optional[List[Message]],
+        limit: int,
+        steps: List[AgentStep],
+    ) -> AgentResult:
         answer = ""
         iterations = 0
         while iterations < limit:

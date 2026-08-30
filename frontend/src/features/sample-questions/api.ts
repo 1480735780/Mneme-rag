@@ -32,3 +32,8 @@ export function updateSampleQuestion(id: string, payload: SampleQuestionPayload)
 export function deleteSampleQuestion(id: string): Promise<void> {
   return del(`/sample-questions/${encodeURIComponent(id)}`);
 }
+
+/** GET /rag/sample-questions：随机示例问题（欢迎页，deleted=0 随机 3 条） */
+export function listRandomSampleQuestions(): Promise<SampleQuestion[]> {
+  return get("/rag/sample-questions");
+}

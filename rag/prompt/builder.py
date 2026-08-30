@@ -184,6 +184,16 @@ class AgentPromptSlot(Enum):
         "WorkFlow 模式不经过 ReAct 架构",
         frozenset(),
     )
+    # 唯一一个不进对话消息的槽位：随工具定义下发，模型在调用前就要读懂
+    # （Java 第 6 参备注：模型靠它判断要不要查知识库，此时还看不到检索结果；
+    # 写清这个库覆盖哪类问题，不必在这里规定回答风格）
+    KNOWLEDGE_TOOL_DESCRIPTION = (
+        "知识库工具声明",
+        SlotGroup.AGENT,
+        frozenset({OrchestrationMode.AGENT}),
+        "WorkFlow 模式不注册原生知识库工具",
+        frozenset(),
+    )
     # 两种架构共用：WorkFlow 下由主链路合成，Agent 下由 RAG Tool 内部合成
     KB_ANSWER = (
         "知识库问答",

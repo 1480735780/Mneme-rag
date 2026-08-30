@@ -16,6 +16,7 @@ import { Loading } from "@/shared/components/AsyncState";
 
 const LoginPage = lazy(() => import("@/features/auth/pages/LoginPage"));
 const ChatPage = lazy(() => import("@/features/chat/pages/ChatPage"));
+const AgentChatPage = lazy(() => import("@/features/agent-chat/pages/AgentChatPage"));
 const KnowledgeListPage = lazy(() => import("@/features/knowledge/pages/KnowledgeListPage"));
 const KnowledgeDocumentsPage = lazy(() => import("@/features/knowledge/pages/KnowledgeDocumentsPage"));
 const KnowledgeChunksPage = lazy(() => import("@/features/knowledge/pages/KnowledgeChunksPage"));
@@ -46,6 +47,9 @@ export default function AppRouter() {
             <Route path="/" element={<Navigate to="/chat" replace />} />
             <Route path="/chat" element={<ChatPage />} />
             <Route path="/chat/:conversationId" element={<ChatPage />} />
+            {/* v1.1 P2：Agent 引擎对话（RAG_ENGINE_TYPE=agent 时后端才挂 /agent/v1/*，meta 徽标提示离线） */}
+            <Route path="/agent" element={<AgentChatPage />} />
+            <Route path="/agent/:conversationId" element={<AgentChatPage />} />
             <Route path="/admin" element={<RequireAdmin />}>
               <Route index element={<Navigate to="/admin/knowledge" replace />} />
               <Route path="dashboard" element={<DashboardPage />} />

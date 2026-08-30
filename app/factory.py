@@ -56,13 +56,28 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
             from rag.controller.agent_controller import router as agent_router
 
             app.include_router(agent_router)
+        # v1.1 P2 Agent 引擎端点（对齐 @ConditionalOnAgentEngine）：RAG_ENGINE_TYPE=agent 且
+        # 引擎域装配完成才挂载（chat/conversation/meta 三路由；显式 workflow 时不可达）
+        if container.agent_engine_chat_service is not None:
+            from agent.controller import chat_router as agent_engine_chat_router
+            from agent.controller import conversation_router as agent_engine_conversation_router
+            from agent.controller import meta_router as agent_engine_meta_router
+
+            app.include_router(agent_engine_chat_router)
+            app.include_router(agent_engine_conversation_router)
+            app.include_router(agent_engine_meta_router)
         # P5 N4 调度任务：随 lifespan 启动 scan/recover 协程（优雅停止）
         if container.knowledge_schedule_job is not None:
             await container.knowledge_schedule_job.start()
+        # P3-2 跨节点取消广播：随 lifespan 订阅取消频道（优雅停止；不可用时本地兜底）
+        if container.stream_task_manager is not None:
+            await container.stream_task_manager.start()
         try:
             yield
         finally:
             # 关闭：先停调度协程，再释放容器持有的资源（含 redis 连接池优雅断开，P6 3.1）
+            if container.stream_task_manager is not None:
+                await container.stream_task_manager.stop()
             if container.knowledge_schedule_job is not None:
                 await container.knowledge_schedule_job.stop()
             await container.aclose()

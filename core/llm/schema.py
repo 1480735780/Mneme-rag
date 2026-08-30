@@ -250,6 +250,9 @@ class RetrievedChunk:
         id: 命中记录的唯一标识（向量库主键/文档 id）。
         text: 命中的文本内容（切分后的片段/段落）。
         score: 命中得分，数值越大表示与查询的相关性越高。
+        rerank_score: 精排（rerank）相关性分，仅精排客户端双写（对齐 Java rerankScore）。
+            score 会被下游覆写，本字段留给证据闸门识别「这条是否经过精排」；
+            未精排（noop / 补位 / 精排未出分）时为 None。
         collection_name: 所属知识库 collection（无库来源如联网检索为 None）。
         doc_id: 所属文档 ID（检索后由元数据富化补齐，未富化时为 None）。
         chunk_index: 分块在所属文档中的序号，从 0 开始（未富化时为 None）。
@@ -259,6 +262,7 @@ class RetrievedChunk:
     id: str
     text: str
     score: Optional[float] = None
+    rerank_score: Optional[float] = None
     collection_name: Optional[str] = None
     doc_id: Optional[str] = None
     chunk_index: Optional[int] = None

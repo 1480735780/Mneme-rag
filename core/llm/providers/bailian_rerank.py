@@ -192,7 +192,7 @@ class BaiLianRerankClient(BaseRerankClient):
         解析 rerank 响应（对齐 Java doRerank 的响应解析）。
 
         校验 output.results → 逐项取 index 映射回候选 → 取 relevance_score
-        覆盖 score → 按 topN 截断；不足时用未命中候选按原序补齐。
+        覆盖 score 并双写 rerank_score → 按 topN 截断；不足时用未命中候选压 0 补齐。
         """
         if not isinstance(data, dict) or "output" not in data:
             raise ModelClientException(
@@ -228,17 +228,20 @@ class BaiLianRerankClient(BaseRerankClient):
             score = item.get("relevance_score")
             if score is not None and isinstance(score, (int, float)) and not (math.isnan(score) or math.isinf(score)):
                 # 整体拷贝仅覆盖分数（对齐 Java toBuilder().score(score)）
+                # 同一个分写两处：score 会被下游覆写，rerank_score 留给证据闸门（对齐 Java rerankScore）
                 hit = RetrievedChunk(
                     id=src.id,
                     text=src.text,
                     score=float(score),
+                    rerank_score=float(score),
                     collection_name=src.collection_name,
                     doc_id=src.doc_id,
                     chunk_index=src.chunk_index,
                     doc_name=src.doc_name,
                 )
             else:
-                hit = src
+                # 对齐 Java unscored：精排没出分的候选同样压 0，不留 RRF 分混尺
+                hit = _unscored(src)
 
             reranked.append(hit)
             added_ids.add(src.id)
@@ -246,11 +249,11 @@ class BaiLianRerankClient(BaseRerankClient):
             if len(reranked) >= top_n:
                 break
 
-        # 不足 topN 时用未命中候选按原序补齐
+        # 不足 topN 时用未命中候选按原序补齐（压 0 沉底，对齐 Java unscored）
         if len(reranked) < top_n:
             for rc in candidates:
                 if rc.id not in added_ids:
-                    reranked.append(rc)
+                    reranked.append(_unscored(rc))
                 if len(reranked) >= top_n:
                     break
 
@@ -281,3 +284,22 @@ class BaiLianRerankClient(BaseRerankClient):
         if target is not None and target.timeout_ms:
             return target.timeout_ms / 1000
         return None
+
+
+def _unscored(chunk: RetrievedChunk) -> RetrievedChunk:
+    """
+    精排没出分的候选压 0 沉底（对齐 Java BaiLianRerankClient.unscored）。
+
+    留着 RRF 分会让一个列表里混两把尺子——名次派生的 0.03 反而压过被判为弱相关的 0.01；
+    不写 rerank_score，证据闸门据此认出这条没经过精排。
+    """
+    return RetrievedChunk(
+        id=chunk.id,
+        text=chunk.text,
+        score=0.0,
+        rerank_score=None,
+        collection_name=chunk.collection_name,
+        doc_id=chunk.doc_id,
+        chunk_index=chunk.chunk_index,
+        doc_name=chunk.doc_name,
+    )

@@ -108,6 +108,18 @@ class IntentNodeRegistry(ABC):
         """
         ...
 
+    @abstractmethod
+    def list_mcp_tool_nodes(self) -> List[IntentNode]:
+        """
+        列出意图树中已配置 MCP 工具的节点（对应 Java listMcpToolNodes）
+
+        Agent 工具目录据此与 MCP 注册表求交集，决定挂载哪些原生 MCP 工具。
+
+        Returns:
+            List[IntentNode]: kind=MCP 且 mcp_tool_id 非空的叶子节点
+        """
+        ...
+
 
 @dataclass
 class IntentTreeData:
@@ -170,6 +182,13 @@ class DefaultIntentClassifier(IntentClassifier, IntentNodeRegistry):
         if not node_id or not node_id.strip():
             return None
         return self._load_intent_tree_data().id2_node.get(node_id)
+
+    def list_mcp_tool_nodes(self) -> List[IntentNode]:
+        return [
+            node
+            for node in self._load_intent_tree_data().leaf_nodes
+            if node.is_mcp() and (node.mcp_tool_id or "").strip()
+        ]
 
     # ==================== 分类主流程 ====================
 
@@ -413,6 +432,25 @@ class IntentResolver:
             kb_intents.extend(NodeScoreFilters.kb(si.node_scores))
         return IntentGroup(mcp_intents=mcp_intents, kb_intents=kb_intents)
 
+    def list_mcp_tool_nodes(self) -> List[IntentNode]:
+        """
+        透传分类器的意图注册表能力（对应 Java AgentToolCatalog 注入 IntentNodeRegistry bean）
+
+        Java 侧目录直接注入 classifier bean（DefaultIntentClassifier 同时实现 IntentClassifier
+        与 IntentNodeRegistry）；Python 装配统一传 resolver 句柄，故在此透传。
+        分类器未实现注册表（自定义桩）时返回空表——不挂载 MCP 原生工具。
+
+        Returns:
+            List[IntentNode]: kind=MCP 且 mcp_tool_id 非空的叶子节点
+        """
+        registry = getattr(self._classifier, "list_mcp_tool_nodes", None)
+        return list(registry()) if callable(registry) else []
+
+    def get_node_by_id(self, node_id: str) -> Optional[IntentNode]:
+        """透传分类器的按 ID 查节点（同 list_mcp_tool_nodes 的适配理由；未实现返回 None）"""
+        registry = getattr(self._classifier, "get_node_by_id", None)
+        return registry(node_id) if callable(registry) else None
+
     def is_system_only(self, node_scores: List[NodeScore]) -> bool:
         """是否纯系统意图（恰 1 个且 kind=SYSTEM；对应 Java isSystemOnly）"""
         return (
@@ -571,6 +609,15 @@ class VectorIntentClassifier(IntentClassifier, IntentNodeRegistry):
         if not self._id2_node:
             self._load_leaf_nodes()
         return self._id2_node.get(node_id)
+
+    def list_mcp_tool_nodes(self) -> List[IntentNode]:
+        if not self._id2_node:
+            self._load_leaf_nodes()
+        return [
+            node
+            for node in self._id2_node.values()
+            if node.is_leaf() and node.is_mcp() and (node.mcp_tool_id or "").strip()
+        ]
 
     # ==================== 懒初始化：批量向量化叶子 ====================
 

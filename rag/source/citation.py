@@ -91,6 +91,15 @@ class CitationContextEnricher:
 
         return _CONTENT_TAG.sub(replace, kb_context)
 
+    def strip_doc_id_anchors(self, kb_context: Optional[str]) -> str:
+        """
+        只抹掉内部 docId 锚点，不注入引用编号（对应 Java stripDocIdAnchors）
+
+        Agent 工具结果不渲染角标，但内部 docId 一定要抹掉，
+        否则会随工具结果漏进主 Agent 的可见文本。
+        """
+        return self.enrich(kb_context, [])
+
     @staticmethod
     def _index_by_doc_id(sources: List[SourceRef]) -> Dict[str, int]:
         """docId → 来源编号 映射：首见优先，跳过无 docId/无 index 的脏数据"""

@@ -4,6 +4,10 @@
 
 - `ScopeProperties`：检索作用域（对应 Java `SearchChannelProperties.Scope`）——min_intent_score /
   confidence_threshold / supplement_ratio，供 RetrievalScopeResolver / 向量通道定向作用域使用。
+- `RerankProperties`：精排开关（对应 Java `rag.rerank.enabled`）——RAGENT_RERANK_ENABLED，
+  控制精排链路是否接入检索处理链。
+- `EvidenceProperties`：证据闸门（对应 Java `SearchChannelProperties.Evidence`）——min_rerank_score，
+  整批最高精排分低于下限即丢弃全部证据（0 = 关闭）。
 - `RetrievalProperties`：检索通道启停（快赢①：检索通道按配置展开）——env 驱动开关：
     - 向量   RAGENT_RETRIEVAL_VECTOR    （on/1/true/yes；读侧为 storage.vector 实现，Milvus/Pg 由 P6 接线）
     - 关键词 RAGENT_RETRIEVAL_KEYWORD   （同上；ES 后端经 rag.keyword.config.EsProperties 默认连接，未配置则内存版）
@@ -53,3 +57,53 @@ class RetrievalProperties:
             lightrag_api_key=os.environ.get("RAGENT_LIGHTRAG_API_KEY", ""),
             web_api_key=os.environ.get("YDC_API_KEY", ""),
         )
+
+
+@dataclass(frozen=True)
+class RerankProperties:
+    """
+    精排开关配置（对齐 Java rag.rerank.enabled，bootstrap application.yaml 默认 true）
+
+    Python 默认偏离为 False：默认部署无 SILICONFLOW_API_KEY，无可用 rerank 客户端，
+    开着只会让 RerankPostProcessor 每次检索空转异常；配好 ai.yaml rerank 组与 key 后
+    置 RAGENT_RERANK_ENABLED=on 激活（闸门 min-rerank-score 才有分可读）。
+    """
+
+    enabled: bool = False
+
+    @classmethod
+    def from_env(cls) -> "RerankProperties":
+        return cls(enabled=_flag("RAGENT_RERANK_ENABLED"))
+
+
+@dataclass(frozen=True)
+class EvidenceProperties:
+    """
+    证据闸门配置（对齐 Java SearchChannelProperties.Evidence）
+
+    env：RAGENT_SEARCH_EVIDENCE_MIN_RERANK_SCORE（对应 Java rag.search.evidence.min-rerank-score）。
+    0 = 关闭闸门。
+
+    注意默认值偏离：Java 默认 0.2（其精排链默认在链上）；Python 侧精排链路尚未接入生产装配
+    （RerankPostProcessor / RoutingRerankService 未接线），默认 0.2 会立刻触发闸门启动校验，
+    故默认 0（关闭），精排接线后可按 Java 语义调回 0.2。
+    """
+
+    min_rerank_score: float = 0.0
+
+    def __post_init__(self):
+        # 范围校验（对齐 Java SearchChannelProperties.Evidence 的 setter 校验：NaN 或 >1 报错）
+        import math
+
+        if math.isnan(self.min_rerank_score) or self.min_rerank_score > 1:
+            raise ValueError(f"evidence.min-rerank-score 非法: {self.min_rerank_score}（须为 [0, 1] 内的数，0 = 关闭）")
+
+    @classmethod
+    def from_env(cls) -> "EvidenceProperties":
+        raw = os.environ.get("RAGENT_SEARCH_EVIDENCE_MIN_RERANK_SCORE", "").strip()
+        if not raw:
+            return cls()
+        try:
+            return cls(min_rerank_score=float(raw))
+        except ValueError:
+            raise ValueError(f"RAGENT_SEARCH_EVIDENCE_MIN_RERANK_SCORE 非法: {raw!r}（须为数值，0 = 关闭）") from None

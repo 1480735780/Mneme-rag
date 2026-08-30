@@ -14,6 +14,7 @@ t_* DO 的表结构，供 in-memory（登记空表）与真实 SQL 后端（CREA
     - com.nageoffer.ai.ragent.rag.dao.entity.AgentProfileDO / AgentPromptDO
     - com.nageoffer.ai.ragent.rag.dao.entity.MessageFeedbackDO / SampleQuestionDO
     - com.nageoffer.ai.ragent.rag.dao.entity.RagTraceRunDO / RagTraceNodeDO
+    - com.nageoffer.ai.ragent.agent.dao.entity.AgentConversationDO / AgentMessageDO（v1.1 Agent 执行架构域）
 """
 from __future__ import annotations
 
@@ -611,8 +612,67 @@ _T_BIZ_CHANGE_LOG = TableSchema(
 )
 
 
+# ==================== P0 v1.1：Agent 执行架构域 3 张新表（对齐 ragent-new v2.0.0 260812_agent_engine.sql） ====================
+# 与 rag 的 t_conversation / t_message 系列两套分立（ragent.engine.type=agent 时启用）；
+# 列类型沿用本项目约定（VARCHAR(32) 主键 / INTEGER 软删），ragent-new 侧的 VARCHAR(20)/SMALLINT 不照搬；
+# DDL 边界不支持索引/NOT NULL/DEFAULT：uk_agent_conversation_user 部分唯一索引等由业务侧（dao 层）保证
+
+_T_AGENT_CONVERSATION = TableSchema(
+    name="t_agent_conversation",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("conversation_id", "VARCHAR(64)"),
+            ("user_id", "VARCHAR(64)"),
+            ("title", "VARCHAR(200)"),
+            ("last_time", "TIMESTAMP"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="Agent 会话列表（与 t_conversation 两套分立；逻辑删的旧行不占用唯一键）",
+)
+
+_T_AGENT_MESSAGE = TableSchema(
+    name="t_agent_message",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("conversation_id", "VARCHAR(64)"),
+            ("user_id", "VARCHAR(64)"),
+            ("role", "VARCHAR(16)"),
+            ("content", "TEXT"),
+            ("thinking_content", "TEXT"),
+            ("blocks", "JSONB"),
+            ("reply_to_message_id", "VARCHAR(32)"),
+            ("message_status", "VARCHAR(16)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    comment="Agent 消息记录（终答双写落这里，无来源无角标；blocks 为 reasoning/answer/tool 有序轨迹块，回放时间线唯一来源）",
+)
+
+_T_AGENT_STATE = TableSchema(
+    name="t_agent_state",
+    columns=(
+        ColumnSpec(name="user_id", data_type="VARCHAR(64)", primary_key=True),
+        ColumnSpec(name="session_id", data_type="VARCHAR(64)", primary_key=True),
+        ColumnSpec(name="state_key", data_type="VARCHAR(64)", primary_key=True),
+        *_cols(
+            ("payload", "JSONB"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+        ),
+    ),
+    comment="AgentScope 工作状态存储（payload 为框架自有编码的不透明 JSON，业务侧不解析；匿名会话 user_id 为 __anon__）",
+)
+
+
 # 当前消费方用到的全部 t_* 表（4.1 KB provider / 5.1 记忆 store / 摘要 / 5.5 AgentPromptResolver / ChunkMetadataResolver
-# / P4 会话/反馈/示例问题/追踪持久化 / P5 摄取与调度域）
+# / P4 会话/反馈/示例问题/追踪持久化 / P5 摄取与调度域 / v1.1 Agent 执行架构域）
 DEFAULT_TABLES: List[TableSchema] = [
     _T_CONVERSATION,
     _T_MESSAGE,
@@ -637,4 +697,7 @@ DEFAULT_TABLES: List[TableSchema] = [
     _T_RAG_TRACE_NODE,
     _T_USER,
     _T_BIZ_CHANGE_LOG,
+    _T_AGENT_CONVERSATION,
+    _T_AGENT_MESSAGE,
+    _T_AGENT_STATE,
 ]

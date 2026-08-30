@@ -19,7 +19,10 @@ interface NavItem {
   icon: typeof MessageSquare;
 }
 
-const userItems: NavItem[] = [{ to: "/chat", label: "对话", icon: MessageSquare }];
+const userItems: NavItem[] = [
+  { to: "/chat", label: "对话", icon: MessageSquare },
+  { to: "/agent", label: "智能体", icon: Bot },
+];
 // M3 admin 菜单：仪表盘 / 知识库 / 链路追踪 / 系统设置
 const coreAdminItems: NavItem[] = [
   { to: "/admin/dashboard", label: "仪表盘", icon: LayoutDashboard },

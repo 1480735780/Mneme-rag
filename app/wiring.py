@@ -225,6 +225,10 @@ class AppContainer:
     light_rag_client: Any = None
     keyword_retriever: Any = None
     vector_retriever: Any = None
+    # 精排注入槽（v1.1 证据闸门配套）：生产由 _build_rerank_service 按 ai.yaml rerank 组构建；
+    # 测试可注入 RerankService 桩。RerankProperties（RAGENT_RERANK_ENABLED）经 rerank_properties 槽注入
+    rerank_service: Any = None
+    rerank_properties: Any = None
     # 有效知识库 collection 提供者（检索作用域用）：生产默认 DatabaseKbCollectionProvider(db)；
     # 测试注入 StaticKbCollectionProvider（P5 知识库域落地前全库范围为空）
     kb_collection_provider: Any = None
@@ -275,6 +279,14 @@ class AppContainer:
     eval_service: Any = None
     # P1 Agent MVP：Agent 门面 + MCP 注册表注入槽（AgentController 依赖；引擎就绪才装配，否则 None）
     agent_service: Any = None
+    # v1.1 知识检索门面（agent_pipeline 与 agent 引擎域共享同一实例）
+    knowledge_facade: Any = None
+    # v1.1 Agent 引擎域（RAG_ENGINE_TYPE=agent 时装配，否则 None）：ReAct 供给 + SSE 流式服务
+    agent_engine_chat_service: Any = None
+    # v1.1 P2：Agent 引擎控制器依赖（与 chat_service 同批装配；AgentConversation/Meta Controller 用）
+    agent_engine_conversation_service: Any = None
+    agent_engine_properties: Any = None
+    agent_engine_tool_catalog: Any = None
     mcp_tool_registry: Any = None
     _mcp_autoconfig: Any = None
     _owned: list = field(default_factory=list)
@@ -290,6 +302,7 @@ class AppContainer:
         else:
             container = cls._build_real(settings)
         cls._ensure_init_admin(container, settings)
+        cls._ensure_seed_agent_prompt(container)
         return container
 
     @classmethod
@@ -322,6 +335,71 @@ class AppContainer:
         logging.getLogger(__name__).info("已播种初始管理员: %s", username)
 
     @classmethod
+    def _ensure_seed_agent_prompt(cls, container: "AppContainer") -> None:
+        """v1.1 P2 实测补齐：内置智能体 + AGENT_MAIN / KNOWLEDGE_TOOL_DESCRIPTION 槽位播种（幂等）
+
+        对齐 Java init_data_pg.sql（builtin 档案）+ 260812_agent_engine.sql（两槽位）：
+        AGENT_MAIN 人设无代码内置默认（DEFAULT_AGENT_PROMPTS 仅收运营槽位），缺种子时
+        Agent 引擎 get_agent fail-fast（"Agent人设内容不允许为空"）。
+        档案已有 builtin 行、槽位已有非空内容则跳过（不覆盖控制台配置）；
+        槽位行存在但内容空白 → 就地补内容（不新增行，避免同槽位多行）。
+        """
+        from common.util.snowflake import default_generator
+        from rag.dao.support import NOT_DELETED
+        from rag.prompt.agent_resolver import AGENT_PROFILE_TABLE, AGENT_PROMPT_TABLE
+        from rag.prompt.agent_seed import (
+            BUILTIN_AGENT_ID,
+            BUILTIN_AGENT_PROFILE,
+            BUILTIN_AGENT_PROMPT_SEEDS,
+        )
+        from storage.database.client import Condition
+        from storage.database.meta import now_iso
+
+        db = container.db
+        now = now_iso()
+        profile_rows = db.select_rows(
+            AGENT_PROFILE_TABLE,
+            where=[Condition.eq("builtin", 1), Condition.eq("deleted", NOT_DELETED)],
+        )
+        if not profile_rows:
+            row = dict(BUILTIN_AGENT_PROFILE)
+            row.update({"create_time": now, "update_time": now, "deleted": NOT_DELETED})
+            db.insert_row(AGENT_PROFILE_TABLE, row)
+            logger.info("已播种内置智能体档案: %s", BUILTIN_AGENT_PROFILE["name"])
+        agent_id = (profile_rows[0].get("id") if profile_rows else None) or BUILTIN_AGENT_ID
+        for slot_key, content in BUILTIN_AGENT_PROMPT_SEEDS.items():
+            existing = db.select_rows(
+                AGENT_PROMPT_TABLE,
+                where=[
+                    Condition.eq("agent_id", agent_id),
+                    Condition.eq("slot_key", slot_key),
+                    Condition.eq("deleted", NOT_DELETED),
+                ],
+            )
+            if any((row.get("content") or "").strip() for row in existing):
+                continue
+            if existing:
+                db.update_rows(
+                    AGENT_PROMPT_TABLE,
+                    {"content": content, "update_time": now},
+                    where=[Condition.eq("id", existing[0]["id"])],
+                )
+            else:
+                db.insert_row(
+                    AGENT_PROMPT_TABLE,
+                    {
+                        "id": str(default_generator.next_id()),
+                        "agent_id": agent_id,
+                        "slot_key": slot_key,
+                        "content": content,
+                        "create_time": now,
+                        "update_time": now,
+                        "deleted": NOT_DELETED,
+                    },
+                )
+            logger.info("已播种智能体提示词槽位: %s", slot_key)
+
+    @classmethod
     def _build_memory(cls, settings: AppSettings) -> "AppContainer":
         """全内存栈（InMemory DB + Memory 缓存），测试/演示 profile"""
         db = InMemoryDatabaseClient()
@@ -333,6 +411,7 @@ class AppContainer:
         container._wire_chat_services()
         container._wire_eval_services()
         container._wire_agent_services()   # P1 Agent MVP：须在 _wire_chat_services 之后（engine 已装配）
+        container._wire_agent_engine()     # v1.1：RAG_ENGINE_TYPE=agent 时装配 ReAct 引擎域（默认 workflow 跳过）
         container._wire_idempotent_framework()
         container._wire_auth_services()
         container._wire_audit_services()
@@ -359,6 +438,7 @@ class AppContainer:
         container._wire_chat_services()
         container._wire_eval_services()
         container._wire_agent_services()   # P1 Agent MVP：须在 _wire_chat_services 之后（engine 已装配）
+        container._wire_agent_engine()     # v1.1：RAG_ENGINE_TYPE=agent 时装配 ReAct 引擎域（默认 workflow 跳过）
         container._wire_idempotent_framework()
         container._wire_auth_services()
         container._wire_audit_services()
@@ -540,14 +620,110 @@ class AppContainer:
             self._mcp_autoconfig = autoconfig
             self._owned.append(_McpAutoconfigCloser(autoconfig))  # aclose 时 destroy 客户端
 
+        # v1.1：knowledge_search 走完整 RAG 管线（改写→意图→歧义引导→检索→KB_ANSWER 合成），
+        # 组件从 engine 提取（与上面 retrieval_engine/budget/scope_resolver 同一先例），
+        # 确保与 chat 链路共享同一批实例（prompt 缓存、熔断状态同源）；门面落容器槽供引擎域共享
+        self.knowledge_facade = self._build_knowledge_facade(llm)
         pipeline = AgentPipeline(
             llm,
             tool_registry=registry,
             retrieval_engine=self.engine._retrieval_engine,
             budget=self.engine._budget,
             scope_resolver=self.engine._scope_resolver,
+            knowledge_facade=self.knowledge_facade,
         )
         self.agent_service = AgentChatService(pipeline)
+
+    def _wire_agent_engine(self) -> None:
+        """v1.1 P1-4：Agent 引擎域装配（对应 Java @ConditionalOnAgentEngine + AgentEngineConfiguration）
+
+        RAG_ENGINE_TYPE=agent 时装配：并发闸门 + 状态存储 + 会话服务 + 工具目录 +
+        ReAct 供给器 + 流式聊天服务（SSE，P2 控制器挂端点）。
+        默认 agent（决策 3B 2026-08-30 落地）；engine/facade 未就绪则跳过（半装配防护）。
+        """
+        from agent.config import AgentProperties, EngineType, resolve_engine_type
+        from agent.memory.compaction import AgentContextCompactionMiddleware
+        from agent.memory.properties import AgentMemoryProperties
+        from agent.memory.trimmer import AgentContextTrimmer
+        from agent.provider import ReActAgentProvider
+        from agent.run_gate import AgentRunGate
+        from agent.service import AgentChatService as EngineChatService, AgentConversationService
+        from agent.state_store import PgAgentStateStore
+        from agent.tool_catalog import AgentToolCatalog
+
+        if resolve_engine_type() != EngineType.AGENT:
+            return
+        if self.engine is None or self.knowledge_facade is None:
+            logger.info("engine/知识门面未就绪，Agent 引擎域跳过装配（RAG_ENGINE_TYPE=agent）")
+            return
+
+        properties = AgentProperties.from_env()
+        gate = AgentRunGate(self.cache, properties.sse_timeout_ms)
+        state_store = PgAgentStateStore(self.db)
+        conversation_service = AgentConversationService(self.db, state_store, gate)
+        catalog = AgentToolCatalog(
+            knowledge_search_facade=self.knowledge_facade,
+            intent_node_registry=self.engine._intent_resolver,
+            mcp_tool_registry=self.mcp_tool_registry if self.mcp_tool_registry is not None else self._empty_mcp_registry(),
+            agent_prompt_resolver=self.engine._agent_prompt_resolver,
+        )
+        compaction = AgentContextCompactionMiddleware(AgentContextTrimmer(AgentMemoryProperties.from_env()))
+        provider = ReActAgentProvider(
+            agent_prompt_resolver=self.engine._agent_prompt_resolver,
+            tool_catalog=catalog,
+            properties=properties,
+            ai_config=self.ai_config,
+            state_store=state_store,
+            compaction_middleware=compaction,
+        )
+        self.agent_engine_chat_service = EngineChatService(
+            provider=provider,
+            conversation_service=conversation_service,
+            run_gate=gate,
+            task_manager=self.stream_task_manager,
+            state_store=state_store,
+            properties=properties,
+        )
+        # P2 控制器依赖（会话 CRUD 端点 + meta 端点）
+        self.agent_engine_conversation_service = conversation_service
+        self.agent_engine_properties = properties
+        self.agent_engine_tool_catalog = catalog
+        logger.info("Agent 引擎域已装配（RAG_ENGINE_TYPE=agent）")
+
+    def _empty_mcp_registry(self) -> Any:
+        from rag.mcp import DefaultMcpToolRegistry
+
+        return DefaultMcpToolRegistry()
+
+    def _build_knowledge_facade(self, llm: Any) -> Any:
+        """构建知识检索门面（对应 Java KnowledgeSearchFacade @Service 依赖注入）
+
+        engine 组件不全（测试桩 / 半装配形态）→ None：knowledge_search 回落裸检索兜底，
+        不阻断 agent_service 装配（对齐半装配防护先例）。
+        """
+        engine = self.engine
+        required = (
+            "_query_rewrite_service", "_intent_resolver", "_guidance_service",
+            "_retrieval_engine", "_budget", "_scope_resolver",
+            "_context_formatter", "_citation_enricher", "_prompt_builder",
+        )
+        if any(getattr(engine, attr, None) is None for attr in required):
+            logger.info("engine 组件不全，knowledge_search 不接知识检索门面（回落裸检索）")
+            return None
+        from rag.service.knowledge_facade import KnowledgeSearchFacade
+
+        return KnowledgeSearchFacade(
+            query_rewrite_service=engine._query_rewrite_service,
+            intent_resolver=engine._intent_resolver,
+            guidance_service=engine._guidance_service,
+            retrieval_engine=engine._retrieval_engine,
+            budget=engine._budget,
+            scope_resolver=engine._scope_resolver,
+            context_formatter=engine._context_formatter,
+            citation_enricher=engine._citation_enricher,
+            prompt_service=engine._prompt_builder,
+            llm_service=llm,
+        )
 
     def _wire_idempotent_framework(self) -> None:
         """P7 F 组：把容器级幂等守卫注入装饰器全局槽（@idempotent_submit 消费）
@@ -643,11 +819,15 @@ class AppContainer:
         )
         # 检索：按 RetrievalProperties（env）装配多通道引擎（快赢①：检索通道按配置展开）
         retrieval = self._build_retrieval_engine()
-        # Prompt：引用默认关（与 5.6 settings 同源）；Agent 提示词解析复用 5.5 共享缓存
+        # Prompt：引用默认关（与 5.6 settings 同源）；Agent 提示词解析复用 5.5 共享缓存。
+        # v1.1 P2 实测补漏：DatabaseAgentPromptResolver 必须显式传入引擎——漏传时引擎落
+        # StaticAgentPromptResolver() 空源（workflow 的 SYSTEM_CHAT 有内置默认兜底故此前未暴露，
+        # agent 引擎的 AGENT_MAIN 人设无默认 → get_agent fail-fast）
+        agent_prompt_resolver = DatabaseAgentPromptResolver(
+            self.db, cache_manager=self.agent_prompt_cache
+        )
         prompt = RAGPromptService(
-            agent_prompt_resolver=DatabaseAgentPromptResolver(
-                self.db, cache_manager=self.agent_prompt_cache
-            ),
+            agent_prompt_resolver=agent_prompt_resolver,
             citation_enabled=False,
         )
         self.engine = RAGChatEngine(
@@ -659,6 +839,7 @@ class AppContainer:
             prompt_builder=prompt,
             memory_service=self.memory_service,
             scope_resolver=self._scope_resolver,  # 与检索引擎共用同一实例（引擎显式传该 resolver）
+            agent_prompt_resolver=agent_prompt_resolver,
         )
 
     def _build_retrieval_engine(self) -> Any:
@@ -744,20 +925,39 @@ class AppContainer:
         # 检索作用域：按子问题解析一次（定向/全局）；生产用 DB 知识库表，测试可注入 Static 桩
         from rag.retrieval.channel.kb_collection_provider import DatabaseKbCollectionProvider
         from rag.retrieval.channel.scope_resolver import RetrievalScopeResolver
-        from rag.retrieval.config import ScopeProperties
+        from rag.retrieval.config import EvidenceProperties, RerankProperties, ScopeProperties
+        from rag.retrieval.postprocessor.evidence_gate import EvidenceGatePostProcessor
+        from rag.retrieval.postprocessor.rerank import RerankPostProcessor
 
         # 引擎级共用同一实例：RAGChatEngine 显式传 self._scope_resolver 覆盖检索引擎内部 resolver
         self._scope_resolver = RetrievalScopeResolver(
             ScopeProperties(),
             self.kb_collection_provider or DatabaseKbCollectionProvider(self.db),
         )
+
+        # 精排链路（v1.1）：RAGENT_RERANK_ENABLED=on 且有可用 rerank 客户端才挂 RerankPostProcessor；
+        # 证据闸门（order=15）的启动校验以同一 rerank_active 为准——闸门开而精排未挂 = fail-fast
+        rerank_props = self.rerank_properties or RerankProperties.from_env()
+        rerank_service = self._get_shared_rerank() if rerank_props.enabled else None
+        rerank_active = rerank_props.enabled and rerank_service is not None
+        if rerank_props.enabled and rerank_service is None:
+            logger.warning(
+                "精排已启用（RAGENT_RERANK_ENABLED=on）但无可用 rerank 客户端"
+                "（检查 ai.yaml rerank 组与对应 provider api_key），精排链路不装配"
+            )
+
+        postprocessors: list = [
+            DeduplicationPostProcessor(),
+            FusionPostProcessor(),
+        ]
+        if rerank_active:
+            postprocessors.append(RerankPostProcessor(rerank_service, rerank_enabled=True))
+        postprocessors.append(EvidenceGatePostProcessor(EvidenceProperties.from_env(), rerank_enabled=rerank_active))
+        postprocessors.append(MetadataEnrichmentPostProcessor())
+
         return MultiChannelRetrievalEngine(
             channels=channels,
-            postprocessors=[
-                DeduplicationPostProcessor(),
-                FusionPostProcessor(),
-                MetadataEnrichmentPostProcessor(),
-            ],
+            postprocessors=postprocessors,
             scope_resolver=self._scope_resolver,
         )
 
@@ -862,6 +1062,51 @@ class AppContainer:
                 cached = self._build_embedding_service(config) if config is not None else None
             self._shared_embedding = cached
         return cached
+
+    def _get_shared_rerank(self) -> Any:
+        """容器级共享精排路由（懒建一次）：检索处理链共用，注入槽（测试桩）优先"""
+        cached = getattr(self, "_shared_rerank", _MISSING)
+        if cached is _MISSING:
+            cached = self.rerank_service
+            if cached is None:
+                config = self.ai_config if self.ai_config is not None else _load_ai_config()
+                cached = self._build_rerank_service(config) if config is not None else None
+            self._shared_rerank = cached
+        return cached
+
+    def _build_rerank_service(self, config: Any) -> Any:
+        """按 ai.yaml 构建路由式精排服务（镜像 _build_embedding_service：已知 rerank provider + 缺 key 跳过）
+
+        无可用 rerank 客户端（provider 无客户端实现 / 占位符 key 未解析）→ None，精排链路不装配
+        """
+        from core.llm.model.health_store import ModelHealthStore
+        from core.llm.model.routing_executor import RoutingExecutor
+        from core.llm.model.selector import ModelSelector
+        from core.llm.providers.bailian_rerank import BaiLianRerankClient
+        from core.llm.reranker import RoutingRerankService
+
+        factory = {"siliconflow": BaiLianRerankClient}
+        clients: list = []
+        for name, provider in config.providers.items():
+            client_cls = factory.get(name)
+            if client_cls is None:
+                continue
+            api_key = str(getattr(provider, "api_key", "") or "").strip()
+            if not api_key or api_key.startswith("${"):
+                # 占位符未解析（如 ${SILICONFLOW_API_KEY} 未设环境变量）→ 视为无 key，不进入候选
+                continue
+            try:
+                clients.append(client_cls())
+            except Exception as ex:  # noqa: BLE001 —— 单 provider 构建失败不阻断其余
+                logger.warning("provider %s rerank client 构建失败: %s", name, ex)
+        if not clients:
+            return None
+        selection = getattr(config, "selection", None) or {}
+        health_store = ModelHealthStore(
+            failure_threshold=int(getattr(selection, "failure_threshold", 2) or 2),
+            open_duration_ms=int(getattr(selection, "open_duration_ms", 30000) or 30000),
+        )
+        return RoutingRerankService(ModelSelector(config, health_store), RoutingExecutor(health_store), clients)
 
     def _get_shared_vector_store(self) -> Any:
         """容器级共享向量库（懒建一次）：knowledge 与 ingestion 共用，

@@ -8,18 +8,26 @@ rag.service.stream.task_manager - 流式任务管理器（对应 Java StreamTask
     - bind_task：绑定协程句柄（asyncio.Task，等价 Java bindHandle 绑 StreamCancellationHandle）；
       已取消则立即 task.cancel()；取消时 task.cancel() 使引擎协程中断；
     - is_cancelled：本地取消标志；
-    - cancel：**设 Redis 取消标记（TTL 30min）→ 本地 cancelLocal 广播**（对齐 Java：标记 + publish 通知所有节点；
-      Python 单机直接本地广播，跨节点的「先取消后注册」由 Redis 标记在 register 时兜底）；
+    - cancel：**设 Redis 取消标记（TTL 30min）→ Pub/Sub 广播 → 本地 cancelLocal**（P3-2 补齐
+      跨节点广播，对齐 Java publishCancel 的 RTopic.publish；本地 CAS 防重使「直发 + 订阅回环」
+      双投递幂等）。广播不可用（Memory 后端 / Redis 异常）时本地取消照常生效——单节点语义不回退；
     - cancel_local：CAS 防重（onCancelSupplier 只执行一次）；task.cancel()；send CANCEL+DONE + complete；
     - unregister：本地移除 + Redis 标记删除。
 
 同步/异步边界：
     - register / bind_task / is_cancelled / unregister 为同步（cache 经 AsyncCacheBridge 桥接，
       对齐 Java 请求线程内阻塞语义）；
-    - cancel 为 async（直接 await cache.set，3.8 stop 端点异步调用）。
+    - cancel 为 async（直接 await cache.set，3.8 stop 端点异步调用）；
+    - start/stop：订阅生命周期（factory lifespan 调用，对齐 Java @PostConstruct/@PreDestroy 的
+      RTopic.addListener/removeListener）；未 start（测试直建）时无订阅回调，cancel 仍本地生效。
+
+偏离登记（保持）：属主登记 + cancelByUser 属主复核未移植（stop 端点无越权校验，P2 登记）；
+广播载荷因此仅为 taskId，属主复核引入时载荷扩展为 taskId|requester（Java 形态）。
 
 对应 ragent 源码：
     - com.nageoffer.ai.ragent.rag.service.handler.StreamTaskManager
+    - com.nageoffer.ai.ragent.framework.web.StreamTaskManager（P3-2 跨节点广播的参考：
+      CANCEL_TOPIC 常量 + publishCancel + RTopic 监听器 → cancelLocal）
     - com.nageoffer.ai.ragent.framework.web.SseEmitterSender（sendCancelAndDone 帧来源）
 """
 
@@ -37,7 +45,8 @@ from storage.cache.bridge import AsyncCacheBridge
 
 logger = logging.getLogger(__name__)
 
-# Redis 取消标记常量（对齐 Java StreamTaskManager.CANCEL_TOPIC/CANCEL_KEY_PREFIX/CANCEL_TTL）
+# Redis 取消标记 / 广播频道常量（对齐 Java StreamTaskManager.CANCEL_TOPIC/CANCEL_KEY_PREFIX/CANCEL_TTL）
+CANCEL_TOPIC = "ragent:stream:cancel"
 CANCEL_KEY_PREFIX = "ragent:stream:cancel:"
 CANCEL_TTL_SECONDS = 30 * 60  # 30min（对齐 Java Duration.ofMinutes(30)）
 
@@ -64,6 +73,31 @@ class StreamTaskManager:
         self._enabled_cross_node = enabled_cross_node
         self._tasks: Dict[str, _StreamTaskInfo] = {}
         self._lock = threading.RLock()
+        self._subscription: Optional[Any] = None  # 订阅句柄（start() 后持有）
+
+    # ==================== 订阅生命周期（对齐 Java @PostConstruct/@PreDestroy） ====================
+
+    async def start(self) -> None:
+        """订阅跨节点取消频道：任一节点 cancel() 广播后，本节点经回调执行 cancelLocal。
+
+        未调用 start（单测直建 / 广播后端不支持）时无回调——cancel() 的本地直发兜底保证
+        本节点语义不变。重复 start 幂等（先停旧订阅）。
+        """
+        if not self._enabled_cross_node:
+            return
+        await self.stop()
+        self._subscription = await self._cache.subscribe(CANCEL_TOPIC, self._on_cancel_broadcast)
+        if self._subscription is None:
+            logger.info("流式取消广播不可用（后端不支持订阅），跨节点取消退化为标记兜底")
+
+    async def stop(self) -> None:
+        if self._subscription is not None:
+            await self._subscription.close()
+            self._subscription = None
+
+    def _on_cancel_broadcast(self, task_id: str) -> None:
+        """订阅回调（对齐 Java RTopic 监听器 → cancelLocal）；CAS 防重使本地直发 + 回环投递幂等"""
+        self.cancel_local(task_id)
 
     # ==================== 注册 / 绑定 / 查询 ====================
 
@@ -108,16 +142,26 @@ class StreamTaskManager:
 
     async def cancel(self, task_id: str) -> None:
         """
-        取消流式任务（对齐 Java cancel）：先设 Redis 标记，再本地 cancelLocal 广播
+        取消流式任务（对齐 Java publishCancel）：先设 Redis 标记，再 Pub/Sub 广播，最后本地收尾
 
-        Java 经 RTopic publish 通知所有节点（含本节点）统一走 cancelLocal；
-        Python 单机部署直接本地广播（Redis 标记供跨节点 register 时检测兜底）。
+        - Redis 标记：跨节点「先取消后注册」竞态由 register 时的标记检测兜底（沿用既有语义）；
+        - 广播：通知所有已订阅节点执行各自 cancelLocal（对齐 Java RTopic.publish）；
+          广播失败（Memory 后端 / Redis 异常）不影响本地收尾；
+        - 本地直发 cancelLocal：不依赖订阅回环（广播down/未订阅场景语义不变），
+          与订阅回调的重复投递由 CAS 防重互斥。
         """
         if self._enabled_cross_node:
             try:
                 await self._cache.set(self._cancel_key(task_id), True, ttl=CANCEL_TTL_SECONDS)
             except Exception as ex:  # noqa: BLE001 —— 标记写入失败不阻断本地取消
                 logger.warning("设置 Redis 取消标记失败，taskId=%s: %s", task_id, ex)
+            try:
+                published = await self._cache.publish(CANCEL_TOPIC, task_id)
+            except Exception as ex:  # noqa: BLE001 —— 广播失败不阻断本地取消
+                published = False
+                logger.warning("发布取消广播失败，taskId=%s: %s", task_id, ex)
+            if not published:
+                logger.debug("取消广播未投递（后端不支持或异常），本地收尾兜底，taskId=%s", task_id)
         self.cancel_local(task_id)
 
     def cancel_local(self, task_id: str) -> None:
