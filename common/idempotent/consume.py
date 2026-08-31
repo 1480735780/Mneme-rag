@@ -7,8 +7,10 @@ common.idempotent.consume - 消费幂等装饰器（对应 Java @IdempotentConsu
     - CONSUMED("1")：已完成 → 直接跳过（返回 None）；
     - 无状态：置 CONSUMING → 执行 body → 置 CONSUMED；执行异常 → 删除令牌（可重试）。
 
-对齐 Java Lua `SET key value NX GET PX expire_ms` 语义；CacheManager 无原子 setnx，
-以 get+set 模拟（对齐既有 D 决策），单实例/进程内有效，跨实例原子性由 P6 real 栈 Redis 强语义兜底。
+对齐 Java Lua `SET key value NX GET PX expire_ms` 语义：R-C 起 CacheManager 提供
+set_if_absent 原子原语（Redis SET NX EX / Memory 实例锁），首占走原子写入——
+并发双消费只有一方能置 CONSUMING，另一方读到 CONSUMING 拒绝（此前 get+set 模拟
+存在双消费者同时置位的竞态窗口，R-C 销案）。
 
 key 解析（对齐 Java keyPrefix + SpEL key，Python 用 key_fn 等价）：
     - key：显式防重令牌键（与 key_prefix 拼接）；
@@ -68,16 +70,19 @@ class IdempotentConsumeGuard:
         fn: Callable[[], Any],
         async_fn: bool = False,
     ) -> Any:
-        """幂等消费：CONSUMING → 抛错；CONSUMED → 跳过返回 None；否则执行并置 CONSUMED
+        """幂等消费：原子占位 CONSUMING → 执行 → 置 CONSUMED；CONSUMING 拒绝 / CONSUMED 跳过
+
+        对齐 Java Lua SET NX GET：set_if_absent 失败（键已存在）后读旧值分流——
+        CONSUMING 抛错（重复消费）、CONSUMED 跳过返回 None。
 
         async_fn=True 时 fn 为协程函数（await 执行）；否则 fn 为普通可调用。
         """
-        current = await self._cache.get(key)
-        if current == IdempotentConsumeStatus.CONSUMING.value:
+        acquired = await self._cache.set_if_absent(key, IdempotentConsumeStatus.CONSUMING.value, ttl=self._key_timeout)
+        if not acquired:
+            current = await self._cache.get(key)
+            if current == IdempotentConsumeStatus.CONSUMED.value:
+                return None
             raise ClientException(f"消息消费者幂等异常，幂等标识：{key}")
-        if current == IdempotentConsumeStatus.CONSUMED.value:
-            return None
-        await self._cache.set(key, IdempotentConsumeStatus.CONSUMING.value, ttl=self._key_timeout)
         try:
             result = await fn() if async_fn else fn()
         except Exception:
@@ -149,7 +154,7 @@ def idempotent_consume(
 
         @wraps(func)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-            # sync 路径：与 async 路径共用同一套 cache 状态机（CacheManager get+set 模拟 setnx）。
+            # sync 路径：与 async 路径共用同一套 cache 状态机（set_if_absent 原子占位，R-C）。
             # CacheManager 为 async 接口，以 asyncio.run 桥接（sync 函数仅在无运行中事件循环的
             # 线程被调用，桥接安全）；状态令牌跨 sync/async 一致，跨进程由 P6 real 栈 Redis 兜底。
             guard = get_guard(key_timeout)

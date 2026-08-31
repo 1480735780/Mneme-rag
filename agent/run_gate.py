@@ -5,20 +5,17 @@ agent.run_gate - Agent 并发闸门（对应 Java AgentRunGate）
 每用户同时只允许一个运行中的 Agent 会话：acquire 失败即拒绝（"当前会话处理中"），
 被拒的请求不该留下任何副作用（META 事件 / 会话行 / 任务登记都发生在 acquire 之后）。
 
-与 Java 的差异（有意适配）：Java 用 Redisson setIfAbsent（跨节点原子）；house CacheManager
-只有 get/set/delete（无 setnx），本节点以「进程内 per-user 锁串行化 check-then-set」保证
-单节点无竞态，槽值经 cache 落地供 running_task_id 探询与多节点可见；多节点部署的原子
-setnx 需后续把 CacheManager 扩展 set_if_absent（StreamTaskManager 跨节点广播已随 P3-2 交付，
-本项仍挂账）。
+原子性（R-C 销案）：占位走 CacheManager.set_if_absent——Redis 后端为服务端 SET NX EX
+（等价 Java Redisson setIfAbsent，跨节点原子），Memory 后端为实例锁进程内原子；
+此前「进程内 per-user 锁串行化 check-then-set」的本地补偿已随 CacheManager 扩展移除。
+释放沿用值比对 CAS：不误删后继运行写入的新槽。
 
 对应 ragent 源码：
     com.nageoffer.ai.ragent.agent.service.handler.AgentRunGate
 """
 from __future__ import annotations
 
-import asyncio
-import threading
-from typing import Awaitable, Callable, Dict, Optional
+from typing import Awaitable, Callable, Optional
 
 from common.exception.business import ClientException
 from storage.cache import CacheManager
@@ -33,8 +30,6 @@ class AgentRunGate:
     def __init__(self, cache: CacheManager, sse_timeout_ms: int):
         self._cache = cache
         self._ttl_seconds = sse_timeout_ms * 2 / 1000.0
-        self._registry_lock = threading.Lock()
-        self._local_locks: Dict[str, asyncio.Lock] = {}
 
     async def acquire(self, user_id: str, task_id: str, conversation_id: str) -> Callable[[], Awaitable[None]]:
         """
@@ -44,11 +39,10 @@ class AgentRunGate:
         """
         slot_value = f"{task_id}{SLOT_SEPARATOR}{conversation_id}"
         key = self._running_key(user_id)
-        async with self._lock_for(user_id):
-            existing = await self._cache.get(key)
-            if existing:
-                raise ClientException("当前会话处理中，请稍后再发起新的对话")
-            await self._cache.set(key, slot_value, ttl=self._ttl_seconds)
+        # 原子占位：set_if_absent 失败即槽被占用（多节点原子，对齐 Java Redisson setIfAbsent）
+        acquired = await self._cache.set_if_absent(key, slot_value, ttl=self._ttl_seconds)
+        if not acquired:
+            raise ClientException("当前会话处理中，请稍后再发起新的对话")
 
         async def release() -> None:
             current = await self._cache.get(key)
@@ -66,14 +60,6 @@ class AgentRunGate:
         if separator < 0 or slot_value[separator + 1:] != conversation_id:
             return None
         return slot_value[:separator]
-
-    def _lock_for(self, user_id: str) -> asyncio.Lock:
-        with self._registry_lock:
-            lock = self._local_locks.get(user_id)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._local_locks[user_id] = lock
-            return lock
 
     def _running_key(self, user_id: str) -> str:
         return f"{RUNNING_KEY_PREFIX}{user_id}"

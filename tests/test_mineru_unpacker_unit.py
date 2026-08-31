@@ -28,9 +28,9 @@ class _FakeStorage:
     def __init__(self):
         self.calls = []
 
-    def upload_asset(self, *, data, object_name, content_type=None):
-        self.calls.append((object_name, content_type))
-        return f"http://oss/{object_name}"
+    def upload_asset(self, content, original_filename, content_type=None):
+        self.calls.append((original_filename, content_type))
+        return f"http://oss/{original_filename}"
 
     def get_public_url(self, object_name):
         return f"http://oss/{object_name}"

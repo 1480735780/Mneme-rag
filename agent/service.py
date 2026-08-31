@@ -291,7 +291,8 @@ class AgentChatService:
             bridge.finish_cancelled_stream()
             return HouseCompletionPayload(message_status=MessageStatus.INTERRUPTED)
 
-        self._task_manager.register(task_id, sender, on_cancel_supplier)
+        # R-B：属主登记进 task_manager（本地 + Redis owner 键），供 cancel_by_user 复核
+        self._task_manager.register(task_id, sender, on_cancel_supplier, owner_user_id=user_id)
         self._task_manager.bind_task(task_id, run_handle.interrupt_upstream)
 
         asyncio.create_task(self._run_agent(active, question, user_id, conversation_id, run_handle, bridge))
@@ -320,6 +321,6 @@ class AgentChatService:
             self._state_store.save(user_id, conversation_id, active.agent.state)
             bridge.fail(exc)
 
-    async def stop_task(self, task_id: str) -> None:
-        """停止流式任务（对应 Java stopTask；偏离：cancelByUser 属主复核未移植，controller 模块登记）"""
-        await self._task_manager.cancel(task_id)
+    async def stop_task(self, task_id: str, requester: str) -> None:
+        """用户停止流式任务（对应 Java stopTask → taskManager.cancelByUser 属主复核，R-B 销案）"""
+        await self._task_manager.cancel_by_user(task_id, requester)

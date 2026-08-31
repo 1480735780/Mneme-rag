@@ -109,7 +109,8 @@ async def stop(task_id: str, request: Request) -> dict:
     container = _container(request)
 
     async def do_stop() -> None:
-        await container.chat_service.stop_task(task_id)
+        # R-B：发起方经 cancel_by_user 与 Redis 属主比对（越权 → ClientException）
+        await container.chat_service.stop_task(task_id, UserContext.get_user_id())
 
     # key=taskId（Java stop 注解未自定义 message，用默认），重复停止 raise ClientException
     await container.idempotent_guard.execute(

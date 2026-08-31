@@ -1,0 +1,57 @@
+{
+  "stack": "memory",
+  "settings": {},
+  "vector_write": {
+    "chunks": 500,
+    "elapsed_s": 0.216,
+    "throughput_chunks_s": 2317.36,
+    "batch": 100
+  },
+  "retrieve": {
+    "runs": 100,
+    "hit": 100,
+    "latency_ms": {
+      "n": 100,
+      "min": 13.78,
+      "p50": 14.294,
+      "p95": 14.592,
+      "p99": 14.7,
+      "max": 15.117,
+      "avg": 14.232
+    }
+  },
+  "qa": [
+    {
+      "users": 10,
+      "requests": 100,
+      "success": 100,
+      "error": 0,
+      "qps": 334.5,
+      "latency_ms": {
+        "n": 100,
+        "min": 27.005,
+        "p50": 28.957,
+        "p95": 33.219,
+        "p99": 33.352,
+        "max": 36.876,
+        "avg": 29.362
+      }
+    },
+    {
+      "users": 50,
+      "requests": 500,
+      "success": 500,
+      "error": 0,
+      "qps": 264.6,
+      "latency_ms": {
+        "n": 500,
+        "min": 159.299,
+        "p50": 183.772,
+        "p95": 218.665,
+        "p99": 218.975,
+        "max": 220.673,
+        "avg": 187.864
+      }
+    }
+  ]
+}

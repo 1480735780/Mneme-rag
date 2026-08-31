@@ -220,3 +220,6 @@ __marimo__/
 
 # ---- 依赖清单（按需维护，不随仓库分发）----
 requirements.txt
+
+# Local AI tool cache
+.ua/

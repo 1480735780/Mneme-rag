@@ -10,7 +10,8 @@ FastMCP 由官方 mcp SDK 2.x 提供（本项目 ragent_mcp 是其适配层；�
     - 启动：python -m ragent_mcp.server.main（uvicorn 挂 Starlette app，port 9099 对齐 Java）
 
 独立部署边界（D7）：本模块（及 tools/）不 import rag/app/core，可独立进程部署。
-工具：M1' 注册 weather_query；M2' 追加 sales_query/ticket_query/youcom_search（无 YDC_API_KEY 不注册）。
+工具：M1' 注册 weather_query；M2' 追加 sales_query/ticket_query/youcom_search（无 YDC_API_KEY 不注册）；
+R-A（2026-08-30）追加 asset_query/leave_query（对齐 ragent-new AssetMcpExecutor/LeaveMcpExecutor）。
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ from typing import Optional
 
 from mcp.server import MCPServer
 
+from ragent_mcp.server.tools.asset import ASSET_TOOL_NAME, handle_asset_call
+from ragent_mcp.server.tools.leave import LEAVE_TOOL_NAME, handle_leave_call
 from ragent_mcp.server.tools.sales import SALES_TOOL_NAME, handle_sales_call
 from ragent_mcp.server.tools.search import (
     YOUCOM_TOOL_NAME,
@@ -98,6 +101,35 @@ if is_youcom_enabled():
         return _raise_if_error(*handle_youcom_call({"query": query, "count": count, "freshness": freshness}))
 else:
     logger.info("YDC_API_KEY 未配置，youcom_search 工具不注册（可在配置后重启 MCP Server 启用）")
+
+
+@server.tool(name=ASSET_TOOL_NAME, description="查询员工名下的公司 IT 资产，包括笔记本电脑、台式机、显示器、扩展坞等，支持按类别和状态筛选，可返回资产汇总、资产明细以及是否达到换新年限")
+def asset_query(
+    employeeName: Optional[str] = None,
+    assetType: Optional[str] = None,
+    status: Optional[str] = None,
+    queryType: str = "summary",
+    limit: int = 20,
+) -> str:
+    """MCP 工具：asset_query（参数对齐 Java AssetMcpExecutor.buildTool，R-A）"""
+    return _raise_if_error(*handle_asset_call({
+        "employeeName": employeeName, "assetType": assetType, "status": status,
+        "queryType": queryType, "limit": limit,
+    }))
+
+
+@server.tool(name=LEAVE_TOOL_NAME, description="查询员工的假期额度与余额，支持年假、调休、病假、事假，年假返回全年额度、上年结转天数与截止日、已休天数和当前可用余额，也可返回请假明细")
+def leave_query(
+    employeeName: Optional[str] = None,
+    leaveType: str = "年假",
+    year: Optional[int] = None,
+    queryType: str = "balance",
+) -> str:
+    """MCP 工具：leave_query（参数对齐 Java LeaveMcpExecutor.buildTool，R-A）"""
+    return _raise_if_error(*handle_leave_call({
+        "employeeName": employeeName, "leaveType": leaveType,
+        "year": year, "queryType": queryType,
+    }))
 
 
 def streamable_app():

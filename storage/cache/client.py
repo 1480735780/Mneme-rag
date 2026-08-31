@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -131,6 +132,26 @@ class CacheManager(ABC):
         """
         return None
 
+    async def set_if_absent(self, key: str, value: Any, ttl: Optional[float] = None) -> bool:
+        """
+        原子「不存在才写入」（R-C；对齐 Java Redisson setIfAbsent / Redis SET NX EX）
+
+        基类实现为 get-then-set 近似语义，仅供自定义桩兜底——跨实例原子性必须由子类覆写：
+        MemoryCacheManager 以实例锁保证进程内原子，RedisCacheManager 走服务端 SET NX EX
+        （AgentRunGate 槽位占位 / 消费幂等令牌是两个强原子消费者）。
+
+        Args:
+            key:   缓存键
+            value: 任意 JSON 可序列化对象
+            ttl:   过期秒数；None = 不设过期；<=0 视为非法参数
+
+        Returns:
+            bool: 键不存在且写入成功 → True；键已存在 / 序列化失败 / TTL 非法 / 后端异常 → False
+        """
+        if await self.get(key) is not None:
+            return False
+        return await self.set(key, value, ttl=ttl)
+
 
 class MemoryCacheManager(CacheManager):
     """
@@ -143,6 +164,8 @@ class MemoryCacheManager(CacheManager):
     def __init__(self, codec: Optional[CacheCodec] = None):
         self._codec = codec or CacheCodec()
         self._store: Dict[str, Tuple[str, Optional[float]]] = {}
+        # set_if_absent 的进程内原子性：get/set 本体无真实挂起点，锁内调用不会跨 await 悬挂
+        self._setnx_lock = threading.Lock()
 
     async def get(self, key: str) -> Optional[Any]:
         entry = self._store.get(key)
@@ -173,6 +196,13 @@ class MemoryCacheManager(CacheManager):
             self._store.pop(key, None)
             return True
         return False
+
+    async def set_if_absent(self, key: str, value: Any, ttl: Optional[float] = None) -> bool:
+        """进程内原子「不存在才写入」：实例锁互斥（get/set 本体无真实挂起点，锁内不跨 await 悬挂）"""
+        with self._setnx_lock:
+            if await self.get(key) is not None:
+                return False
+            return await self.set(key, value, ttl=ttl)
 
     def size(self) -> int:
         """当前缓存条目数（测试 / 诊断用）"""
@@ -250,6 +280,23 @@ class RedisCacheManager(CacheManager):
             result = await self._redis.delete(self._real_key(key))
             return bool(result)
         except (self._redis_error, self._connection_error):
+            return False
+
+    async def set_if_absent(self, key: str, value: Any, ttl: Optional[float] = None) -> bool:
+        """服务端原子 SET NX EX（对齐 Java Redisson setIfAbsent(key, value, ttl)）；语义同 set() 的 TTL 口径"""
+        if ttl is not None and ttl <= 0:
+            return False
+        try:
+            raw = self._codec.serialize(value)
+        except Exception:
+            return False
+        try:
+            if ttl is None:
+                result = await self._redis.set(self._real_key(key), raw, nx=True)
+            else:
+                result = await self._redis.set(self._real_key(key), raw, nx=True, ex=int(ttl))
+            return bool(result)
+        except (self._redis_error, self._connection_error, ValueError):
             return False
 
     async def publish(self, channel: str, message: str) -> bool:

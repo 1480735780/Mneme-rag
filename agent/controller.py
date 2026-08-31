@@ -21,8 +21,8 @@ agent.controller - Agent 引擎 HTTP 端点（对应 Java 三个控制器）
       「否则与 mcpConfigured 各说各话」的口径）。
 
 偏离登记：
-    - stop 不带属主校验：Java stopTask → taskManager.cancelByUser（Redis owner 复核越权）；
-      Python StreamTaskManager 无属主登记，沿 workflow chat_service.stop_task 单节点先例直接 cancel。
+    - （已销案，R-B 2026-08-30）stop 属主复核已移植：cancel_by_user 与 Redis 属主比对，
+      广播载荷 `taskId|requester`、执行端复核对齐 Java cancelByUser/cancelLocal。
 
 对应 ragent 源码：
     - com.nageoffer.ai.ragent.agent.controller.AgentChatController
@@ -117,13 +117,14 @@ async def agent_chat(
 
 @chat_router.post("/agent/v1/stop", name="agent_engine_stop")
 async def stop_agent(task_id: str, request: Request) -> dict:
-    """POST /agent/v1/stop：停止指定 Agent 流式任务（对齐 Java stop）
+    """POST /agent/v1/stop：停止指定 Agent 流式任务（对齐 Java stop → cancelByUser 属主复核）
 
     Java 端点无 @IdempotentSubmit（与 workflow /rag/v3/stop 不同），重复停止由
-    task_manager.cancel_local 的 CAS 防重承接（onCancelSupplier 只执行一次）。
+    task_manager.cancel_local 的 CAS 防重承接（onCancelSupplier 只执行一次）；
+    R-B：发起方经 cancel_by_user 与 Redis 属主比对（越权 → ClientException）。
     """
     container = _container(request)
-    await container.agent_engine_chat_service.stop_task(task_id)
+    await container.agent_engine_chat_service.stop_task(task_id, UserContext.get_user_id())
     return result_to_dict(Results.success(None))
 
 

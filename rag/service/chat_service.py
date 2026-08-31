@@ -131,6 +131,6 @@ class RAGChatService:
             # 此处 finally 幂等 unregister（正常路径 on_complete 已 unregister，重复调用无害）。
             self._task_manager.unregister(task_id)
 
-    async def stop_task(self, task_id: str) -> None:
-        """停止流式任务（对应 Java stopTask）"""
-        await self._task_manager.cancel(task_id)
+    async def stop_task(self, task_id: str, requester: str) -> None:
+        """用户停止流式任务（对应 Java stopTask → taskManager.cancelByUser 属主复核，R-B 销案）"""
+        await self._task_manager.cancel_by_user(task_id, requester)

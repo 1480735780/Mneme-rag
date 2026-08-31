@@ -148,7 +148,11 @@ class StreamChatEventHandler(BaseStreamCallback):
     def _initialize(self) -> None:
         """发送元数据事件 + 注册任务（对齐 Java initialize）"""
         self._send(SSEEventType.META, MetaPayload(conversation_id=self._conversation_id, task_id=self._task_id))
-        self._task_manager.register(self._task_id, self._sender, self._build_completion_payload_on_cancel)
+        # R-B：属主登记（对齐 Java register(taskId, userId, finalizer)），供 cancel_by_user 复核
+        self._task_manager.register(
+            self._task_id, self._sender, self._build_completion_payload_on_cancel,
+            owner_user_id=self._user_id,
+        )
 
     def _should_send_title(self) -> bool:
         """是否在完成事件附带标题（对齐 Java shouldSendTitle）：新会话（无记录）或会话标题空 → True"""
