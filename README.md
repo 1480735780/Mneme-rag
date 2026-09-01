@@ -1,6 +1,8 @@
 <div align="center">
 
-# Mneme-RAG
+
+
+<img width="1254" height="764" alt="Mneme-rag" src="https://github.com/user-attachments/assets/34b80551-af4e-47e5-85cc-08c3aebb43c7" />
 
 **Python 原生的生产级 RAG 平台 — 让大模型回答有据可依**
 
