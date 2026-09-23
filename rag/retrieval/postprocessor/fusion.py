@@ -102,6 +102,7 @@ class FusionPostProcessor(SearchResultPostProcessor):
         Returns:
             融合后的候选列表（按 RRF 分数倒序排序）
         """
+        # 召回的chunk列表为空，直接返回
         if not chunks:
             return chunks
 
@@ -130,7 +131,13 @@ class FusionPostProcessor(SearchResultPostProcessor):
                 key = retrieved_chunk_key(chunk)  #为每个检索结果生成唯一的key
                 delta = weight / (k + rank + 1)
                 rrf_scores[key] = rrf_scores.get(key, 0.0) + delta #同一个 Chunk 在不同检索通道中的多路证据累加。
-
+        """
+        按 key 汇总各通道 RRF 分
+        → 回写到 Dedup 后的唯一 Chunk
+        → 按 RRF 分数倒序
+        → 按 candidate_limit 截断
+        → 送入 Rerank
+        """
         fused = list(chunks)
         #把 RRF 分数写回 Chunk
         for chunk in fused:
