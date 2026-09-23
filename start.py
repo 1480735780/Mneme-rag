@@ -31,7 +31,10 @@ FRONTEND_PORT = 5173
 
 
 def _setup_env(args) -> None:
-    """装配开发默认环境（用户显式设置的 env 优先）。"""
+    """装配开发默认环境（用户显式设置的 env 优先）。
+    本机服务（ollama、后端自己）强制直连不被代理劫持；外部 API（OpenAI/千问等）该走系统代理还走系统代理
+    ——因为删的是环境变量，而 Windows 系统级代理（注册表那层）还在，外部请求仍会经由它出去。两个世界的流量各走各的。
+    """
     proxied = {"http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
                "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"}
     saved = {k: os.environ.get(k) for k in proxied}
@@ -97,6 +100,7 @@ def _probe(url: str, timeout: float = 2.0) -> bool:
 
 
 def _wait_ready(url: str, label: str, seconds: int = 60) -> bool:
+    """轮询探活，默认等 60s """
     print(f"  ⏳ 等待{label}就绪：{url}")
     deadline = time.time() + seconds
     while time.time() < deadline:

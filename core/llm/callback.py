@@ -3,8 +3,11 @@
 core.llm.callback - 流式响应回调接口（对应 ragent 的 StreamCallback）
 """
 
+import logging
 from abc import ABC, abstractmethod
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 # 导入需要的数据类型（避免循环引用，使用 TYPE_CHECKING）
 from typing import TYPE_CHECKING
@@ -145,4 +148,4 @@ class BaseStreamCallback(StreamCallback):
         pass
 
     async def on_error(self, error: Exception) -> None:
-        print(f"[StreamCallback Error] {error}")
+        logger.error("StreamCallback 回调异常: %s", error)

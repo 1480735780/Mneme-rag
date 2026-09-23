@@ -13,8 +13,10 @@
 | `modern-rag-improvement-roadmap.md` | 现代化改进路线（文档理解、Hybrid Retrieval 2.0、GraphRAG、Agentic RAG、评估与企业平台化） |
 | `infra-ai-analysis.md` | ragent infra-ai 层（模型管理/路由/故障转移）源码分析 |
 | `roadmap.md` | 演进路线（当前阶段、里程碑、待办） |
-| `diagrams/architecture.drawio` | 总体架构图（draw.io 源文件） |
-| `diagrams/rag-flow.drawio` | RAG 流程时序/数据流图（draw.io 源文件） |
+| `diagrams/architecture.svg` | 总体架构图（SVG 源文件） |
+| `diagrams/architecture.png` | 总体架构图（2x 高清导出） |
+| `diagrams/architecture.drawio` | 总体架构图 draw.io 版本（占位，待补充） |
+| `diagrams/rag-flow.drawio` | RAG 流程时序/数据流图（占位，待补充） |
 
 ## 与其他模块的关系
 
@@ -24,6 +26,6 @@
 
 ## 使用说明与注意事项
 
-- 架构图使用 [draw.io](https://www.draw.io/) 打开编辑，改动后请同时更新对应 Markdown 文档；
+- 架构图优先编辑 `diagrams/architecture.svg`；如需在 [draw.io](https://www.draw.io/) 中维护，请补充对应 draw.io 源文件。改动后请同时更新对应 Markdown 文档和 PNG 导出；
 - 新增/变更模块时，请同步更新 `modules.md` 与本目录的架构文档；
 - 分析类文档（`*-analysis.md`）记录研究结论，保留历史判断即可，无需随代码频繁改动。

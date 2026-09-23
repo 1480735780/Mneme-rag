@@ -62,6 +62,10 @@ class ProbeStreamBridge(BaseStreamCallback):
     即提交缓冲并进入增量转发模式。首包之前出现 on_error / 无内容完成视为该候选失败，
     缓冲被丢弃、不污染下游（中间候选的失败不会上报给业务层）。
 
+    人话：
+    首包之前，所有事件先攒在 buffer 里不下发；确认这个候选"活了"（收到首个 content/thinking）才一次性放行给下游。
+    失败则整个缓冲丢弃，下游完全不感知这次尝试。
+
     首包超时机制（对齐 Java 的 awaitFirstPacket）：
         通过 asyncio.Event 实现：首包到达时 set()，await_first_packet(timeout)
         在超时内等待该事件；超时则返回 TIMEOUT 结果，由调用方取消任务并切换候选。
@@ -75,10 +79,10 @@ class ProbeStreamBridge(BaseStreamCallback):
     """
 
     def __init__(self, downstream: StreamCallback) -> None:
-        self._downstream = downstream
-        self._buffer: List = []
-        self._committed = False
-        self.succeeded = False
+        self._downstream = downstream #下游数据出口
+        self._buffer: List = []  #缓冲区，用于存储首包前的回调动作
+        self._committed = False  # ★模式开关：还缓冲 / 已直通
+        self.succeeded = False   #首包是否到达
         self.result: ProbeResult = ProbeResult.NO_CONTENT
         self.error: Optional[BaseException] = None
         self._first_packet_event = asyncio.Event()
@@ -86,14 +90,18 @@ class ProbeStreamBridge(BaseStreamCallback):
     # ---- 缓冲/提交 ----
 
     async def _emit(self, action) -> None:
-        """未提交则缓冲，已提交则立即执行。"""
+        """未提交则缓冲，已提交则立即执行。
+        全类唯一读 _committed 的地方，也是全类唯一写 _buffer 的地方。
+        on_start / on_reply_to_message_id / on_sources / on_grounding_chunks 这 4 个"载荷事件"全部转发到这里，
+        其余方法不碰缓冲。
+        """
         if self._committed:
             await action()
         else:
             self._buffer.append(action)
 
     async def _commit(self) -> None:
-        """提交缓冲（首包到达时），按序执行缓冲动作。"""
+        """提交缓冲（首包到达时），按序执行缓冲动作。把暂存的变成已发生的"""
         if self._committed:
             return
         self._committed = True
@@ -208,6 +216,7 @@ class LLMService(ABC):
         request: ChatRequest,
         tier: Optional[Tier] = None,
         preferred_model_id: Optional[str] = None,
+        allow_fallback: bool = True,
     ) -> str:
         """
         同步调用（对应 Java 的三个 chat 重载，Python 以默认参数折叠）。
@@ -215,7 +224,16 @@ class LLMService(ABC):
         Args:
             request: 包含完整配置的请求对象。
             tier: 显式档位覆盖（如 Tier.FAST）；None 走默认/深度思考档。
-            preferred_model_id: 优先模型 id；空则走档位候选。
+            preferred_model_id: 优先使用 preferredModelId 指定的模型。
+            allow_fallback: 指定 preferred_model_id 失败后是否回退到档位其余候选。
+                True（默认，对齐 Java preferred 语义）：preferred 置首 + 其余候选追加。
+                   注意：默认路径下未登记/不健康的 preferred 由 selector 静默忽略
+                   并回退档位候选（既有语义）；失败计入 health_store，全候选失败
+                   抛 RoutingExecutionError（cause 保留原异常）。
+                False：仅使用 preferred，失败即抛（_only_preferred 校验，对齐
+                   embedding/rerank 指定模型不降级语义）；异常不经 executor 直接
+                   冒出，不记熔断计数。
+                未指定 preferred_model_id 时本参数无意义（本来就多候选路由）。
 
         Returns:
             str: 模型返回的完整回答。
@@ -284,16 +302,25 @@ class RoutingLLMService(LLMService):
         request: ChatRequest,
         tier: Optional[Tier] = None,
         preferred_model_id: Optional[str] = None,
+        allow_fallback: bool = True,
     ) -> str:
-        """同步调用，经 selector 选候选 + executor 故障转移。"""
+        """同步调用，经 selector 选候选 + executor 故障转移。
+
+        allow_fallback 默认 True（preferred 失败回退档位其余候选，对齐 Java）；
+        传 False 时仅使用 preferred_model_id，失败即抛、不降级。
+        """
+        targets = self._selector.select_chat_candidates(
+            bool(request.thinking),
+            override=tier,
+            preferred_model_id=preferred_model_id,
+        )
+        if preferred_model_id and not allow_fallback:
+            # 显式禁用降级：仅保留指定模型（未解析到则 fail-fast）
+            targets = self._only_preferred(targets, preferred_model_id)
         return await self._executor.execute_with_fallback(
             ModelCapability.CHAT,
-            self._selector.select_chat_candidates(
-                bool(request.thinking),
-                override=tier,
-                preferred_model_id=preferred_model_id,
-            ),
-            lambda t: self._clients_by_provider.get(t.candidate.provider),
+            targets,
+            lambda t: self._clients_by_provider.get(t.candidate.provider),#客户端不是从候选里“拿”出来的——候选（`ModelTarget` ）只携带`candidate.provider` 字符串（纯配置层信息），客户端实例是启动时由 _build_registry 按 provider 建的`Dict[str, BaseChatClient]` 。所以那行 lambda 本质就是一次字典查找
             lambda client, t: client.chat(request, t),
         )
 
@@ -317,12 +344,13 @@ class RoutingLLMService(LLMService):
         首包超时预算取 target.timeout_ms（对齐 Java firstPacketBudgetMs = target.timeoutMs()）。
         中间候选的失败不会上报下游（由 ProbeStreamBridge 丢弃缓冲）。
         """
-        
+        #利用selector从候选集选择大模型列表
         targets = self._selector.select_chat_candidates(bool(request.thinking))
         if not targets:
             raise RoutingExecutionError("No Chat model candidates available")
 
         last_error: Optional[BaseException] = None
+        #遍历候选集的大模型
         for target in targets:
             client = self._clients_by_provider.get(target.candidate.provider)
             if client is None:
@@ -335,8 +363,9 @@ class RoutingLLMService(LLMService):
             permit = self._health_store.allow_call(target.id)
             if permit is None:
                 continue  # 熔断中（执行期双保险），跳过该候选
-
+            #创建首包闸门
             bridge = ProbeStreamBridge(callback)
+            #定义等待首包超时时间
             first_packet_budget_s = (
                 target.timeout_ms / 1000 if target.timeout_ms else None
             )
@@ -373,9 +402,18 @@ class RoutingLLMService(LLMService):
                 # 首包后出错（bridge.on_error 已转发下游）
                 self._health_store.mark_failure(target.id)
                 last_error = bridge.error or last_error
+                # 结构化降级日志（doc 11.3），字段与 RoutingExecutor 对齐
                 logger.warning(
                     "Chat stream failed after first packet. modelId=%s, provider=%s, result=%s",
                     target.id, target.candidate.provider, bridge.result.value,
+                    extra={
+                        "capability": ModelCapability.CHAT.display_name,
+                        "failed_model_id": target.id,
+                        "failed_provider": target.candidate.provider,
+                        "result": bridge.result.value,
+                        "error_type": type(bridge.error).__name__ if bridge.error else None,
+                        "error_message": str(bridge.error) if bridge.error else None,
+                    },
                 )
                 continue
             # 路径 B：超时/错误/无内容 → 强制取消后台任务 切换下一候选
@@ -388,9 +426,18 @@ class RoutingLLMService(LLMService):
 
             self._health_store.mark_failure(target.id)
             last_error = bridge.error or last_error
+            # 结构化降级日志（doc 11.3），字段与 RoutingExecutor 对齐
             logger.warning(
                 "Chat stream failed, fallback to next. modelId=%s, provider=%s, result=%s",
                 target.id, target.candidate.provider, bridge.result.value,
+                extra={
+                    "capability": ModelCapability.CHAT.display_name,
+                    "failed_model_id": target.id,
+                    "failed_provider": target.candidate.provider,
+                    "result": bridge.result.value,
+                    "error_type": type(bridge.error).__name__ if bridge.error else None,
+                    "error_message": str(bridge.error) if bridge.error else None,
+                },
             )
 
         error = RoutingExecutionError(
@@ -441,7 +488,8 @@ class RoutingLLMService(LLMService):
         # 3. 路由到具体客户端
         client = self._get_client(provider)
         return await client.chat(request, target)
-
+    
+    # ==================== 便捷流式输出直连（按 provider / model 定位） ====================
     async def stream_chat_direct(
         self,
         messages: List[Message],
@@ -479,6 +527,26 @@ class RoutingLLMService(LLMService):
         await client.stream_chat(request, callback, target)
 
     # ==================== 私有辅助方法 ====================
+
+    @staticmethod
+    def _only_preferred(
+        targets: List[ModelTarget],
+        preferred_model_id: str,
+    ) -> List[ModelTarget]:
+        """仅保留指定模型（allow_fallback=False 时的候选列表）。
+
+        未在候选列表中解析到指定模型（未登记 / 熔断中 / 未启用 / Provider 缺失）
+        → RoutingExecutionError fail-fast：显式指定 + 不可用 = 明确失败，而非
+        静默回退档位候选。
+
+        注意：仅 chat 的 allow_fallback=False 路径走此校验；默认路径
+        （allow_fallback=True）不走——selector 对未登记/不健康的 preferred
+        静默忽略并回退档位候选（既有语义，见 selector 的 warning 分支）。
+        """
+        preferred = next((t for t in targets if t.id == preferred_model_id), None)
+        if preferred is None:
+            raise RoutingExecutionError(f"Chat 模型不可用: {preferred_model_id}")
+        return [preferred]
 
     def _get_client(self, provider: str) -> BaseChatClient:
         if provider not in self._clients_by_provider:

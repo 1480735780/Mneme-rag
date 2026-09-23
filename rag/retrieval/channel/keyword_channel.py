@@ -70,7 +70,7 @@ class KeywordSearchChannel(SearchChannel):
             if not collections:
                 logger.info("关键词检索未解析到目标知识库，跳过")
                 return self.empty_result(int((time.monotonic() - start) * 1000))
-
+            #真检索关键词
             question = context.get_main_question()
             quota = ScopeQuota.split(scope, context.budget.recall_budget, self._supplement_ratio)
 

@@ -14,14 +14,15 @@ common 不包含任何业务逻辑，只提供被各层复用的横向能力：
 
 | 目录/文件 | 说明 | 状态 |
 |-----------|------|------|
-| `exception/model_client_exception.py` | 模型客户端异常（对应 ragent `ModelClientException` + `ModelClientErrorType`，覆盖网络/鉴权/HTTP 4xx/5xx/解析错误） | 🚧 占位待实现 |
-| `response/` | 统一响应结构（对应 ragent `Result.java`） | 🚧 占位待实现 |
-| `middleware/` | 中间件：请求日志、鉴权、限流等（详见 [middleware/README.md](middleware/README.md)） | 🚧 占位待实现 |
-| `logging/` | 日志初始化与格式化（建议统一 `logging` 配置，避免各处 `print`） | 🚧 占位待实现 |
-| `tracing/` | 链路追踪（对应 ragent `RagTraceNode` / `RagStreamTraceSupport`） | 🚧 占位待实现 |
-| `security/` | 安全能力（密钥管理、鉴权等） | 🚧 占位待实现 |
+| `exception/model_client_exception.py` | 模型客户端异常（对应 ragent `ModelClientException` + `ModelClientErrorType`，覆盖网络/鉴权/HTTP 4xx/5xx/解析错误） | ✅ 已实现（含 errorcode.py 错误码枚举 + WebExceptionHandler 统一映射） |
+| `response/` | 统一响应结构（对应 ragent `Result.java`） | ✅ 已实现（result.py：`Result` + `Results`，code="0" 成功约定，request_id 追踪） |
+| `middleware/` | 中间件：请求日志、鉴权、限流等 | ✅ 鉴权已实现（UserContextMiddleware）+ **请求日志已实现（RequestLogMiddleware，2026-09-16）**；限流承载于 `rag/service/ratelimit/` 与 `knowledge/filter/upload_rate_limiter.py`（429） |
+| `logging/` | 日志初始化与格式化（建议统一 `logging` 配置，避免各处 `print`） | ✅ 已实现（2026-09-16：`setup_logging`/`get_logger`，RAGENT_LOG_LEVEL 控制级别，格式对齐 Spring 默认 pattern；`callback.py` 残留 `print` 已迁移 `logging`） |
+| `tracing/` | 链路追踪（对应 ragent `RagTraceNode` / `RagStreamTraceSupport`） | 🟡 本目录为空壳；职责承载于 `rag/dao/trace_dao.py` + `rag/service/trace_service.py`（RagTraceRun/Node 全链路，`engine.py` 注明「@RagTraceNode 延后上线」） |
+| `security/` | 安全能力（密钥管理、鉴权等） | ✅ 已销案（见本包 `__init__.py` docstring，P7 D7 归并）：认证→`user.security.require_role`，上下文→middleware+context，密钥→ai.yaml `ProviderConfig.resolve_api_key` |
 
-> 🚧 = 文件结构已就绪，待编写实现
+> ✅ = 已实现 / 🟡 = 部分实现或职责别处承载 / ⛔ = 尚未实现
+> ⚠️ 下表原为早期规划占位清单（「🚧 占位待实现」），实际开发已随项目落地，2026-09-16 据实修正。
 
 ## 与其他模块的关系
 

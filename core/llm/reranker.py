@@ -49,6 +49,7 @@ class RerankService(ABC):
         candidates: List[RetrievedChunk],
         top_n: int,
         model_id: Optional[str] = None,
+        allow_fallback: bool = False,
     ) -> List[RetrievedChunk]:
         """
         对检索候选按 query 相关度重排序（对应 Java rerank）。
@@ -58,6 +59,15 @@ class RerankService(ABC):
             candidates: 待排序的候选文档片段列表。
             top_n: 返回前 N 个最相关的结果。
             model_id: 指定模型 id；None 走默认 rerank 候选路由。
+            allow_fallback: 指定 model_id 失败后是否降级到其余候选。
+                False（默认）：不降级，失败即抛（对齐 Java 指定模型语义）；
+                   客户端异常不经 executor 直接冒出，不记熔断计数。
+                True：指定模型置首 + 默认候选追加，经 RoutingExecutor 故障转移；
+                   失败计入 health_store，全候选失败抛 RoutingExecutionError
+                   （cause 保留原异常）。注意只覆盖"调用失败"：指定模型选择期
+                   不可用（未登记 / 熔断中 / 未启用 / Provider 缺失）时仍
+                   fail-fast，不降级。
+                model_id 为 None 时本参数无意义（本来就多候选路由）。
 
         Returns:
             List[RetrievedChunk]: 重排序后的文档片段列表，按相关性从高到低排序。
@@ -97,21 +107,36 @@ class RoutingRerankService(RerankService):
         candidates: List[RetrievedChunk],
         top_n: int,
         model_id: Optional[str] = None,
+        allow_fallback: bool = False,
     ) -> List[RetrievedChunk]:
-        if model_id:
+        if model_id and not allow_fallback:
             # 指定模型：不做降级（对齐 Java rerank 指定模型）
             target = self._resolve_target(model_id)
             client = self._resolve_client(target)
             return await client.rerank(query, candidates, top_n, target)
-        # 默认：多候选 + 故障转移
+        # 默认 / 显式降级：多候选 + 故障转移
         return await self._executor.execute_with_fallback(
             ModelCapability.RERANK,
-            self._selector.select_rerank_candidates(),
+            self._fallback_targets(model_id),
             self._resolve_client,
             lambda client, target: client.rerank(query, candidates, top_n, target),
         )
 
     # ==================== 辅助 ====================
+
+    def _fallback_targets(self, model_id: Optional[str]) -> List[ModelTarget]:
+        """降级候选列表：指定模型置首 + 默认候选追加（去重）。
+
+        指定模型必须先经 _resolve_target 校验：选择期不可用（未登记 / 熔断中 /
+        未启用 / Provider 配置缺失）→ RoutingExecutionError。allow_fallback 只覆盖
+        "调用失败"后的降级，选择期不可用一律 fail-fast（与不降级路径语义一致：
+        显式指定 + 不可用 = 明确失败），不静默换模型。
+        """
+        targets = self._selector.select_rerank_candidates()
+        if model_id:
+            preferred = self._resolve_target(model_id)
+            targets = [preferred] + [t for t in targets if t.id != preferred.id]
+        return targets
 
     def _resolve_client(self, target: ModelTarget) -> Optional[BaseRerankClient]:
         return self._clients_by_provider.get(target.candidate.provider)

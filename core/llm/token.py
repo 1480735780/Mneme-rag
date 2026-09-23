@@ -3,8 +3,7 @@
 core.llm.token - Token 统计服务（对应 ragent 的 infra/token 包）
 
 本模块定义 Token 统计能力，与 embedding/rerank/vlm 等能力层同属 core/llm 顶层，
-但它是**横向能力**：不调用模型 API，纯本地字符计算，被多个层复用（如入库落库
-记录 tokenCount、embedding 按 token 预算分片等）。
+但它是横向能力：不调用模型 API，纯本地字符计算，被多个层复用（如入库落库记录 tokenCount、embedding 按 token 预算分片等）。
 
 架构对应关系：
     Ragent (Java)                                   Mneme-rag (Python)

@@ -54,13 +54,27 @@ class EmbeddingService(ABC):
     """
 
     @abstractmethod
-    async def embed(self, text: str, model_id: Optional[str] = None) -> List[float]:
+    async def embed(
+        self,
+        text: str,
+        model_id: Optional[str] = None,
+        allow_fallback: bool = False,
+    ) -> List[float]:
         """
         对单个文本进行向量化（对应 Java embed / embed(text, modelId)）。
         因为java支持函数重载而python是一个动态性的语言，如果重载会出现后面函数覆盖前面函数。
         Args:
             text: 待向量化文本。
             model_id: 指定模型 id；None 走默认 embedding 候选路由。
+            allow_fallback: 指定 model_id 失败后是否降级到其余候选。
+                False（默认）：不降级，失败即抛（对齐 Java embed(text, modelId)）；
+                   客户端异常不经 executor 直接冒出，不记熔断计数。
+                True：指定模型置首 + 默认候选追加，经 RoutingExecutor 故障转移
+                   （对齐 Java selectEmbeddingCandidates() 路径）；失败计入
+                   health_store，全候选失败抛 RoutingExecutionError（cause 保留原异常）。
+                   注意只覆盖"调用失败"：指定模型选择期不可用（未登记 / 熔断中 /
+                   未启用 / Provider 缺失）时仍 fail-fast，不降级。
+                model_id 为 None 时本参数无意义（本来就多候选路由）。
 
         Returns:
             List[float]: 文本对应的向量（长度固定）。
@@ -72,6 +86,7 @@ class EmbeddingService(ABC):
         self,
         texts: List[str],
         model_id: Optional[str] = None,
+        allow_fallback: bool = False,
     ) -> List[List[float]]:
         """
         对多个文本进行批量向量化（对应 Java embedBatch / embedBatch(texts, modelId)）。
@@ -79,6 +94,7 @@ class EmbeddingService(ABC):
         Args:
             texts: 待向量化文本列表。
             model_id: 指定模型 id；None 走默认 embedding 候选路由。
+            allow_fallback: 同 embed（含熔断计数与异常类型差异说明）。
 
         Returns:
             List[List[float]]: 向量列表，顺序与输入一致。
@@ -122,20 +138,21 @@ class RoutingEmbeddingService(EmbeddingService):
 
     # ==================== 单文本 ====================
 
-    async def embed(self, text: str, model_id: Optional[str] = None) -> List[float]:
-        if model_id:
+    async def embed(
+        self,
+        text: str,
+        model_id: Optional[str] = None,
+        allow_fallback: bool = False,
+    ) -> List[float]:
+        if model_id and not allow_fallback:
             # 指定模型：不做降级（对齐 Java embed(text, modelId)）
             target = self._resolve_target(model_id)
             client = self._resolve_client(target)
             return await client.embed(text, target)
+        # 降级：指定模型置首 + 默认候选追加（去重），失败切换下一候选
         return await self._executor.execute_with_fallback(
-            #作用：告诉 execute_with_fallback 当前调用的LLM是什么类型。这个值主要用于：
-            #- 日志记录：区分 Chat、Embedding、Rerank 的失败日志
-            #- 错误消息：当所有候选失败时，报错信息会显示 "No EMBEDDING model candidates available"
             ModelCapability.EMBEDDING,
-            #作用：从配置中选出所有可用的 Embedding 模型候选列表，返回 List[ModelTarget]。
-            self._selector.select_embedding_candidates(),
-            #作用：这是一个函数引用，它的职责是：给定一个 ModelTarget，返回对应的 BaseEmbeddingClient 实例。
+            self._fallback_targets(model_id),
             self._resolve_client,
             lambda client, target: client.embed(text, target),
         )
@@ -146,14 +163,15 @@ class RoutingEmbeddingService(EmbeddingService):
         self,
         texts: List[str],
         model_id: Optional[str] = None,
+        allow_fallback: bool = False,
     ) -> List[List[float]]:
-        if model_id:
+        if model_id and not allow_fallback:
             target = self._resolve_target(model_id)
             client = self._resolve_client(target)
             return await client.embed_batch(texts, target)
         return await self._executor.execute_with_fallback(
             ModelCapability.EMBEDDING,
-            self._selector.select_embedding_candidates(),
+            self._fallback_targets(model_id),
             self._resolve_client,
             lambda client, target: client.embed_batch(texts, target),
         )
@@ -170,6 +188,52 @@ class RoutingEmbeddingService(EmbeddingService):
         return 0
 
     # ==================== 辅助方法 ====================
+
+    def _fallback_targets(self, model_id: Optional[str]) -> List[ModelTarget]:
+        """降级候选列表：指定模型置首 + 默认候选追加（去重 + 维度一致性过滤）。
+
+        指定模型必须先经 _resolve_target 校验：选择期不可用（未登记 / 熔断中 /
+        未启用 / Provider 配置缺失）→ RoutingExecutionError。allow_fallback 只覆盖
+        "调用失败"后的降级，选择期不可用一律 fail-fast（与不降级路径语义一致：
+        显式指定 + 不可用 = 明确失败），不静默换模型。
+
+        维度一致性守卫（doc 11.2）：指定模型声明了 dimension 时，追加候选仅保留
+        同维度者，防止降级到不同维度模型导致向量库索引/查询维度不匹配；
+        未声明（None）时无法校验，不过滤。默认路由（model_id=None）不在守卫
+        范围内（非降级场景，维度一致性由配置负责）。
+        """
+        targets = self._selector.select_embedding_candidates()
+        if model_id:
+            preferred = self._resolve_target(model_id)
+            targets = [preferred] + self._filter_by_dimension(
+                [t for t in targets if t.id != preferred.id],
+                preferred.candidate.dimension,
+            )
+        return targets
+
+    @staticmethod
+    def _filter_by_dimension(
+        targets: List[ModelTarget],
+        expected_dim: Optional[int],
+    ) -> List[ModelTarget]:
+        """按期望维度过滤降级候选（对应 doc 11.2，防止向量库损坏）。
+
+        expected_dim 为 None（指定模型未声明维度）时无法校验，原样返回；
+        否则仅保留声明维度与期望一致的候选，未声明或不一致的候选剔除并
+        逐个告警（向量完整性优先于候选可用性，剔除可见于日志而非静默）。
+        """
+        if expected_dim is None:
+            return targets
+        kept: List[ModelTarget] = []
+        for target in targets:
+            if target.candidate.dimension == expected_dim:
+                kept.append(target)
+            else:
+                logger.warning(
+                    "Embedding 降级候选维度不匹配，跳过: modelId=%s, dimension=%s, expected=%s",
+                    target.id, target.candidate.dimension, expected_dim,
+                )
+        return kept
 
     def _resolve_client(self, target: ModelTarget) -> Optional[BaseEmbeddingClient]:
         return self._clients_by_provider.get(target.candidate.provider)

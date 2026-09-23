@@ -76,7 +76,7 @@ class AppSettings:
         return cls(
             host=os.environ.get("RAGENT_HOST", "127.0.0.1"),
             port=int(os.environ.get("RAGENT_PORT", "8000")),
-            stack_profile=os.environ.get("RAGENT_STACK_PROFILE", "memory"),
+            stack_profile=os.environ.get("RAGENT_STACK_PROFILE", "memo· ry"),
             sse_timeout_ms=int(os.environ.get("RAGENT_SSE_TIMEOUT_MS", "0")),
             orchestration_mode=os.environ.get("RAGENT_ORCHESTRATION_MODE", "workflow"),
             rate_limit_backend=os.environ.get("RAGENT_RATE_LIMIT_BACKEND", "process"),

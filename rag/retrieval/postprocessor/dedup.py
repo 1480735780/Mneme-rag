@@ -29,6 +29,7 @@ class DeduplicationPostProcessor(SearchResultPostProcessor):
         return "Deduplication"
 
     def get_order(self) -> int:
+        """get_order() 返回的不是“重要性”，而是后处理链中的执行序号。"""
         return 1
 
     def is_enabled(self, context: SearchContext) -> bool:
@@ -45,8 +46,8 @@ class DeduplicationPostProcessor(SearchResultPostProcessor):
         # 去重阶段不依赖上游输出，直接消费多通道原始召回）
         seen_keys = set()
         deduped: List[RetrievedChunk] = []
-        for result in results:
-            for chunk in result.chunks:
+        for result in results: #遍历每个通道的召回结果
+            for chunk in result.chunks: #遍历这个通道的召回的chunk列表
                 key = retrieved_chunk_key(chunk)
                 if key not in seen_keys:
                     seen_keys.add(key)

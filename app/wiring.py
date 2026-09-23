@@ -1007,7 +1007,15 @@ class AppContainer:
             failure_threshold=int(getattr(selection, "failure_threshold", 2) or 2),
             open_duration_ms=int(getattr(selection, "open_duration_ms", 30000) or 30000),
         )
-        return RoutingEmbeddingService(ModelSelector(config, health_store), RoutingExecutor(health_store), clients)
+        return RoutingEmbeddingService(
+            ModelSelector(config, health_store),
+            RoutingExecutor(
+                health_store,
+                max_fallback=getattr(selection, "max_fallback", None),
+                transient_retries=int(getattr(selection, "transient_retries", 0) or 0),
+            ),
+            clients,
+        )
 
     def _build_llm(self) -> Any:
         """生产装配真实 LLM 路由栈（对应 Java LLM @Configuration）：ai.yaml + 熔断 + 按 provider 建 chat client
@@ -1033,7 +1041,11 @@ class AppContainer:
             open_duration_ms=int(getattr(selection, "open_duration_ms", 30000) or 30000),
         )
         selector = ModelSelector(config, health_store)
-        executor = RoutingExecutor(health_store)
+        executor = RoutingExecutor(
+            health_store,
+            max_fallback=getattr(selection, "max_fallback", None),
+            transient_retries=int(getattr(selection, "transient_retries", 0) or 0),
+        )
         return RoutingLLMService(selector, health_store, executor, clients, config)
 
     # ==================== 跨域共享实例（对齐 Java 单例 bean） ====================
@@ -1106,7 +1118,15 @@ class AppContainer:
             failure_threshold=int(getattr(selection, "failure_threshold", 2) or 2),
             open_duration_ms=int(getattr(selection, "open_duration_ms", 30000) or 30000),
         )
-        return RoutingRerankService(ModelSelector(config, health_store), RoutingExecutor(health_store), clients)
+        return RoutingRerankService(
+            ModelSelector(config, health_store),
+            RoutingExecutor(
+                health_store,
+                max_fallback=getattr(selection, "max_fallback", None),
+                transient_retries=int(getattr(selection, "transient_retries", 0) or 0),
+            ),
+            clients,
+        )
 
     def _get_shared_vector_store(self) -> Any:
         """容器级共享向量库（懒建一次）：knowledge 与 ingestion 共用，

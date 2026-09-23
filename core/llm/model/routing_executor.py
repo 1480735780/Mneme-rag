@@ -34,6 +34,10 @@ core.llm.model.routing_executor - 模型路由执行器（对应 ragent 的 Mode
 import logging
 from typing import Awaitable, Callable, List, Optional, TypeVar, Union
 
+from common.exception.model_client_exception import (
+    ModelClientErrorType,
+    ModelClientException,
+)
 from ..enums import ModelCapability
 from .health_store import ModelHealthStore
 from .model_target import ModelTarget
@@ -83,9 +87,28 @@ class RoutingExecutor:
         )
     """
 
-    def __init__(self, health_store: ModelHealthStore) -> None:
-        """注入健康状态存储（对应 Java 的 @RequiredArgsConstructor 构造注入）。"""
+    def __init__(
+        self,
+        health_store: ModelHealthStore,
+        max_fallback: Optional[int] = None,
+        transient_retries: int = 0,
+    ) -> None:
+        """注入健康状态存储与降级策略（对应 Java 的 @RequiredArgsConstructor 构造注入）。
+
+        Args:
+            health_store: 模型健康状态存储。
+            max_fallback: 单次调用最大降级次数（doc 11.4）；None=不限（现状）。
+                N 表示最多允许 N 次"真失败"（= N+1 个真尝试的候选），
+                被跳过的候选（client 缺失/熔断）不占预算；
+                超出后截断，RoutingExecutionError 消息注明 max_fallback。
+            transient_retries: 临时性故障（ModelClientException.NETWORK_ERROR）
+                的重试次数（doc 11.5）；0=不重试（现状）。重试期间不记
+                mark_failure、不发降级日志（健康反馈以候选为粒度）；
+                RATE_LIMITED（429）显式不重试——重试会加剧限流。
+        """
         self.health_store = health_store
+        self.max_fallback = max_fallback
+        self.transient_retries = max(0, transient_retries)
 
     async def execute_with_fallback(
         self,
@@ -115,7 +138,23 @@ class RoutingExecutor:
             raise RoutingExecutionError(f"No {capability_name} model candidates available")
 
         last_error: Optional[BaseException] = None
-        for target in targets:
+        failed_count = 0  # 已发生的真实失败次数（跳过的候选不计入）
+        truncated_by_max_fallback = False
+        for target_index, target in enumerate(targets):
+            if (
+                self.max_fallback is not None
+                and failed_count > self.max_fallback
+            ):
+                # 降级深度已用尽（doc 11.4）：剩余候选不尝试，避免延迟过高
+                truncated_by_max_fallback = True
+                logger.warning(
+                    "%s fallback depth reached (max_fallback=%d), %d candidate(s) skipped. "
+                    "lastModelId=%s",
+                    capability_name, self.max_fallback,
+                    len(targets) - target_index, target.id,
+                )
+                break
+
             client = client_resolver(target)
             if client is None:
                 logger.warning(
@@ -129,15 +168,29 @@ class RoutingExecutor:
                 continue  # 熔断中（执行期双保险），跳过该候选
 
             try:
-                response = await caller(client, target)
+                response = await self._call_with_transient_retry(
+                    caller, client, target, capability_name
+                )
             except Exception as e:
                 last_error = e
                 self.health_store.mark_failure(target.id)
+                # 结构化降级日志（doc 11.3）：extra 字段供日志后端按
+                # failed_provider / error_type 聚合降级频率与根因；
+                # fallback_count = 本次失败前已发生的降级次数（首个失败候选为 0）
                 logger.warning(
                     "%s model failed, fallback to next. modelId=%s, provider=%s",
                     capability_name, target.id, target.candidate.provider,
                     exc_info=e,
+                    extra={
+                        "capability": capability_name,
+                        "failed_model_id": target.id,
+                        "failed_provider": target.candidate.provider,
+                        "error_type": type(e).__name__,
+                        "error_message": str(e),
+                        "fallback_count": failed_count,
+                    },
                 )
+                failed_count += 1
                 continue
             else:
                 self.health_store.mark_success(target.id)
@@ -146,10 +199,67 @@ class RoutingExecutor:
                 # 幂等防御：mark_success/mark_failure 已复位时不会误释放
                 self.health_store.release_half_open_permit(permit)
 
+        if truncated_by_max_fallback:
+            raise RoutingExecutionError(
+                f"All attempted {capability_name} model candidates failed "
+                f"(stopped by max_fallback={self.max_fallback}): "
+                f"{last_error if last_error is not None else 'unknown'}",
+                cause=last_error,
+            )
         raise RoutingExecutionError(
             f"All {capability_name} model candidates failed: "
             f"{last_error if last_error is not None else 'unknown'}",
             cause=last_error,
+        )
+
+    # ==================== 临时性故障重试（doc 11.5） ====================
+
+    async def _call_with_transient_retry(
+        self,
+        caller: ModelCaller,
+        client,
+        target: ModelTarget,
+        capability_name: str,
+    ):
+        """带临时性故障重试的单候选调用；耗尽后抛最后一次异常（交由降级路径）。
+
+        重试仅针对 NETWORK_ERROR（网络抖动幂等，doc 11.5 建议）；
+        RATE_LIMITED / 其他 ModelClientException / 未知异常直接抛出。
+        重试期间不 mark_failure / 不发降级日志——健康反馈以候选为粒度，
+        重试成功则该候选零失败记录。
+        """
+        attempt = 0
+        while True:
+            try:
+                return await caller(client, target)
+            except Exception as e:
+                if attempt >= self.transient_retries or not self._is_transient(e):
+                    raise
+                attempt += 1
+                # 重试可观测（对齐 11.3 结构化风格）：retry_attempt 从 1 起
+                logger.warning(
+                    "%s transient error, retrying. modelId=%s, provider=%s",
+                    capability_name, target.id, target.candidate.provider,
+                    exc_info=e,
+                    extra={
+                        "capability": capability_name,
+                        "retry_model_id": target.id,
+                        "retry_provider": target.candidate.provider,
+                        "error_type": type(e).__name__,
+                        "retry_attempt": attempt,
+                    },
+                )
+
+    @staticmethod
+    def _is_transient(error: BaseException) -> bool:
+        """是否可重试的临时性故障：仅 NETWORK_ERROR。
+
+        RATE_LIMITED（429）有意排除：限流场景重试会加剧限流（doc 11.5 风险）；
+        SERVER_ERROR 等其余类型失败原因不可幂等假定，直接降级。
+        """
+        return (
+            isinstance(error, ModelClientException)
+            and error.error_type == ModelClientErrorType.NETWORK_ERROR
         )
 
     @staticmethod

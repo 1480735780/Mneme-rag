@@ -11,6 +11,10 @@ import uvicorn
 
 from app.config import AppSettings
 from app.factory import create_app
+from common.logging import setup_logging
+
+# 统一日志初始化（根 logger 配置；RAGENT_LOG_LEVEL 可覆盖级别）
+setup_logging()
 
 app = create_app()
 

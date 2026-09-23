@@ -150,11 +150,13 @@ class ModelGroup:
 class SelectionConfig:
     """
     模型选择策略配置（对应 Java 的 Selection）
-    
+
     故障转移和熔断策略，用于高可用场景。
     """
     failure_threshold: int = 2          # 失败阈值，超过后触发熔断
     open_duration_ms: int = 30000       # 熔断器打开持续时间（毫秒）
+    max_fallback: Optional[int] = None  # 单次调用最大降级次数（doc 11.4）；None=不限（现状）
+    transient_retries: int = 0          # 临时性故障（NETWORK_ERROR）重试次数（doc 11.5）；0=不重试（现状）
 
 @dataclass
 class StreamConfig:
@@ -211,12 +213,23 @@ def load_config_from_dict(data: Dict[str, Any]) -> AIModelConfig:
     def parse_model_group(group_data: Dict[str, Any]) -> ModelGroup:
         candidates = []
         for cand in group_data.get("candidates", []):
+            # dimension 强转 int 并 fail-fast（如 "768" 字符串配置）：
+            # 维度守卫的 == 比较、向量库建集合都依赖 int 类型，
+            # 字符串混入会在降级过滤/建集合处产生难排查的静默错配
+            dim = cand.get("dimension")
+            if dim is not None and not isinstance(dim, int):
+                try:
+                    dim = int(dim)
+                except (TypeError, ValueError) as e:
+                    raise ValueError(
+                        f"模型 {cand.get('id', '<unnamed>')} 的 dimension 配置非法: {dim!r}"
+                    ) from e
             candidates.append(ModelCandidate(
                 id=cand.get("id", ""),
                 provider=cand.get("provider", ""),
                 model=cand.get("model", ""),
                 url=cand.get("url"),
-                dimension=cand.get("dimension"),
+                dimension=dim,
                 priority=cand.get("priority", 100),
                 enabled=cand.get("enabled", True),
                 supports_thinking=cand.get("supports_thinking", False)
@@ -244,7 +257,9 @@ def load_config_from_dict(data: Dict[str, Any]) -> AIModelConfig:
     sel_data = ai_data.get("selection", {})
     selection = SelectionConfig(
         failure_threshold=sel_data.get("failure_threshold", 2),
-        open_duration_ms=sel_data.get("open_duration_ms", 30000)
+        open_duration_ms=sel_data.get("open_duration_ms", 30000),
+        max_fallback=sel_data.get("max_fallback"),
+        transient_retries=sel_data.get("transient_retries", 0),
     )
     
     # 解析 stream

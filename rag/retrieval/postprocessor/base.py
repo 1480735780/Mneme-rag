@@ -47,7 +47,7 @@ class SearchResultPostProcessor(ABC):
     def get_order(self) -> int:
         """
         处理器优先级（数字越小越先执行）
-
+        get_order() 返回的不是“重要性”，而是后处理链中的执行序号。
         Returns:
             int: 排序权重
         """

@@ -68,8 +68,8 @@ class SourceRef:
     回答来源引用（文档级），对应 Java 的 SourceRef
     
     由检索片段按文档去重、赋号后得到，用于：
-        - SSE 下发
-        - 消息落库
+        - SSE 下发:前端【现在】显示来源面板   （实时）
+        - 消息落库:存入数据库，以后还能查来源   （持久）
         - 前端来源面板与预览
     
     与 GroundingChunk 职责分离：
@@ -148,7 +148,7 @@ class Message:
     thinking_duration: Optional[int] = None   #深度思考耗时（秒，仅 ASSISTANT 角色可能携带）
     sources: List[SourceRef] = field(default_factory=list) #回答来源（文档级来源列表，仅 ASSISTANT 角色可能携带）
     retrieved_chunks: List[GroundingChunk] = field(default_factory=list)    #推荐问题 grounding 片段（仅 ASSISTANT 角色可能携带，随消息落库供推荐追问生成 grounding，不参与模型上下文）
-    reply_to_message_id: Optional[str] = None  #当前助手消息对应的用户消息 ID
+    reply_to_message_id: Optional[str] = None  #当前AI消息对应的用户消息 ID
     message_status: MessageStatus = MessageStatus.NORMAL   #消息结束状态
 
     #创建一条系统消息方法
@@ -207,8 +207,8 @@ class ChatRequest:
     
     messages:List[Message]
     temperature: Optional[float] = 0.7
-    topP: Optional[float] = None        # 对应 Java 的 topP
-    topK: Optional[int] = None          # 对应 Java 的 topK
+    topP: Optional[float] = None        # 核采样阈值，每一步生成 token 时，只从累计概率达到 top_p 的最小候选集合中进行采样。
+    topK: Optional[int] = None          # 模型会从所有候选词中选择前 k 个概率最高的，作为下一个候选词。
     maxTokens: Optional[int] = 2048     # 限制模型本次回答最多生成的 token 数量,可用于控制回复长度与成本；若为 {@code null}，则走模型或服务端默认配置
     thinking: Optional[bool] = False    #可选：是否启用「思考模式」开关
     enableTools: Optional[bool] = False # 可选：是否启用工具调用（Tool Calling / Function Calling）

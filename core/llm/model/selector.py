@@ -176,7 +176,18 @@ class ModelSelector:
             preferred_model_id: 优先模型 id（可为空）。
             require_thinking: 是否要求候选支持思考链。
         """
+        # 构建模型注册表，模型 ID → 模型配置，用于快速查找模型信息
+       #  registry = {
+       #    "qwen-max": ModelCandidate(...),
+       #    "qwen-plus": ModelCandidate(...),
+       #    "qwen-turbo": ModelCandidate(...),
+       # }
         registry = self._build_registry(group.candidates)
+
+        #组装 ordered_ids。
+        #它在做两件事：
+        #1. 如果有 preferred_model_id，先把它放到队首。
+        #2. 把当前档位中的候选依次追加，并去重。
 
         ordered_ids: List[str] = []
         if preferred_model_id and preferred_model_id.strip():
@@ -207,6 +218,7 @@ class ModelSelector:
 
         providers = self._properties.providers
         targets: List[ModelTarget] = []
+        # 有序遍历候选，过滤未启用 / 不支持思考 / 不健康 / 未登记的候选
         for model_id in ordered_ids:
             candidate = registry.get(model_id)
             if candidate is None:

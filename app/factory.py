@@ -22,7 +22,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import AppSettings
 from app.wiring import AppContainer
-from common.middleware import UserContextMiddleware
+from common.logging import setup_logging
+from common.middleware import RequestLogMiddleware, UserContextMiddleware
 from common.response.result import Results
 from common.web import register_exception_handlers
 from common.web.serializer import result_to_dict
@@ -97,6 +98,8 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
         allow_credentials=True,
         max_age=3600,
     )
+    # 请求访问日志：最后 add = 中间件链最外层（包住 CORS 之外全部，含静态/健康探活）
+    app.add_middleware(RequestLogMiddleware)
 
     # 全局异常处理器（D0.8）：参数校验 / AbstractException / 兜底
     register_exception_handlers(app)

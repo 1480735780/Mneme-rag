@@ -142,7 +142,7 @@
 | `chat/SiliconFlowChatClient.java` | `core/llm/providers/siliconflow.py` | ✅ P0：继承 OpenAIStyleChatClient，wiring 已装配。 |
 | `chat/StreamAsyncExecutor.java` | asyncio task/scheduler | ⛔ asyncio 原生替代，无需线程池执行器。 |
 | `chat/StreamCallback.java` | `core/llm/callback.py` | ✅ |
-| `chat/StreamCancellationHandle.java` | `asyncio.Task` + `rag/service/stream/task_manager.py` | ✅ 语义等价；`core/llm/cancellation_handle.py` 是空文件。 |
+| `chat/StreamCancellationHandle.java` | `asyncio.Task` + `rag/service/stream/task_manager.py` | ✅ 语义等价；`core/llm/cancellation_handle.py` 空占位已于 2026-09-16 删除。 |
 | `chat/StreamCancellationHandles.java` | `rag/service/stream/task_manager.py` | ✅ |
 | `chat/StreamSpanCallback.java` | `_TraceAwareCallback` + `ForwardingStreamCallback` | ✅ Trace 收尾语义合并实现。 |
 | `config/AIModelProperties.java` | `core/llm/config/config.py`、`ai.yaml` | ✅ |

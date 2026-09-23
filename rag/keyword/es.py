@@ -347,6 +347,7 @@ class EsKeywordRetrieverService(KeywordRetrieverService):
     async def search(
         self, query: str, collection_names: List[str], top_k: int
     ) -> List[RetrievedChunk]:
+        #构建 ES 查询体（match 打 BM25 + filter 限定范围）
         body: Dict[str, Any] = {
             "size": top_k,
             "query": {"bool": {"must": [{"match": {"content": query}}]}},
@@ -374,6 +375,7 @@ class EsKeywordRetrieverService(KeywordRetrieverService):
                 continue
             source = hit.get("_source") or {}
             content = source.get("content") or ""
+            #ES 返回 → 客户端取 _score 排序
             score = hit.get("_score")
             chunks.append(
                 RetrievedChunk(

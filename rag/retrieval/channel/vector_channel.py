@@ -68,11 +68,14 @@ class VectorSearchChannel(SearchChannel):
     async def search(self, context: SearchContext) -> SearchChannelResult:
         start = time.monotonic()
         try:
-            scope = context.retrieval_scope
+            #获取检索作用域
+            scope = context.retrieval_scope  
+            #作用域是定向的
             if scope is not None and scope.directed:
                 chunks = await self._retrieve_directed(context, scope)
                 metadata = {"scope": "directed", "top_score": scope.top_score}
             else:
+            #作用域是全局的
                 chunks = await self._retrieve_global(context, scope)
                 metadata = {"scope": "global", "top_score": scope.top_score if scope else 0.0}
 
