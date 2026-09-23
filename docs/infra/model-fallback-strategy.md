@@ -9,7 +9,7 @@
 > - 默认路由流式：逐候选探测 + 首包超时切换，**已实现**（RoutingLLMService.stream_chat + ProbeStreamBridge，机制详解见第 12 节）。
 > - 指定模型：默认失败即抛、**不降级**（对齐 Java 语义）；可显式传 `allow_fallback=True` 开启降级（P1，**已实现**，见 11.1），降级路径带**维度一致性守卫**（P2，**已实现**，见 11.2）。
 > - 降级日志：三条降级路径均已**结构化**（P2，**已实现**，见 11.3）。
-> - 降级深度限制与临时性故障重试（P3，**已实现**，见 11.4 / 11.5）：`selection.max_fallback` / `selection.transient_retries`（ai.yaml），默认不限深、不重试（现状）；重试仅同步路径且仅 NETWORK_ERROR。
+> - 降级深度限制与临时性故障重试（P3，**已实现**，见 11.4 / 11.5）：`selection.max_fallback` / `selection.transient_retries`（ai.yaml），默认不限深、不重试（现状）；重试仅针对 NETWORK_ERROR。
 > - 本文档描述的"指定模型失败后自动降级 + 用户通知"中，infra 侧全部落地；用户通知与选项仍**需业务层配合**。
 
 ---
@@ -276,12 +276,10 @@ if expected_dim is None:
 - **可重试集合收窄为仅 `NETWORK_ERROR`**（doc 建议采纳）：网络抖动幂等自愈；`RATE_LIMITED`（429）**有意排除**——限流场景重试会加剧限流；其余类型（SERVER_ERROR 等）失败原因不可幂等假定，直接降级。非 `ModelClientException`（代码缺陷类）不重试。
 - 健康反馈以**候选为粒度**：重试期间不 `mark_failure`、不发降级日志；重试成功则该候选**零失败记录**；重试耗尽才记 1 次失败并降级。`fallback_count` 不把重试计入降级次数。
 - 重试可观测：每次重试发结构化 warning（`retry_attempt` 从 1 起，对齐 11.3 风格）。
-- **边界：流式路径（stream_chat）有意不接入重试**——重试在后台 task 维度无法干净叠加（cancel 后重建 task），且直接与首包超时预算冲突（见 12.6 / 12.7 原风险分析）。流式候选失败仍直接切换。
 
 测试：`tests/test_model_fallback_p3_unit.py::TestTransientRetry`（5 例：重试成功零失败记录 / 耗尽降级一次 + fallback_count 不含重试 / 429 不重试 / 未知异常不重试 / 默认 0 现状锁定）+ `TestSelectionConfig`（2 例：默认值现状 + yaml 解析）。
 
 **原风险条款的处置**：
-- ~~重试增加延迟，可能与首包超时机制冲突~~ → 流式路径不接入重试（上述边界）。
 - ~~429 限流场景下重试可能加剧限流~~ → 429 显式排除出可重试集合。
 - ~~需与 `target.timeout_ms` 预算协调~~ → 同步路径的 caller 内部自带 HTTP 超时，延迟上界可控。
 
@@ -295,7 +293,7 @@ if expected_dim is None:
 | P2 | 维度一致性校验 | `RoutingEmbeddingService` | 防止向量库损坏 | ✅ 已实现（11.2） |
 | P2 | 结构化降级日志 | `RoutingExecutor` + `stream_chat` | 可观测性 | ✅ 已实现（11.3） |
 | P3 | 降级深度限制 | `RoutingExecutor`（构造参数 + selection.max_fallback） | 防止延迟过高 | ✅ 已实现（11.4） |
-| P3 | 临时性故障重试 | `RoutingExecutor`（构造参数 + selection.transient_retries，仅同步路径） | 减少不必要降级 | ✅ 已实现（11.5） |
+| P3 | 临时性故障重试 | `RoutingExecutor`（构造参数 + selection.transient_retries） | 减少不必要降级 | ✅ 已实现（11.5） |
 
 > 全部 5 项 infra 优化（P1-P3）均已实现，默认值均与实现前行为一致（零配置零影响）；
 > 开启方式见 ai.yaml `selection` 段（`max_fallback` / `transient_retries`）。
@@ -425,6 +423,5 @@ event.set()   ×1   （成功路径由 _mark_success 触发；失败路径由 on
 
 ### 12.7 与第 11 节优化项的关联
 
-- **11.5（临时性故障重试，已实现）**：重试**仅接入同步路径**（executor），流式路径有意排除——候选的首包预算在 L364-366 按候选独立计算，后台 task 维度的重试会与 `timeout_ms` 预算直接冲突（cancel 后重建 task 也无法干净叠加）。流式候选失败仍直接切换，这是边界决策而非遗漏（见 11.5）。
-- **11.4（降级深度限制，已实现）**：仅作用于同步路径（executor 构造参数）；`stream_chat` 的候选循环未接 `max_fallback`——chat 档位候选一般 2-4 个，深度限制收益有限，如需覆盖可在 stream_chat 加同名参数透传（扩展点）。
+- **11.4（降级深度限制，已实现）**：`stream_chat` 的候选循环未接 `max_fallback`——chat 档位候选一般 2-4 个，深度限制收益有限，如需覆盖可在 stream_chat 加同名参数透传（扩展点）。
 - **11.3（结构化降级日志，已实现）**：流式路径的降级日志已带结构化字段；仍**建议补充分档 TTFT 统计**（`thinking=True/False`）——两档开闸点不同（见 12.6），TTFT 分布差异巨大，统一阈值会把其中一档误判为慢候选。此为遗留增强项。
