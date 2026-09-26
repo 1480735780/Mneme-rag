@@ -394,8 +394,10 @@ class ChunkData:
         chunk_id:       块唯一标识
         index:          块在文档中的序号，从 0 开始
         content:        文档原貌（markdown），回填 LLM 上下文与前端预览用
-        embedding_text: 向量文本（章节路径 + 正文），不参与展示
+        embedding_text: 用什么文本去做向量化（章节路径 + 正文），不参与展示
         metadata:       块元数据
+
+    content与embedding_text的区别：content 保留文档原貌；而 embedding_text 可以主动补充章节路径等上下文，让 embedding 模型知道这句话到底属于哪个章节？”
     """
     chunk_id: str
     index: int

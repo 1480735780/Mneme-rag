@@ -271,6 +271,45 @@ DEFAULT_AGENT_PROMPTS: Dict[str, str] = {
         "检索片段：\n{chunks}\n\n"
         "输出格式：[\"追问一\", \"追问二\", ...]"
     ),
+    # V2.1.1 P-01：会话摘要从"自由文本 200 字"升级为"4-slot 结构化状态"
+    # LLM 不产 references（由装配阶段从 Evidence 派生，避免幻觉 doc_id）
+    # 注意：项目 PromptTemplateUtils.fill_slots 是 str.replace("{key}", value) 语义，
+    # 只替换传入 slots 里存在的 key（此处仅 summary_max_chars）；其他 {xxx} 保持字面量传给 LLM，
+    # 因此下面 JSON 模板用单花括号即可，不要写 {{ }} 转义。
+    AgentPromptSlot.CONVERSATION_SUMMARY.name: (
+        "你是会话状态压缩助手。请把「历史状态 + 本轮新对话」合并输出为「会话结构化状态」，"
+        "整体长度控制在 {summary_max_chars} 字以内。\n\n"
+        "输出格式（严格 JSON，无代码围栏、无解释文字、无多余字段）：\n"
+        "{\n"
+        '  "user_goal": "用户当前想完成的事，单条字符串",\n'
+        '  "progress": ["已完成里程碑 1", "已完成里程碑 2", ...],\n'
+        '  "open_questions": ["尚未解决的追问 1", ...],\n'
+        '  "critical_context": ["关键约束/偏好/实体定义/参数值 1", ...]\n'
+        "}\n\n"
+        "各字段的合并规则：\n"
+        "1. user_goal：延续旧目标则改写为覆盖新旧的完整表述；完全切换则替换。\n"
+        "2. progress：只做「追加新完成项」和「删除被后续消息否定的项」两件事，不重写旧项措辞。\n"
+        "3. open_questions：重算并允许删除——被本轮对话回答的问题直接剔除，不必保留。\n"
+        "4. critical_context：新旧合并去重；同一事实出现两个版本时保留更新的。\n\n"
+        "【显式声明必留硬约束】（优先级最高，覆盖上面的合并规则）：\n"
+        "用户对话中出现下列形式的**显式声明**时，必须原文照录、不加缩写、不做意译，"
+        "放入 critical_context，直到后续消息明确修改或删除该声明为止：\n"
+        "  (a) 键值对：形如 `NAME=VALUE` / `NAME: VALUE` / `XX_YY=1` "
+        "（含大写下划线、数字、连字符的独特短串）。"
+        "例：`DB_ENGINE=POSTGRESQL_Y`、`RETRY_K=7`、`BACKEND_STACK=FastAPI_Z`、`X_TIMEOUT=42`\n"
+        "  (b) 重命名/别名：形如「X 简称 Y」「X 别名 Y」「以后 X 叫 Y」「X codename 是 Y」"
+        "「项目 X 用 Y」。整条声明原文照录，尤其要保留独特标识符的字面量。"
+        "例：`以后 KnowledgeDocument 简称 KD_DOC_ALIAS` → 原样保留\n"
+        "  (c) 定义型：形如「定义 X = Y」「设 X 为 Y」「X 是 Y」——"
+        "保留 X 与 Y 的原始字面量，尤其含英文/数字/下划线混合的独特串"
+        "（如 `ALPHA_CORE`、`value_Q`、`3.13B`、`MNEME_PROJECT_X`）\n"
+        "禁止把这些独特字符串意译为通用中文（把 `POSTGRESQL_Y` 写成「PostgreSQL」判违规；"
+        "把 `KD_DOC_ALIAS` 写成「KnowledgeDocument 的简称」判违规）。\n\n"
+        "禁止：\n"
+        "- 不要输出 references / doc_id / chunk_id 等引用信息（由系统另行注入）。\n"
+        "- 不要把「知识库中未找到」这类元话语写入任何 slot。\n"
+        "- 不要输出 JSON 之外的任何字符。"
+    ),
 }
 
 

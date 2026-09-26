@@ -3,8 +3,10 @@
 
 ChunkBudget 是用户唯一可配的分块自由度：切法由文档结构唯一决定，用户只控制体量与冗余度。
 ChunkingService 是分块入口，只有两个分支，分支依据是预算而不是用户选的策略：
-整文档单块，或按 Block 类型分发给 dispatcher。MVP 阶段 dispatcher 只有 TextChunkDispatcher
-一个实现（渲染 Block → 纯文本 → TextSplitter 边界感知切分），BlockAware 各 chunker 属 P6。
+整文档单块，或按 Block 类型分发给 dispatcher。dispatcher 有两个实现：
+TextChunkDispatcher（渲染 Block → 纯文本 → TextSplitter 边界感知切分，兜底）与
+BlockAwareChunkerDispatcher（标题/表格/列表等，见 blockaware/ 与 block_splitter.py，
+生产默认启用）。
 
 对应 ragent 源码：
     - com.nageoffer.ai.ragent.core.chunk.ChunkingService
@@ -128,10 +130,11 @@ class ChunkerDispatcher(ABC):
 
 class TextChunkDispatcher(ChunkerDispatcher):
     """
-    MVP 文本分发（对应 ragent 纯文本路径）
+    纯文本分发兜底（对应 ragent 纯文本路径）
 
     渲染 Block → 纯文本，再交给 TextSplitter 做边界感知切分；
-    BlockAware（标题/表格/列表分块）留待 P6 的 block_splitter.py。
+    Block 感知路径见同目录 block_splitter.build_block_splitter（wiring 按
+    RAGENT_CHUNK_BLOCKAWARE_ENABLED 默认启用 BlockAware，本类为关闭时兜底）。
     """
 
     def dispatch(self, blocks: List[Block], budget: ChunkBudget) -> List[ChunkData]:

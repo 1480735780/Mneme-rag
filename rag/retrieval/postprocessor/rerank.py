@@ -50,16 +50,19 @@ class RerankPostProcessor(SearchResultPostProcessor):
         results: List[SearchChannelResult],
         context: SearchContext,
     ) -> List[RetrievedChunk]:
+        #没有候选就不产生模型调用，直接把空列表传给下一处理器。
         if not chunks:
             logger.info("Chunk 列表为空，跳过 Rerank")
             return chunks
-
+        #调用Rerank服务，对融合后的候选做精排。
         reranked = await self._rerank_service.rerank(
             context.get_main_question(),
             chunks,
-            context.budget.context_top_k,
+            context.budget.context_top_k, #Rerank后的精排保留多少条上下文
         )
+        #打印本批精排分的高低两端
         self._log_score_spread(reranked)
+        #打印归因日志
         self._log_attribution(chunks, reranked, results)
         return reranked
 

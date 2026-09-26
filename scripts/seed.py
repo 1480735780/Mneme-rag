@@ -63,10 +63,7 @@ PROMPT_DEFAULTS: Dict[str, str] = {
         "你是知识库问答助手。严格基于提供的知识库片段回答；"
         "片段中不包含答案时如实说明「知识库中未找到相关信息」，不要编造。"
     ),
-    "CONVERSATION_SUMMARY": (
-        "你是会话摘要助手。请将以下历史对话压缩为不超过 {summary_max_chars} 字的摘要，"
-        "保留关键事实、已解决的问题与尚未解决的疑问，使用中文输出。"
-    ),
+    "CONVERSATION_SUMMARY": DEFAULT_AGENT_PROMPTS["CONVERSATION_SUMMARY"],
     "RECOMMENDED_QUESTIONS": DEFAULT_AGENT_PROMPTS["RECOMMENDED_QUESTIONS"],
     # v1.1 Agent 执行架构槽位（内容移植自 ragent-new v2.0.0 260812_agent_engine.sql，
     # 内置智能体是所有空槽位的回落终点，故不写死具体知识范围）

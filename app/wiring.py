@@ -78,10 +78,42 @@ def _load_ai_config() -> Any:
     try:
         from core.llm.config.config import load_config_from_yaml
 
-        return load_config_from_yaml(_AI_CONFIG_YAML)
+        config = load_config_from_yaml(_AI_CONFIG_YAML)
     except Exception as ex:  # noqa: BLE001
         logger.warning("AI 模型配置加载失败（settings ai / 聊天链路不装配）: %s", ex)
         return None
+
+    # V2.1.1 P-10: context_window 启动校验（对齐 MEMORY 教训「validator 定义必须真接入 wiring」）
+    # 硬错误（is_blocking=True）→ raise 中止启动；软告警 → logger.warning 逐条
+    try:
+        from rag.memory.context.context_window_validator import validate_context_windows
+
+        chat = getattr(config, "chat", None)
+        if chat is not None:
+            candidates_by_id = {c.id: c for c in (chat.candidates or [])}
+            tiers_by_name = chat.tiers or {}
+            providers_by_key = {k: k for k in (getattr(config, "providers", {}) or {})}
+            violations = validate_context_windows(
+                candidates_by_id, tiers_by_name, providers_by_key=providers_by_key
+            )
+            hard_errors = []
+            for v in violations:
+                if v.is_blocking:
+                    hard_errors.append(v)
+                else:
+                    logger.warning("[context_window 校验] %s", v.message)
+            if hard_errors:
+                raise RuntimeError(
+                    "context_window 校验失败（P-10），中止启动： "
+                    + " | ".join(v.message for v in hard_errors)
+                )
+    except RuntimeError:
+        raise
+    except Exception as ex:  # noqa: BLE001
+        # 校验器自身异常（如 import 失败、字段结构漂移）不阻断启动，仅告警
+        logger.warning("context_window 校验器执行异常, 跳过校验: %s", ex)
+
+    return config
 
 
 def _build_chat_clients(config: Any) -> list:
@@ -1488,6 +1520,19 @@ class AppContainer:
 
     # ==================== 生命周期 ====================
 
+    def _build_chunking_service(self) -> Any:
+        """入库切分服务（knowledge 内核 / ingestion 流水线共用装配语义）：
+        RAGENT_CHUNK_BLOCKAWARE_ENABLED（默认 True）→ Block 感知切分
+        （标题/表格/列表/代码，block_splitter.build_block_splitter）；
+        False → 默认纯文本切分兜底（TextChunkDispatcher）。只影响新入库文档。
+        """
+        from rag.ingestion.splitter.base import ChunkingService
+        from rag.ingestion.splitter.block_splitter import build_block_splitter
+
+        if self.settings.chunk_blockaware_enabled:
+            return ChunkingService(dispatcher=build_block_splitter())
+        return ChunkingService()
+
     def _wire_knowledge_services(self) -> None:
         """组装 P5 knowledge 域（N1-N3：KB/文档/分块 service + 支撑组件，plan 5.3.5）
 
@@ -1519,7 +1564,6 @@ class AppContainer:
         from knowledge.support.vector_target_resolver import VectorTargetResolver
         from rag.ingestion.kernel import ChunkEmbeddingService, DefaultIngestionKernel
         from rag.ingestion.sink import ChunkIndexWriter, VectorStoreSink
-        from rag.ingestion.splitter.base import ChunkingService
 
         # 解析器注册表 + 摄取配置 codec/schema（schema 档位推导依赖注册表；MinerU 条件注册见 build_parser_registry）
         parser_registry = build_parser_registry(self._get_shared_file_storage())
@@ -1549,7 +1593,7 @@ class AppContainer:
 
         # 摄取内核：parser → chunk → embed → 扇出
         ingest_kernel = DefaultIngestionKernel(
-            parser_registry, ChunkingService(), chunk_embedding, chunk_index_writer
+            parser_registry, self._build_chunking_service(), chunk_embedding, chunk_index_writer
         )
 
         # dao
@@ -1647,7 +1691,6 @@ class AppContainer:
         from ingestion.strategy.fetcher.http_url_fetcher import HttpUrlFetcher
         from ingestion.util.http_client_helper import HttpClientHelper
         from rag.ingestion.kernel import ChunkEmbeddingService
-        from rag.ingestion.splitter.base import ChunkingService
 
         # dao ×4（pipeline/node/task/task_node）
         pipeline_dao = IngestionPipelineDao(self.db)
@@ -1669,7 +1712,7 @@ class AppContainer:
         fetchers = [HttpUrlFetcher(http), FeishuFetcher(http)]
         nodes = [FetcherNode(fetchers), ParserNode(parser_registry)]
         if chunk_embedding is not None:
-            nodes.append(ChunkerNode(ChunkingService(), chunk_embedding))
+            nodes.append(ChunkerNode(self._build_chunking_service(), chunk_embedding))
         if llm is not None:
             nodes.append(EnhancerNode(llm))
             nodes.append(EnricherNode(llm))

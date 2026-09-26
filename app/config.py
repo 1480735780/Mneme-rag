@@ -58,6 +58,10 @@ class AppSettings:
     auth_enabled: bool = False  # RAGENT_AUTH_ENABLED
     # P8 E1 评测开关（D5/D9）：False（默认）不挂载 /rag/eval 端点，零运行时开销；True 且引擎就绪时挂载
     eval_enabled: bool = False  # RAGENT_EVAL_ENABLED
+    # 入库切分路径开关：True（默认）走 Block 感知切分（标题/表格/列表/代码，见
+    # splitter/block_splitter.build_block_splitter）；False 回落纯文本切分。
+    # 只影响新入库文档，存量向量不重建则同一 KB 内新旧切分风格并存
+    chunk_blockaware_enabled: bool = True  # RAGENT_CHUNK_BLOCKAWARE_ENABLED
     # P2 部署资源：MCP Server 列表（env RAGENT_MCP_SERVERS_JSON，形如
     # {"servers":[{"name":"ragent-mcp","url":"http://host:9099/mcp"}]} 或裸数组；空 → 不注册远程工具）
     mcp_servers_json: str = ""  # RAGENT_MCP_SERVERS_JSON
@@ -76,7 +80,7 @@ class AppSettings:
         return cls(
             host=os.environ.get("RAGENT_HOST", "127.0.0.1"),
             port=int(os.environ.get("RAGENT_PORT", "8000")),
-            stack_profile=os.environ.get("RAGENT_STACK_PROFILE", "memo· ry"),
+            stack_profile=os.environ.get("RAGENT_STACK_PROFILE", "memory"),
             sse_timeout_ms=int(os.environ.get("RAGENT_SSE_TIMEOUT_MS", "0")),
             orchestration_mode=os.environ.get("RAGENT_ORCHESTRATION_MODE", "workflow"),
             rate_limit_backend=os.environ.get("RAGENT_RATE_LIMIT_BACKEND", "process"),
@@ -98,6 +102,7 @@ class AppSettings:
             schedule_lock_backend=os.environ.get("RAGENT_SCHEDULE_LOCK_BACKEND", "db"),
             auth_enabled=_env_bool("RAGENT_AUTH_ENABLED", False),
             eval_enabled=_env_bool("RAGENT_EVAL_ENABLED", False),
+            chunk_blockaware_enabled=_env_bool("RAGENT_CHUNK_BLOCKAWARE_ENABLED", True),
             mcp_servers_json=os.environ.get("RAGENT_MCP_SERVERS_JSON", ""),
             init_admin_username=os.environ.get("RAGENT_INIT_ADMIN_USERNAME", ""),
             init_admin_password=os.environ.get("RAGENT_INIT_ADMIN_PASSWORD", ""),

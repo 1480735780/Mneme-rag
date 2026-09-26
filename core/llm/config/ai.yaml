@@ -66,6 +66,8 @@ ai:
     deep_thinking_tier: deep
 
     # ---- 2.1 模型候选注册表（对应 ModelCandidate） ----
+    # V2.1.1 P-10 起 context_window 为强制声明：rag.memory 压缩 Guard 依赖它计算预算，
+    # 未声明会导致 Guard 退化为 char/4 启发式估算；Ollama 更严格要求与 provider_options.num_ctx 一致
     candidates:
       - id: qwen-max                    # 模型唯一标识符
         provider: qwen                  # 对应 providers 中的 key
@@ -73,6 +75,7 @@ ai:
         enabled: true
         supports_thinking: true         # 支持思考链（DeepSeek-R1 风格）
         priority: 10
+        context_window: 32768
 
       - id: qwen-turbo
         provider: qwen
@@ -80,6 +83,7 @@ ai:
         enabled: true
         supports_thinking: false
         priority: 20
+        context_window: 8192
 
       - id: qwen-plus
         provider: qwen
@@ -87,6 +91,7 @@ ai:
         enabled: true
         supports_thinking: false
         priority: 15
+        context_window: 32768
 
       - id: gpt-4o
         provider: openai
@@ -94,6 +99,7 @@ ai:
         enabled: true
         supports_thinking: false
         priority: 10
+        context_window: 128000
 
       - id: gpt-4o-mini
         provider: openai
@@ -101,6 +107,7 @@ ai:
         enabled: true
         supports_thinking: false
         priority: 20
+        context_window: 128000
 
       - id: llama3
         provider: ollama
@@ -108,6 +115,9 @@ ai:
         enabled: true
         supports_thinking: false
         priority: 30
+        context_window: 8192
+        provider_options:
+          num_ctx: 8192                 # 必须等于 context_window；Ollama 默认 2048 会让 Guard 全部失真
 
       - id: deepseek-v3
         provider: siliconflow
@@ -115,6 +125,7 @@ ai:
         enabled: true
         supports_thinking: true
         priority: 10
+        context_window: 8192
 
       - id: aihubmix-gpt-4o
         provider: aihubmix
@@ -122,6 +133,7 @@ ai:
         enabled: true
         supports_thinking: false
         priority: 40
+        context_window: 128000
 
     # ---- 2.2 档位配置（对应 TierConfig） ----
     tiers:

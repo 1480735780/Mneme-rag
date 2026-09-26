@@ -41,8 +41,10 @@ class DocumentRef:
     """
     文档身份：纯数据，字节从上传、URL 还是飞书来是内核之前的事，内核不认识取数方式
 
+    DocumentRef 表示这次 ingestion 操作针对的到底是哪份文档。
+
     Attributes:
-        doc_id:   文档 ID，决定资产归属与落库归属
+        doc_id:   文档 ID，决定资产归属与落库归属，资产归属也就是说传给 Parser，因为解析 PDF、Word 等文档时可能产生图片资产，需要通过 doc_id 确定图片应该放在哪个文档下面。
         kb_id:    所属知识库 ID，决定关系库归属
         filename: 原始文件名，供类型识别与溯源，可为空（删除路径不需要）
     """
@@ -70,7 +72,7 @@ INGESTION_SPEC_VERSION = 2
 @dataclass(frozen=True)
 class IngestionSpec:
     """
-    文档级摄取配置（L3）：这一篇怎么解析、怎么切
+    文档级摄取配置（L3）：一份文档进入摄取内核以后，应该按照什么规则进行解析和分块。
 
     不含 embedding_model：嵌入模型是知识库级（L2）约束性配置，文档级无权覆盖，
     只能由 VectorTarget 提供。
@@ -195,6 +197,7 @@ class ChunkEmbeddingService:
                     f"物理空间要求 {target.dimension} 维（分区 {target.partition}）"
                     "——请改用同维度的嵌入模型，或调整部署级维度并重建向量空间"
                 )
+            #最后组装 EmbeddedChunk 对象
             result.append(EmbeddedChunk(chunk=chunk, embedding=row))
         return result
 
@@ -284,7 +287,7 @@ class DefaultIngestionKernel(IngestionKernel):
         if not mime_type:
             raise ValueError(f"无法识别文件类型：doc_id={doc.doc_id}, filename={doc.filename}")
 
-        # ② parse：(MIME × 档位) → 解析器
+        # ② parse：(MIME × 档位) → 解析器：文档解析成 Block 列表
         parse_start = time.time()
         parser: DocumentParser = self._parser_registry.require(mime_type, effective_spec.parse_profile)
         if hasattr(parser, "async_parse_structured"):
@@ -294,7 +297,7 @@ class DefaultIngestionKernel(IngestionKernel):
         blocks: List[Block] = parsed.blocks if parsed.blocks is not None else []
         parse_millis = _elapsed(parse_start)
 
-        # ③ chunk：Block 类型 → chunker + 预算
+        # ③ chunk： Block 切成 ChunkData
         chunk_start = time.time()
         chunks: List[ChunkData] = self._chunking_service.chunk(blocks, effective_spec.budget)
         chunk_millis = _elapsed(chunk_start)

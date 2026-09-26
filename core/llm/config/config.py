@@ -118,6 +118,13 @@ class ModelCandidate:
     priority: int = 100                # 优先级（数值越小优先级越高）
     enabled: bool = True               # 是否启用该模型
     supports_thinking: bool = False    # 是否支持思考链（DeepSeek-R1 / QwQ）
+    # V2.1.1 P-10: 上下文窗口 token 数（供 rag.memory 上下文压缩 Guard 用）
+    # - 云端 API（openai / qwen / siliconflow / aihubmix）：可选，缺失时用 provider 公开值兜底
+    # - Ollama 本地部署：必须显式声明，且需与 options.num_ctx 一致；否则真实窗口
+    #   可能是 Ollama 默认 2048，与配置声明 8192 严重背离会让 Guard 全部失效
+    # - 未声明时 rag.memory 走 heuristic (char/4) 估算，精度差但不会崩
+    context_window: Optional[int] = None
+    provider_options: Optional[dict] = None  # 传给 provider 的额外参数（如 Ollama options.num_ctx）
 
 
 @dataclass
@@ -232,7 +239,10 @@ def load_config_from_dict(data: Dict[str, Any]) -> AIModelConfig:
                 dimension=dim,
                 priority=cand.get("priority", 100),
                 enabled=cand.get("enabled", True),
-                supports_thinking=cand.get("supports_thinking", False)
+                supports_thinking=cand.get("supports_thinking", False),
+                # V2.1.1 P-10: 上下文窗口与 provider 侧参数（如 Ollama num_ctx）
+                context_window=cand.get("context_window"),
+                provider_options=cand.get("provider_options"),
             ))
         tiers = {}
         for tier_name, tier_cfg in group_data.get("tiers", {}).items():

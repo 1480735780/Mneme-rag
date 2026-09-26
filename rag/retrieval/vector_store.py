@@ -213,7 +213,7 @@ class VectorStoreAdmin(ABC):
     Milvus 建共享 collection，PG 依赖迁移脚本建表故此处多为空操作，均以本接口抹平差异。
 
     对应 ragent 源码：
-        - com.nageoffer.ai.ragent.rag.core.vector.VectorStoreAdmin
+        - com.nageoffer.ai.ragent.rag.core.vector.VectorStoreAdminService
     """
 
     @abstractmethod

@@ -127,12 +127,20 @@ _T_CONVERSATION_SUMMARY = TableSchema(
             ("user_id", "VARCHAR(64)"),
             ("content", "TEXT"),
             ("last_message_id", "VARCHAR(32)"),
+            # V2.1.1 P-01: 摘要 schema 版本；NULL/'v1'=自由文本走 V1 路径，'v2'=Structured ConversationState
+            ("summary_version", "VARCHAR(16)"),
+            # V2.1.1 P-01: ConversationState 的 JSON 快照；V1 行为 NULL
+            ("structured_content", "JSONB"),
+            # V2.1.1 P-09: 本轮 LLM 调用次数（1=单次成功/失败, 0=L3 skip, >1 保留给未来 retry）
+            ("attempt_count", "INTEGER"),
+            # V2.1.1 P-09: 走的自愈档位，供 dashboard 识别"哪些会话正在挣扎"
+            ("healing_level", "VARCHAR(32)"),
             ("create_time", "TIMESTAMP"),
             ("update_time", "TIMESTAMP"),
             ("deleted", "INTEGER"),
         ),
     ),
-    comment="会话摘要",
+    comment="会话摘要（V2.1.1 P-01 起支持 4-slot 结构化状态；content 保留文本快照兼容 V1 消费者）",
 )
 
 _T_KNOWLEDGE_BASE = TableSchema(

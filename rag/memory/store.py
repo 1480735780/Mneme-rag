@@ -169,8 +169,8 @@ class DatabaseConversationMemoryStore(ConversationMemoryStore):
         conversation_id: Optional[str],
         user_id: Optional[str],
     ) -> List[Message]:
-        max_messages = self._properties.history_keep_turns * 2
-        rows = self._list_messages(conversation_id, user_id, max_messages)
+        max_messages = self._properties.history_keep_turns * 2  #去数据库查询的最大消息数
+        rows = self._list_messages(conversation_id, user_id, max_messages)  #查询数据库
         messages = [self._to_chat_message(row) for row in rows]
         messages = [m for m in messages if self._is_history_message(m)]
         return self._normalize_history(messages)
@@ -221,7 +221,7 @@ class DatabaseConversationMemoryStore(ConversationMemoryStore):
         user_id: Optional[str],
         limit: int,
     ) -> List[dict]:
-        """查最近消息（对齐 Java ConversationMessageServiceImpl.listMessages DESC）"""
+        """去数据库查最近消息（对齐 Java ConversationMessageServiceImpl.listMessages DESC）"""
         if _is_blank(conversation_id) or _is_blank(user_id):
             return []
         # 会话必须存在（deleted=0），否则视为无历史（对齐 Java listMessages 的会话校验）
@@ -253,7 +253,7 @@ class DatabaseConversationMemoryStore(ConversationMemoryStore):
         user_id: str,
         question: str,
     ) -> None:
-        """会话 upsert（对齐 Java ConversationServiceImpl.createOrUpdate）：仅更新 last_time"""
+        """会话 update（对齐 Java ConversationServiceImpl.createOrUpdate）：仅更新 last_time"""
         now = _now_iso()
         existing = self._db.select_rows(
             _T_CONVERSATION,
@@ -290,7 +290,7 @@ class DatabaseConversationMemoryStore(ConversationMemoryStore):
 
     @staticmethod
     def _to_chat_message(row: dict) -> Optional[Message]:
-        """行 → Message（对齐 Java toChatMessage）：剥 CitationMarkup；空白/未知角色返回 None"""
+        """把数据库一行转换成 Message 对象。：剥 CitationMarkup；空白/未知角色返回 None"""
         if not row or not row.get("content") or not str(row["content"]).strip():
             return None
         try:
@@ -304,12 +304,12 @@ class DatabaseConversationMemoryStore(ConversationMemoryStore):
 
     @staticmethod
     def _is_history_message(message: Optional[Message]) -> bool:
-        """仅 USER / ASSISTANT 且非空内容参与历史（对齐 Java isHistoryMessage）"""
+        """判断一条消息是否适合作为对话历史。仅 USER / ASSISTANT 且非空内容参与历史（对齐 Java isHistoryMessage）"""
         return message is not None and message.role in (Role.USER, Role.ASSISTANT)
 
     @staticmethod
     def _normalize_history(messages: List[Message]) -> List[Message]:
-        """跳过开头 ASSISTANT；全为 ASSISTANT 返回空（对齐 Java normalizeHistory）"""
+        """负责把消息序列整理成合法的对话结构。跳过开头 ASSISTANT；全为 ASSISTANT 返回空（对齐 Java normalizeHistory）"""
         start = 0
         while start < len(messages) and messages[start].role == Role.ASSISTANT:
             start += 1
