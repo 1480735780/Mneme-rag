@@ -23,6 +23,8 @@ import json
 from dataclasses import dataclass
 from typing import Optional
 
+from core.llm.result import UsageStats
+
 
 DATA_PREFIX = "data:"
 DONE_MARKER = "[DONE]"
@@ -37,11 +39,15 @@ class ParsedEvent:
         content: 增量内容片段，无则为 None。
         reasoning: 增量思考内容片段，无或未开启解析则为 None。
         completed: 是否流已结束（[DONE] 或 finish_reason 出现）。
+        usage: 真实 token 用量尾包（P10.1 T1.4）：OpenAI 协议在流尾发送
+            choices 为空的 usage 块（或 finish_reason 块附带 usage），
+            任一形态解析出的 UsageStats；缺失为 None。
     """
 
     content: Optional[str] = None
     reasoning: Optional[str] = None
     completed: bool = False
+    usage: Optional[UsageStats] = None
 
     def has_content(self) -> bool:
         """是否有可回调的内容（非空）。"""
@@ -107,9 +113,13 @@ class OpenAIStyleSseParser:
         if not isinstance(obj, dict):
             return ParsedEvent()
 
+        # usage 尾包先于 choices 守卫解析：OpenAI 协议的 usage 块恰是空 choices，
+        # 走到守卫会被静默丢弃（P10.1 T1.4 决策 A）
+        usage = OpenAIStyleSseParser._extract_usage(obj)
+
         choices = obj.get("choices")
         if not choices:
-            return ParsedEvent()
+            return ParsedEvent(usage=usage)
 
         choice0 = choices[0]
         if not isinstance(choice0, dict):
@@ -122,7 +132,23 @@ class OpenAIStyleSseParser:
         )
         completed = choice0.get("finish_reason") is not None
 
-        return ParsedEvent(content=content, reasoning=reasoning, completed=completed)
+        return ParsedEvent(content=content, reasoning=reasoning, completed=completed, usage=usage)
+
+    @staticmethod
+    def _extract_usage(chunk: dict) -> Optional[UsageStats]:
+        """usage 块 → UsageStats（形态异常一律 None，观测元数据不破坏解析降级链）"""
+        raw = chunk.get("usage")
+        if not isinstance(raw, dict):
+            return None
+
+        def _int(value) -> Optional[int]:
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+        prompt_tokens = _int(raw.get("prompt_tokens"))
+        completion_tokens = _int(raw.get("completion_tokens"))
+        if prompt_tokens is None and completion_tokens is None:
+            return None
+        return UsageStats(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
 
     @staticmethod
     def _extract_text(choice: dict, field_name: str) -> Optional[str]:

@@ -24,6 +24,7 @@ from uuid import uuid4
 
 from core.llm.observation.events import (
     CALL_KIND_CHAT,
+    STATUS_CANCELED,
     STATUS_FAILED,
     STATUS_SUCCESS,
     TOKEN_SOURCE_ESTIMATED,
@@ -51,7 +52,7 @@ def _estimate_text_tokens(text: Optional[str]) -> int:
     return count if count is not None else 0
 
 
-def _error_type(error: BaseException) -> str:
+def resolve_error_type(error: BaseException) -> str:
     """错误分类（Q11）：ModelClientException 取其 error_type 枚举值，未知异常取类名"""
     error_type = getattr(error, "error_type", None)
     if error_type is not None:
@@ -137,7 +138,7 @@ class ChatCallObserver:
                 self._events.append(
                     self._build_event(
                         target, attempt_no, latency_ms,
-                        status=STATUS_FAILED, error=_error_type(e),
+                        status=STATUS_FAILED, error=resolve_error_type(e),
                         usage=None, completion_text=None,
                     )
                 )
@@ -208,5 +209,131 @@ class ChatCallObserver:
             completion_tokens=tokens.completion_tokens,
             token_source=tokens.token_source,
             latency_ms=latency_ms,
+            create_time=datetime.now().isoformat(),
+        )
+
+
+class StreamCallObserver:
+    """
+    一次流式 chat 逻辑调用的观测记录器（RoutingLLMService.stream_chat 专用，T1.4）
+
+    与 ChatCallObserver 同构：缓冲行 + finish() 终态统一补标 is_final 投递——
+    stream_chat 把 finish() 放在 finally，**canceled 路径也保证落行**（Q11：取消
+    不进失败率但已产出内容计成本）。数据源是 ProbeStreamBridge 的遥测
+    （ttft_ms / content_text / usage），token 口径 = 真实尾包优先、内容估算兜底。
+
+    四条出口路径的落行语义（D4/Q11 + 执行期决策 B）：
+        - 首包前失败（探活 ERROR/NO_CONTENT）→ failed 行，tokens=None（无内容无消耗）
+        - TTFT 超预算切换 → failed 行，error_type="timeout"（决策 B 新字面量）
+        - 上游取消 → canceled 行（部分输出照常计成本）
+        - 流终态（complete / 首包后出错）→ success / failed 行
+    探活 NO_CONTENT 归 invalid_response（响应形态问题）；探活 ERROR 沿用异常自身
+    error_type。
+    """
+
+    def __init__(
+        self,
+        sink: Optional[EventSink],
+        *,
+        request: Any,
+        tier: Optional[str] = None,
+    ) -> None:
+        self._sink = sink
+        self._scope = current_scope()  # D5：发射点物化（构造发生在请求 task 内）
+        self.request_uid = uuid4().hex
+        self._tier = tier  # stream_chat 无 tier 参数，恒 None（选档在 selector 内部）
+        self._prompt_estimate = sum(
+            _estimate_text_tokens(getattr(message, "content", None))
+            for message in (getattr(request, "messages", None) or ())
+        )
+        self._events: List[CallEvent] = []
+        self._finished = False
+
+    # ==================== 探活失败路径（无内容无 token） ====================
+
+    def record_probe_failure(
+        self, target: Any, *, latency_ms: int, error_type: str
+    ) -> None:
+        """首包前失败（探活 ERROR / NO_CONTENT / TTFT 超时）：tokens 恒 None"""
+        self._events.append(
+            self._build_event(
+                target, len(self._events) + 1, latency_ms,
+                status=STATUS_FAILED, error=error_type,
+                tokens=_TokenUsage(None, None, None), ttft_ms=None,
+            )
+        )
+
+    # ==================== 终态路径（数据源 = bridge 遥测） ====================
+
+    def record_terminal(
+        self,
+        target: Any,
+        bridge: Any,
+        *,
+        status: str,
+        error: Optional[BaseException],
+        started_at: float,
+    ) -> None:
+        """流终态行（成功 / 首包后出错 / 上游取消）：部分输出照常计成本（Q11）"""
+        latency_ms = int((time.monotonic() - started_at) * 1000)
+        usage = getattr(bridge, "usage", None)
+        usage = usage if isinstance(usage, UsageStats) and not usage.is_empty else None
+        content_text = getattr(bridge, "content_text", None) or ""
+        tokens = _resolve_token_usage(usage, self._prompt_estimate, content_text)
+        self._events.append(
+            self._build_event(
+                target, len(self._events) + 1, latency_ms,
+                status=status,
+                error=resolve_error_type(error) if error is not None else None,
+                tokens=tokens,
+                ttft_ms=getattr(bridge, "ttft_ms", None),
+            )
+        )
+
+    # ==================== 终态收尾（与非流式同构） ====================
+
+    def finish(self) -> None:
+        """请求终态：is_final 落最后一行并统一投递（幂等；观测未装配时零开销）"""
+        if self._finished:
+            return
+        self._finished = True
+        if self._sink is None or not self._events:
+            return
+        self._events[-1] = replace(self._events[-1], is_final=True)
+        for event in self._events:
+            self._sink(event)  # put_nowait：非阻塞，满即丢由队列计数（D2）
+
+    # ==================== 内部 ====================
+
+    def _build_event(
+        self,
+        target: Any,
+        attempt_no: int,
+        latency_ms: int,
+        *,
+        status: str,
+        error: Optional[str],
+        tokens: _TokenUsage,
+        ttft_ms: Optional[int],
+    ) -> CallEvent:
+        return CallEvent(
+            request_uid=self.request_uid,
+            call_kind=CALL_KIND_CHAT,
+            provider=getattr(target.candidate, "provider", "") or "",
+            model=getattr(target.candidate, "model", "") or "",
+            status=status,
+            scene=self._scope.scene,
+            purpose=self._scope.purpose,
+            trace_id=self._scope.trace_id,
+            user_id=self._scope.user_id,
+            tier=self._tier,
+            attempt_no=attempt_no,
+            is_final=False,  # finish() 统一补标终态行
+            error_type=error,
+            prompt_tokens=tokens.prompt_tokens,
+            completion_tokens=tokens.completion_tokens,
+            token_source=tokens.token_source,
+            latency_ms=latency_ms,
+            ttft_ms=ttft_ms,
             create_time=datetime.now().isoformat(),
         )

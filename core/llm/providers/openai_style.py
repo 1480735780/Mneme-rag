@@ -115,6 +115,15 @@ class OpenAIStyleChatClient(BaseChatClient):
         """
         return bool(request.thinking)
 
+    def include_stream_usage(self) -> bool:
+        """流式请求是否显式索取 usage 尾包（P10.1 T1.4 决策 A）
+
+        OpenAI 兼容协议需显式 stream_options.include_usage 才回传流式用量，否则
+        流式明细永远 estimated（T1.4 空转）。对未知字段严格的 provider（报 400）
+        覆写为 False 一行止血——那是流式可用性风险，不是观测风险。
+        """
+        return True
+
     # ===============================
     # 模板方法：同步调用 chat
     # ===============================
@@ -225,6 +234,10 @@ class OpenAIStyleChatClient(BaseChatClient):
                             await callback.on_thinking(event.reasoning)
                         if event.has_content():
                             await callback.on_content(event.content)
+                        if event.usage is not None:
+                            # usage 尾包（P10.1 T1.4）：天然先于 [DONE]/完成块到达，
+                            # on_complete 之前回调；默认空实现对业务侧零影响
+                            await callback.on_usage(event.usage)
                         if event.completed:
                             await callback.on_complete()
                             completed = True
@@ -271,6 +284,9 @@ class OpenAIStyleChatClient(BaseChatClient):
         }
         if stream:
             body["stream"] = True
+            # P10.1 T1.4 决策 A：显式索取 usage 尾包（钩子门控，见 include_stream_usage）
+            if self.include_stream_usage():
+                body["stream_options"] = {"include_usage": True}
 
         if request.temperature is not None:
             body["temperature"] = request.temperature

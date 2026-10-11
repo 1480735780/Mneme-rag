@@ -170,6 +170,12 @@ class ForwardingStreamCallback:
     async def on_grounding_chunks(self, chunks) -> None:
         await self._delegate.on_grounding_chunks(chunks)
 
+    async def on_usage(self, usage) -> None:
+        """usage 尾包透传（P10.1 T1.4）：delegate 无此方法时静默跳过（鸭子类型防御）"""
+        handler = getattr(self._delegate, "on_usage", None)
+        if handler is not None:
+            await handler(usage)
+
     # ---------- 终态：透传 + CAS-once 收尾 ----------
 
     async def on_complete(self) -> None:

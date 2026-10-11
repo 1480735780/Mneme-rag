@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 # 导入需要的数据类型（避免循环引用，使用 TYPE_CHECKING）
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
+    from .result import UsageStats
     from .schema import SourceRef, GroundingChunk
 
 
@@ -94,6 +95,18 @@ class StreamCallback(ABC):
 
         Args:
             chunks: grounding 片段列表
+        """
+        pass
+
+    async def on_usage(self, usage: Optional["UsageStats"]) -> None:
+        """
+        接收流式 token 用量尾包（P10.1 T1.4 观测扩展，Java 无对应）
+
+        provider 在流尾（通常先于 [DONE]）回调一次，真实用量由此进入观测链路；
+        默认空实现——业务侧回调不重写即零影响（on_sources 先例同款）。
+
+        Args:
+            usage: 真实 token 用量；任一维度缺失为 None
         """
         pass
 

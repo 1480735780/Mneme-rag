@@ -24,6 +24,7 @@ RoutingLLMService（推荐）
 
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -35,8 +36,10 @@ from .model.health_store import ModelHealthStore
 from .model.model_target import ModelTarget
 from .model.routing_executor import RoutingExecutionError, RoutingExecutor
 from .model.selector import ModelSelector
-from .observation.emit import ChatCallObserver
+from .observation.emit import ChatCallObserver, StreamCallObserver, resolve_error_type
+from .observation.events import STATUS_CANCELED, STATUS_FAILED, STATUS_SUCCESS
 from .providers.base import BaseChatClient
+from .result import UsageStats
 from .schema import ChatRequest, Message
 
 logger = logging.getLogger(__name__)
@@ -87,6 +90,11 @@ class ProbeStreamBridge(BaseStreamCallback):
         self.result: ProbeResult = ProbeResult.NO_CONTENT
         self.error: Optional[BaseException] = None
         self._first_packet_event = asyncio.Event()
+        # P10.1 T1.4 观测遥测：StreamCallObserver 的数据源（发射点读取，flush 端不碰）
+        self.usage: Optional[UsageStats] = None   # usage 尾包捕获（真实 token 用量）
+        self.ttft_ms: Optional[int] = None        # 构造 → 首包延迟
+        self._content_parts: List[str] = []       # 已产出内容（内容+思考均计费输出）
+        self._created_at = time.monotonic()
 
     # ---- 缓冲/提交 ----
 
@@ -113,9 +121,11 @@ class ProbeStreamBridge(BaseStreamCallback):
     def _mark_success(self) -> None:
         self.succeeded = True
         self.result = ProbeResult.SUCCESS
+        # P10.1 T1.4：首包延迟（观测遥测）
+        self.ttft_ms = int((time.monotonic() - self._created_at) * 1000)
         # 信号灯这是一个“只触发一次”的标志位。首包没到时，它是“未设置”状态，所有等待者会阻塞；
         # 首包一到，它变为“已设置”，所有等待者被唤醒。
-        self._first_packet_event.set()     
+        self._first_packet_event.set()
 
     # ---- 首包等待（对齐 Java awaitFirstPacket）----
 
@@ -151,7 +161,12 @@ class ProbeStreamBridge(BaseStreamCallback):
             if self.result == ProbeResult.NO_CONTENT:
                 self.result = ProbeResult.TIMEOUT
             return self.result
-        return self.result
+        # P10.1 T1.4 修复（既有竞态，观测测试揭露）：首包成功后、探针唤醒前，
+        # post-commit 的 on_error 会把 result 覆写为 ERROR——成功与否以
+        # _mark_success 时刻的 succeeded 为准（文档语义「首包 → SUCCESS」），
+        # 不读可能已被终态覆写的 result 字段，否则已提交内容的流被误判为
+        # 首包前失败而切换候选，造成下游内容重复。
+        return ProbeResult.SUCCESS if self.succeeded else self.result
 
     # ---- 生命周期 ----
 
@@ -168,14 +183,29 @@ class ProbeStreamBridge(BaseStreamCallback):
         await self._emit(lambda: self._downstream.on_grounding_chunks(chunks))
 
     async def on_content(self, token: str) -> None:
+        self._content_parts.append(token)  # T1.4 遥测：计费输出累计
         self._mark_success()
         await self._commit()
         await self._downstream.on_content(token)
 
     async def on_thinking(self, token: str) -> None:
+        self._content_parts.append(token)  # T1.4 遥测：思考内容也是计费输出
         self._mark_success()
         await self._commit()
         await self._downstream.on_thinking(token)
+
+    async def on_usage(self, usage: Optional[UsageStats]) -> None:
+        """usage 尾包：捕获供观测 + 防御式转发下游（T1.4 决策 D——delegate 可能是
+        无 on_usage 的鸭子类型，如 ForwardingStreamCallback，直接转发会 AttributeError）"""
+        self.usage = usage
+        handler = getattr(self._downstream, "on_usage", None)
+        if handler is not None:
+            await handler(usage)
+
+    @property
+    def content_text(self) -> str:
+        """已产出内容全文（内容+思考，估算数据源）"""
+        return "".join(self._content_parts)
 
     async def on_complete(self) -> None:
         if self.succeeded:
@@ -378,6 +408,39 @@ class RoutingLLMService(LLMService):
         if not targets:
             raise RoutingExecutionError("No Chat model candidates available")
 
+        # P10.1 T1.4：观测未装配时与既有路径完全一致（sink None → observer None）
+        observer = (
+            StreamCallObserver(self._observation_sink, request=request)
+            if self._observation_sink is not None
+            else None
+        )
+        try:
+            await self._stream_with_fallback(request, callback, targets, observer)
+        finally:
+            # 请求终态（完成 / 全候选失败 / 上游取消）统一补标 is_final 并投递明细；
+            # canceled 路径经 finally 同样落行（Q11：不进失败率但计成本）
+            if observer is not None:
+                observer.finish()
+
+    async def _stream_with_fallback(
+        self,
+        request: ChatRequest,
+        callback: StreamCallback,
+        targets: List[ModelTarget],
+        observer: Optional[StreamCallObserver],
+    ) -> None:
+        """候选级故障转移循环（原 stream_chat 主体，T1.4 抽出以便 finally 收尾观测）。
+
+        逐候选尝试：
+            - 将 client.stream_chat 作为 asyncio Task 启动；
+            - bridge.await_first_packet(timeout) 等待首包：
+              · SUCCESS → await task 让流继续到完成，mark_success 返回；
+              · ERROR / NO_CONTENT → mark_failure 切换下一候选；
+              · TIMEOUT → cancel task，mark_failure 切换下一候选；
+            - 全部失败 → 回调 on_error 并抛 RoutingExecutionError。
+        首包超时预算取 target.timeout_ms（对齐 Java firstPacketBudgetMs = target.timeoutMs()）。
+        中间候选的失败不会上报下游（由 ProbeStreamBridge 丢弃缓冲）。
+        """
         last_error: Optional[BaseException] = None
         #遍历候选集的大模型
         for target in targets:
@@ -398,6 +461,7 @@ class RoutingLLMService(LLMService):
             first_packet_budget_s = (
                 target.timeout_ms / 1000 if target.timeout_ms else None
             )
+            started_at = time.monotonic()  # T1.4：attempt 计时起点
             # 1. 启动后台流式任务（非阻塞）
             # 启动流式任务（对应 Java 的 StreamAsyncExecutor.submit）
             task = asyncio.create_task(
@@ -408,8 +472,13 @@ class RoutingLLMService(LLMService):
                 # 等待首包或超时（对应 Java 的 awaitFirstPacket）
                 probe_result = await bridge.await_first_packet(first_packet_budget_s)
             except asyncio.CancelledError:
-                # 3. 外部取消（比如 HTTP 请求断开）
+                # 3. 外部取消（比如 HTTP 请求断开）——首包前取消：无内容无 token（T1.4）
                 task.cancel()
+                if observer is not None:
+                    observer.record_terminal(
+                        target, bridge, status=STATUS_CANCELED,
+                        error=None, started_at=started_at,
+                    )
                 raise
 
             if probe_result == ProbeResult.SUCCESS:
@@ -417,11 +486,36 @@ class RoutingLLMService(LLMService):
                 try:
                     await task # 此时流在后台继续，主协程等待它彻底结束
                 except asyncio.CancelledError:
+                    # 上游取消（已产出内容）：canceled 行计成本不进失败率（Q11/T1.4）
+                    if observer is not None:
+                        observer.record_terminal(
+                            target, bridge, status=STATUS_CANCELED,
+                            error=None, started_at=started_at,
+                        )
                     raise
                 except Exception as e:
                     # 流式中途出错（首包后），bridge 已提交 → on_error 已由 bridge 转发下游
                     bridge.result = ProbeResult.ERROR
                     bridge.error = e
+                    if observer is not None:
+                        observer.record_terminal(
+                            target, bridge, status=STATUS_FAILED,
+                            error=e, started_at=started_at,
+                        )
+                else:
+                    # 流任务正常返回：终态以 bridge.result 为准——provider 约定错误经
+                    # on_error 上报后正常返回（await task 不抛，T1.4 逐行核对确认）
+                    if observer is not None:
+                        if bridge.result == ProbeResult.SUCCESS:
+                            observer.record_terminal(
+                                target, bridge, status=STATUS_SUCCESS,
+                                error=None, started_at=started_at,
+                            )
+                        else:
+                            observer.record_terminal(
+                                target, bridge, status=STATUS_FAILED,
+                                error=bridge.error, started_at=started_at,
+                            )
                 finally:
                     self._health_store.release_half_open_permit(permit)
 
@@ -455,6 +549,26 @@ class RoutingLLMService(LLMService):
 
             self._health_store.mark_failure(target.id)
             last_error = bridge.error or last_error
+            # T1.4：首包前失败行——无内容无 token；error_type 口径见执行期决策 B
+            if observer is not None:
+                if probe_result == ProbeResult.TIMEOUT:
+                    observer.record_probe_failure(
+                        target,
+                        latency_ms=int((time.monotonic() - started_at) * 1000),
+                        error_type="timeout",
+                    )
+                elif bridge.error is not None:
+                    observer.record_probe_failure(
+                        target,
+                        latency_ms=int((time.monotonic() - started_at) * 1000),
+                        error_type=resolve_error_type(bridge.error),
+                    )
+                else:  # NO_CONTENT：响应形态问题
+                    observer.record_probe_failure(
+                        target,
+                        latency_ms=int((time.monotonic() - started_at) * 1000),
+                        error_type="invalid_response",
+                    )
             # 结构化降级日志（doc 11.3），字段与 RoutingExecutor 对齐
             logger.warning(
                 "Chat stream failed, fallback to next. modelId=%s, provider=%s, result=%s",
