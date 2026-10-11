@@ -29,9 +29,10 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cmp_to_key
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from storage.database.meta import fill_insert_fields, fill_update_fields
 from storage.database.schema import TableSchema
@@ -41,6 +42,27 @@ Row = Dict[str, Any]
 
 # 排序项：列名 → 方向（"asc" / "desc"）
 OrderItem = Tuple[str, str]
+
+# CAS 失败的四类标准原因（对应设计文档 §6.4：分别写日志与管理页原因，由调用方分类）
+CAS_SUPERSEDED = "superseded"            # 目标指针已被其他发布移动
+CAS_LEASE_LOST = "lease_lost"            # job 租约校验未通过
+CAS_DELETED = "deleted"                  # 目标文档/revision 已删除
+CAS_ALREADY_PUBLISHED = "already_published"  # 幂等重发：已是该状态
+CAS_WRITE_CONFLICT = "write_write_conflict"  # 事务提交时检测到并发写（first-committer-wins）
+
+
+class CasConflict(RuntimeError):
+    """
+    CAS 条件未命中 / 事务提交冲突（对齐设计文档 §6.4 的失败分类）
+
+    Args:
+        reason:  失败原因（四类标准原因见 CAS_* 常量；调用方按业务分类传入）
+        message: 可选补充信息（日志 / 管理页展示）
+    """
+
+    def __init__(self, reason: str, message: str = ""):
+        super().__init__(message or f"CAS conflict: {reason}")
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -221,13 +243,35 @@ class DatabaseClient(ABC):
         按条件删除多行（等价 Java delete(LambdaQueryWrapper)）
 
         Args:
-            table: 表名
-            where: 条件列表，AND 语义（至少一个）
+            table:  表名
+            where:  条件列表，AND 语义（至少一个）
 
         Returns:
             int: 受影响行数
         """
         ...
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """
+        事务上下文（最小能力，D3：只加 transaction()，不做 ORM 化）
+
+        语义（对齐设计文档 §6.4 / §17.3 / 决策 D4）：
+            - 同一事务内的读写落在同一连接 / 同一快照上；
+            - 事务内的写对事务外不可见，直到成功提交；
+            - with 体异常（含调用方主动 raise CasConflict）→ 整体回滚；
+            - InMemory 后端实现快照式事务（提交时校验并发写，first-committer-wins），
+              发布 CAS 的全部单元测试不依赖真实 PG；
+            - 不支持嵌套。
+
+        CAS 用法：事务内的条件更新返回受影响行数，调用方对「必须命中」的更新自行校验
+        并 raise CasConflict(CAS_*) 触发整体回滚——框架不把普通业务 0 行更新当冲突。
+
+        Yields:
+            None（事务范围由 with 体界定）
+        """
+        raise NotImplementedError(f"{type(self).__name__} 不支持事务")
+        yield None  # pragma: no cover - 使其成为生成器（contextmanager 要求）
 
 
 class InMemoryDatabaseClient(DatabaseClient):
@@ -244,6 +288,10 @@ class InMemoryDatabaseClient(DatabaseClient):
         self._tables: Dict[str, List[Row]] = {}
         # 表列集合（ensure_schema 登记；供元数据自动填充列感知裁剪，register_table 不登记）
         self._columns: Dict[str, set] = {}
+        # 表数据版本号（每次已生效的数据变更 +1；事务提交时据此做并发写校验）
+        self._versions: Dict[str, int] = {}
+        # 线程局部事务状态（事务按线程隔离；不支持嵌套）
+        self._tx_local = threading.local()
         for name, rows in (tables or {}).items():
             self.register_table(name, rows)
 
@@ -253,6 +301,7 @@ class InMemoryDatabaseClient(DatabaseClient):
             raise ValueError("表名不能为空")
         with self._lock:
             self._tables[table] = [dict(row) for row in rows]
+            self._versions[table] = self._versions.get(table, 0) + 1
 
     def ensure_schema(self, tables: Sequence[TableSchema]) -> None:
         """幂等：按表结构规格登记缺失的表（已存在的表不覆盖，保留既有数据）"""
@@ -262,8 +311,36 @@ class InMemoryDatabaseClient(DatabaseClient):
                     if not table.name or not table.name.strip():
                         raise ValueError("表名不能为空")
                     self._tables[table.name] = []
+                    self._versions[table.name] = self._versions.get(table.name, 0) + 1
                 # 登记列集合（自动填充列感知；已登记表可重复调用覆盖为同值）
                 self._columns[table.name] = set(table.column_names())
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """快照式事务（D4）：延迟写 overlay + 提交时表级版本校验（first-committer-wins）。
+
+        - 事务内读：已触及表读 overlay（含自身未提交写），未触及表读实时数据（按语句
+          对齐 PG READ COMMITTED）；
+        - 事务内写：写入线程局部 overlay，对事务外不可见；
+        - 提交：校验触及表版本未变（期间被并发写 → CasConflict(CAS_WRITE_CONFLICT)），
+          通过后原子重放变更；回滚仅丢弃 overlay，无残留。
+        """
+        if getattr(self._tx_local, "tx", None) is not None:
+            raise RuntimeError("嵌套事务不支持")
+        tx = _InMemoryTransaction(self)
+        self._tx_local.tx = tx
+        try:
+            yield
+            tx.commit()
+        except BaseException:
+            tx.discard()
+            raise
+        finally:
+            self._tx_local.tx = None
+
+    def _active_tx(self) -> Optional["_InMemoryTransaction"]:
+        """当前线程的活动事务（无则 None）；CRUD 方法据此路由到 overlay"""
+        return getattr(self._tx_local, "tx", None)
 
     def select_rows(
         self,
@@ -273,6 +350,20 @@ class InMemoryDatabaseClient(DatabaseClient):
         order_by: Optional[Sequence[OrderItem]] = None,
         limit: Optional[int] = None,
     ) -> List[Row]:
+        tx = self._active_tx()
+        if tx is not None:
+            return tx.select_rows(table, columns, where, order_by, limit)
+        return self._select_rows_direct(table, columns, where, order_by, limit)
+
+    def _select_rows_direct(
+        self,
+        table: str,
+        columns: Optional[Sequence[str]] = None,
+        where: Optional[Sequence[Condition]] = None,
+        order_by: Optional[Sequence[OrderItem]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Row]:
+        """无事务路由的直读（事务 overlay 对未触及表回源专用，防递归）"""
         with self._lock:
             conditions = list(where or [])
             matched = [
@@ -294,6 +385,15 @@ class InMemoryDatabaseClient(DatabaseClient):
         ids: Sequence[Any],
         id_column: str = "id",
     ) -> List[Row]:
+        tx = self._active_tx()
+        if tx is not None:
+            return tx.select_batch(table, ids, id_column)
+        return self._select_batch_direct(table, ids, id_column)
+
+    def _select_batch_direct(
+        self, table: str, ids: Sequence[Any], id_column: str = "id"
+    ) -> List[Row]:
+        """无事务路由的直读（事务 overlay 对未触及表回源专用，防递归）"""
         with self._lock:
             id_set = _dedupe(ids)
             if not id_set:
@@ -312,11 +412,15 @@ class InMemoryDatabaseClient(DatabaseClient):
     ) -> Any:
         if not table or not table.strip():
             raise ValueError("表名不能为空")
+        tx = self._active_tx()
+        if tx is not None:
+            return tx.insert_row(table, row, id_column)
         with self._lock:
             # 元数据自动填充（对齐 Java MyMetaObjectHandler insertFill；列感知裁剪）
             fill_insert_fields(row, columns=self._columns.get(table))
             inserted = dict(row)
             self._tables.setdefault(table, []).append(inserted)
+            self._versions[table] = self._versions.get(table, 0) + 1
             return inserted.get(id_column)
 
     def update_rows(
@@ -325,6 +429,9 @@ class InMemoryDatabaseClient(DatabaseClient):
         values: Row,
         where: Sequence[Condition],
     ) -> int:
+        tx = self._active_tx()
+        if tx is not None:
+            return tx.update_rows(table, values, where)
         with self._lock:
             # 元数据自动填充（对齐 Java MyMetaObjectHandler updateFill：update_time 强制刷新）
             fill_update_fields(values, columns=self._columns.get(table))
@@ -334,6 +441,8 @@ class InMemoryDatabaseClient(DatabaseClient):
                 if _all_match(row, conditions):
                     row.update(values)
                     updated += 1
+            if updated:
+                self._versions[table] = self._versions.get(table, 0) + 1
             return updated
 
     def delete_rows(
@@ -341,6 +450,9 @@ class InMemoryDatabaseClient(DatabaseClient):
         table: str,
         where: Sequence[Condition],
     ) -> int:
+        tx = self._active_tx()
+        if tx is not None:
+            return tx.delete_rows(table, where)
         with self._lock:
             conditions = list(where or [])
             rows = self._tables.get(table, [])
@@ -350,7 +462,144 @@ class InMemoryDatabaseClient(DatabaseClient):
                 self._tables[table] = remaining
             else:
                 self._tables.pop(table, None)
+            if deleted:
+                self._versions[table] = self._versions.get(table, 0) + 1
             return deleted
+
+
+class _InMemoryTransaction:
+    """
+    InMemory 快照式事务（D4）：延迟写 overlay + 提交时表级版本校验
+
+    - 触及（首次写）某表时对当前数据做整表快照并记录版本号；后续读写在 overlay 上进行；
+    - 提交时在锁内校验各触及表版本未变（被并发写 → CasConflict(CAS_WRITE_CONFLICT)，
+      first-committer-wins），通过后按序原子重放变更；版本校验为表级粒度（较 PG MVCC
+      行级更保守：同表无关并发写也会判冲突，开发测试后端可接受，生产用 PG）；
+    - 回滚 = 丢弃 overlay（真实数据从未被触碰）。
+    """
+
+    def __init__(self, client: "InMemoryDatabaseClient"):
+        self._client = client
+        self._snapshot: Dict[str, List[Row]] = {}
+        self._base_versions: Dict[str, int] = {}
+        self._ops: List[Tuple[Any, ...]] = []
+
+    def _touch(self, table: str) -> None:
+        """首次写某表：整表快照 + 记录基线版本（锁内取一致视图）"""
+        if table not in self._snapshot:
+            with self._client._lock:
+                self._snapshot[table] = [
+                    dict(row) for row in self._client._tables.get(table, [])
+                ]
+                self._base_versions[table] = self._client._versions.get(table, 0)
+
+    # ── 读侧（overlay 视图；未触及表回源实时读，对齐 READ COMMITTED 按语句取最新） ──
+
+    def select_rows(
+        self,
+        table: str,
+        columns: Optional[Sequence[str]] = None,
+        where: Optional[Sequence[Condition]] = None,
+        order_by: Optional[Sequence[OrderItem]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Row]:
+        if table not in self._snapshot:
+            return self._client._select_rows_direct(table, columns, where, order_by, limit)  # noqa: SLF001
+        conditions = list(where or [])
+        matched = [
+            row for row in self._snapshot[table] if _all_match(row, conditions)
+        ]
+        if order_by:
+            matched = sorted(matched, key=cmp_to_key(lambda a, b: _compare(a, b, order_by)))
+        projected = [_project(row, columns) for row in matched]
+        if limit is not None and limit > 0:
+            projected = projected[:limit]
+        return projected
+
+    def select_batch(
+        self,
+        table: str,
+        ids: Sequence[Any],
+        id_column: str = "id",
+    ) -> List[Row]:
+        if table not in self._snapshot:
+            return self._client._select_batch_direct(table, ids, id_column)  # noqa: SLF001
+        id_set = _dedupe(ids)
+        if not id_set:
+            return []
+        return [
+            dict(row)
+            for row in self._snapshot[table]
+            if row.get(id_column) in id_set
+        ]
+
+    # ── 写侧（overlay + 变更日志；元数据自动填充与非事务路径同语义） ──
+
+    def insert_row(self, table: str, row: Row, id_column: str = "id") -> Any:
+        self._touch(table)
+        fill_insert_fields(row, columns=self._client._columns.get(table))
+        inserted = dict(row)
+        self._snapshot[table].append(inserted)
+        self._ops.append(("insert", table, dict(row)))
+        return inserted.get(id_column)
+
+    def update_rows(self, table: str, values: Row, where: Sequence[Condition]) -> int:
+        self._touch(table)
+        values = dict(values)
+        fill_update_fields(values, columns=self._client._columns.get(table))
+        conditions = list(where or [])
+        updated = 0
+        for row in self._snapshot[table]:
+            if _all_match(row, conditions):
+                row.update(values)
+                updated += 1
+        self._ops.append(("update", table, tuple(conditions), dict(values)))
+        return updated
+
+    def delete_rows(self, table: str, where: Sequence[Condition]) -> int:
+        self._touch(table)
+        conditions = list(where or [])
+        rows = self._snapshot[table]
+        remaining = [row for row in rows if not _all_match(row, conditions)]
+        deleted = len(rows) - len(remaining)
+        self._snapshot[table] = remaining
+        self._ops.append(("delete", table, tuple(conditions)))
+        return deleted
+
+    # ── 提交 / 回滚 ──
+
+    def commit(self) -> None:
+        """版本校验 + 锁内按序原子重放（两步同一临界区，杜绝 TOCTOU）"""
+        client = self._client
+        with client._lock:
+            for table, base in self._base_versions.items():
+                if client._versions.get(table, 0) != base:
+                    raise CasConflict(
+                        CAS_WRITE_CONFLICT,
+                        f"表 {table} 在事务期间被并发修改（first-committer-wins）",
+                    )
+            for op in self._ops:
+                kind, table = op[0], op[1]
+                if kind == "insert":
+                    client._tables.setdefault(table, []).append(dict(op[2]))
+                elif kind == "update":
+                    conditions, values = op[2], op[3]
+                    for row in client._tables.get(table, []):
+                        if _all_match(row, conditions):
+                            row.update(values)
+                else:
+                    conditions = op[2]
+                    rows = client._tables.get(table, [])
+                    remaining = [r for r in rows if not _all_match(r, conditions)]
+                    if remaining:
+                        client._tables[table] = remaining
+                    else:
+                        client._tables.pop(table, None)
+            for table in self._base_versions:
+                client._versions[table] = client._versions.get(table, 0) + 1
+
+    def discard(self) -> None:
+        """丢弃 overlay（真实数据未被触碰，无清理动作；保留方法名以对齐事务生命周期）"""
 
 
 def _all_match(row: Row, conditions: Sequence[Condition]) -> bool:

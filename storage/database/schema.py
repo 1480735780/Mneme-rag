@@ -45,6 +45,25 @@ class ColumnSpec:
 
 
 @dataclass(frozen=True)
+class IndexSpec:
+    """
+    表索引规格（D2 增量对齐：CREATE [UNIQUE] INDEX IF NOT EXISTS，含部分索引）
+
+    Attributes:
+        name:    索引名（跨表全局唯一，对齐 PG 命名空间）
+        columns: 索引列（保序）
+        unique:  是否唯一索引（默认 False）
+        where:   部分索引谓词（Postgres 方言原样拼接，如
+                 "status IN ('QUEUED', 'RUNNING', 'BUILT_AWAITING_CONFIRMATION')"）；None = 全量索引
+    """
+
+    name: str
+    columns: Tuple[str, ...]
+    unique: bool = False
+    where: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class TableSchema:
     """
     表结构规格（对应 Java DO → 表）
@@ -53,11 +72,13 @@ class TableSchema:
         name:    表名（t_*）
         columns: 列规格列表（顺序即 DDL 列序）
         comment: 表注释（可选）
+        indexes: 索引规格列表（D2 增量对齐建；仅真实 SQL 后端消费，InMemory 忽略）
     """
 
     name: str
     columns: Tuple[ColumnSpec, ...] = field(default_factory=tuple)
     comment: Optional[str] = None
+    indexes: Tuple[IndexSpec, ...] = field(default_factory=tuple)
 
     def __post_init__(self):
         if not self.name or not self.name.strip():
@@ -69,6 +90,10 @@ class TableSchema:
     def column_names(self) -> Tuple[str, ...]:
         """列名序列（保序）"""
         return tuple(c.name for c in self.columns)
+
+    def index_names(self) -> Tuple[str, ...]:
+        """索引名序列（保序）"""
+        return tuple(i.name for i in self.indexes)
 
 
 def _cols(*items: Tuple[str, str]) -> Tuple[ColumnSpec, ...]:
@@ -153,6 +178,8 @@ _T_KNOWLEDGE_BASE = TableSchema(
             ("collection_name", "VARCHAR(64)"),
             ("created_by", "VARCHAR(64)"),
             ("updated_by", "VARCHAR(64)"),
+            # P9 阶段 0b（§17.2）：per-KB 版本化开关——未开启走旧路径，开启触发一次性 v0 迁移
+            ("versioning_enabled", "BOOLEAN"),
             ("create_time", "TIMESTAMP"),
             ("update_time", "TIMESTAMP"),
             ("deleted", "INTEGER"),
@@ -356,12 +383,17 @@ _T_KNOWLEDGE_CHUNK = TableSchema(
             ("char_count", "INTEGER"),
             ("token_count", "INTEGER"),
             ("embedding_text", "TEXT"),
+            ("parent_id", "VARCHAR(32)"),
+            ("chunk_role", "VARCHAR(20)"),
             ("enabled", "INTEGER"),
             ("created_by", "VARCHAR(64)"),
             ("updated_by", "VARCHAR(64)"),
             ("create_time", "TIMESTAMP"),
             ("update_time", "TIMESTAMP"),
             ("deleted", "INTEGER"),
+            # P9 阶段 0b/1（§3.4）：chunk 归属的 revision / attempt（存量行 NULL = v0 迁移后回填）
+            ("revision_id", "VARCHAR(32)"),
+            ("build_attempt_id", "VARCHAR(32)"),
         ),
     ),
     comment="知识库文档分块",
@@ -393,6 +425,12 @@ _T_KNOWLEDGE_DOCUMENT = TableSchema(
             ("create_time", "TIMESTAMP"),
             ("update_time", "TIMESTAMP"),
             ("deleted", "INTEGER"),
+            # P9 阶段 0b/1（§3.1）：版本化指针与策略（存量行 NULL = 未迁移，走旧路径）
+            ("active_revision_id", "VARCHAR(32)"),
+            ("desired_revision_id", "VARCHAR(32)"),
+            ("update_policy", "VARCHAR(16)"),
+            ("source_identity", "VARCHAR(128)"),
+            ("metadata_generation", "BIGINT"),
         ),
     ),
     comment="知识库文档",
@@ -681,6 +719,118 @@ _T_AGENT_STATE = TableSchema(
 
 # 当前消费方用到的全部 t_* 表（4.1 KB provider / 5.1 记忆 store / 摘要 / 5.5 AgentPromptResolver / ChunkMetadataResolver
 # / P4 会话/反馈/示例问题/追踪持久化 / P5 摄取与调度域 / v1.1 Agent 执行架构域）
+# ==================== P9 阶段 1（§3.2–3.4）：版本化域三张新表 ====================
+
+_T_KNOWLEDGE_REVISION = TableSchema(
+    name="t_knowledge_revision",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            # revision_id 即主键（雪花 id，§3.2 不可变版本身份）
+            ("document_id", "VARCHAR(32)"),
+            ("kb_id", "VARCHAR(32)"),
+            ("source_type", "VARCHAR(16)"),
+            ("source_hash", "VARCHAR(64)"),
+            ("build_fingerprint", "VARCHAR(64)"),
+            # BUILT_AWAITING_CONFIRMATION / SUCCEEDED / FAILED / REJECTED / REVOKED
+            # （发布状态由 Document.active_revision_id 指针表达，revision 不设 PUBLISHED 态）
+            ("status", "VARCHAR(32)"),
+            ("committed_attempt_id", "VARCHAR(32)"),
+            ("embedding_model", "VARCHAR(64)"),
+            ("embedding_dimension", "INTEGER"),
+            ("created_at", "TIMESTAMP"),
+            ("completed_at", "TIMESTAMP"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    indexes=(
+        IndexSpec(
+            name="idx_revision_doc_fingerprint",
+            columns=("document_id", "build_fingerprint"),
+        ),
+        IndexSpec(name="idx_revision_doc_status", columns=("document_id", "status")),
+    ),
+    comment="知识文档不可变版本（§3.2；发布后不可修改，失败重试只换 build_attempt_id）",
+)
+
+_T_KNOWLEDGE_UPDATE_JOB = TableSchema(
+    name="t_knowledge_update_job",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            # job_id 即主键（雪花 id，§3.3）；build_attempt_id 一次具体执行，重试递增
+            ("document_id", "VARCHAR(32)"),
+            ("kb_id", "VARCHAR(32)"),
+            ("revision_id", "VARCHAR(32)"),
+            ("build_attempt_id", "VARCHAR(32)"),
+            ("content_hash", "VARCHAR(64)"),
+            ("build_fingerprint", "VARCHAR(64)"),
+            # QUEUED / RUNNING / BUILT_AWAITING_CONFIRMATION / SUCCEEDED /
+            # FAILED_RETRYABLE / FAILED_MANUAL / CANCELED
+            ("status", "VARCHAR(32)"),
+            ("expected_child_count", "INTEGER"),
+            ("expected_parent_count", "INTEGER"),
+            ("lease_owner", "VARCHAR(64)"),
+            ("lease_token", "VARCHAR(64)"),
+            ("lease_until", "TIMESTAMP"),
+            ("retry_count", "INTEGER"),
+            ("next_retry_at", "TIMESTAMP"),
+            ("error_code", "VARCHAR(64)"),
+            ("error_message", "TEXT"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+            ("deleted", "INTEGER"),
+        ),
+    ),
+    indexes=(
+        # §17.4.5：同文档活跃任务唯一（应用层把唯一冲突翻译为「返回已有 job_id」）
+        IndexSpec(
+            name="uq_update_job_active_doc",
+            columns=("document_id",),
+            unique=True,
+            where="status IN ('QUEUED', 'RUNNING', 'BUILT_AWAITING_CONFIRMATION')",
+        ),
+        # 队列扫描：可重试任务领取
+        IndexSpec(name="idx_update_job_queue", columns=("status", "next_retry_at")),
+    ),
+    comment="知识文档版本化更新任务（§3.3；持久化、租约 fencing、重试退避）",
+)
+
+_T_KNOWLEDGE_CHUNK_IDENTITY = TableSchema(
+    name="t_knowledge_chunk_identity",
+    columns=(
+        # chunk_key_id = sha256(canonical_natural_key)[:20]（§3.4；截断碰撞由主键唯一性捕获）
+        ColumnSpec(name="chunk_key_id", data_type="VARCHAR(20)", primary_key=True),
+        *_cols(
+            ("document_id", "VARCHAR(32)"),
+            ("revision_id", "VARCHAR(32)"),
+            ("build_attempt_id", "VARCHAR(32)"),
+            ("chunk_index", "INTEGER"),
+            ("chunk_role", "VARCHAR(20)"),
+            # 指向物理 chunk 行（父子回填 / 引用解析 / 计数对账 / 精确清理的硬依赖）
+            ("chunk_id", "VARCHAR(32)"),
+            ("parent_key_id", "VARCHAR(20)"),
+            # §17.4.4：chunk 内容级 hash 预埋（二期 chunk 级向量复用依赖，现在加列成本为零）
+            ("content_hash", "VARCHAR(64)"),
+            ("create_time", "TIMESTAMP"),
+            ("update_time", "TIMESTAMP"),
+        ),
+    ),
+    indexes=(
+        # §3.4：四元组唯一约束——同时捕获截断 hash 碰撞（发现碰撞必须失败，不静默覆盖）。
+        # 注意 chunk_index 在 (document_id, revision_id, build_attempt_id) 域内全局唯一，
+        # parent/child 共用同一 index 序列，写侧（阶段 3）负责编号。
+        IndexSpec(
+            name="uq_chunk_identity_natural_key",
+            columns=("document_id", "revision_id", "build_attempt_id", "chunk_index"),
+            unique=True,
+        ),
+    ),
+    comment="chunk 自然键注册表（§3.4；完整自然键入表，截断 hash 碰撞必须失败）",
+)
+
 DEFAULT_TABLES: List[TableSchema] = [
     _T_CONVERSATION,
     _T_MESSAGE,
@@ -689,6 +839,9 @@ DEFAULT_TABLES: List[TableSchema] = [
     _T_KNOWLEDGE_CHUNK,
     _T_KNOWLEDGE_DOCUMENT,
     _T_KNOWLEDGE_DOCUMENT_CHUNK_LOG,
+    _T_KNOWLEDGE_REVISION,
+    _T_KNOWLEDGE_UPDATE_JOB,
+    _T_KNOWLEDGE_CHUNK_IDENTITY,
     _T_KNOWLEDGE_DOCUMENT_SCHEDULE,
     _T_KNOWLEDGE_DOCUMENT_SCHEDULE_EXEC,
     _T_INGESTION_PIPELINE,

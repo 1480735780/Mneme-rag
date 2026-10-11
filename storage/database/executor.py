@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional, Sequence, Tuple
+from contextlib import contextmanager
+from typing import Any, Iterator, List, Optional, Sequence, Tuple
 
 from storage.database.client import Row
 
@@ -88,15 +89,68 @@ class SqlExecutor(ABC):
         self, sql: str, params: Optional[Sequence[Any]] = None
     ) -> Optional[Any]:
         """
-        执行单值查询（COUNT / 标量），无行返回 None（对应 JdbcTemplate.queryForObject）
+        执行单值查询（COUNT / 标量），无行返回 None，对应 JdbcTemplate.queryForObject
 
         Args:
             sql:    SQL 语句
-            params: 占位符 `?` 的参数（无参可省略）
+            params: 占位符 `?` 的参数
 
         Returns:
             Optional[Any]: 首行首列值；无行返回 None
         """
+        ...
+
+    @contextmanager
+    def session(self) -> Iterator["SqlExecutorSession"]:
+        """
+        独占一条连接的会话执行器（事务底座；对应 JdbcTemplate 同连接语义）
+
+        会话内所有语句落在同一连接上（池化连接下逐方法调用会各自取还连接，GUC/事务
+        状态会静默丢失）；commit / rollback 由调用方收口。默认不支持（记录型实现可不覆写，
+        但消费方调 session() 会得到明确报错）。
+
+        Yields:
+            SqlExecutorSession: 会话执行器（同 SqlExecutor 五方法 + commit/rollback）
+        """
+        raise NotImplementedError(f"{type(self).__name__} 不支持 session()")
+        yield None  # pragma: no cover - 使其成为生成器（contextmanager 要求）
+
+    def query_with_session(
+        self, session_sqls: Sequence[str], sql: str, params: Optional[Sequence[Any]] = None
+    ) -> List[Row]:
+        """
+        先执行会话前置语句（SET 等），再执行查询（对应 JdbcTemplate 的同连接语义）
+
+        会话级 GUC（hnsw.ef_search / random_page_cost 等）必须与查询落在同一连接上才生效；
+        逐条 execute + query 的组合在池化连接下不保证同连接（真实后端每次调用独立取还连接，
+        SET 可能落在另一条连接上被后续查询错过）。默认实现为逐条转发的尽力语义（记录型 /
+        测试实现复用）；真实后端必须覆写为同连接执行（见 SqlAlchemySqlExecutor.query_with_session）。
+
+        Args:
+            session_sqls: 前置会话语句列表（如 SET ...，按序执行）
+            sql:          查询 SQL（`?` 占位符）
+            params:       查询参数
+
+        Returns:
+            List[Row]: 查询行列表
+        """
+        for session_sql in session_sqls:
+            self.execute(session_sql)
+        return self.query(sql, params)
+
+
+class SqlExecutorSession(SqlExecutor):
+    """同连接会话执行器（SqlExecutor.session() 的产物）：连接生命周期由 session() 管理，
+    commit / rollback 收口事务边界；五方法语义与 SqlExecutor 一致但不自动提交"""
+
+    @abstractmethod
+    def commit(self) -> None:
+        """提交当前会话事务"""
+        ...
+
+    @abstractmethod
+    def rollback(self) -> None:
+        """回滚当前会话事务"""
         ...
 
 
@@ -198,6 +252,30 @@ class SqlAlchemySqlExecutor(SqlExecutor):
             row = conn.execute(self._text(sql, params)).first()
             return row[0] if row is not None else None
 
+    def query_with_session(
+        self, session_sqls: Sequence[str], sql: str, params: Optional[Sequence[Any]] = None
+    ) -> List[Row]:
+        """同一连接上先执行会话语句再查询。
+
+        池化连接下逐条 execute + query 会各自取还连接，SET 可能落在另一条连接上被
+        查询错过（GUC 静默丢失）；此处保证前置语句与查询共用同一连接。
+        会话级 SET（非 LOCAL）不随回滚消失，连接归还池后 GUC 保留（对后续取用者
+        无害：pgvector GUC 只影响 HNSW 扫描，rpc=1.1 即全局期望的成本基线）。
+        """
+        with self._engine.connect() as conn:
+            for session_sql in session_sqls:
+                conn.execute(self._text(session_sql, None))
+            result = conn.execute(self._text(sql, params))
+            rows = [dict(row) for row in result.mappings()]
+            conn.commit()
+            return rows
+
+    @contextmanager
+    def session(self) -> Iterator["SqlExecutorSession"]:
+        """独占一条池化连接的会话执行器；语句不自动提交，由 commit/rollback 收口"""
+        with self._engine.connect() as conn:
+            yield _SqlAlchemySession(conn)
+
     @staticmethod
     def _create_engine(url: str):
         try:
@@ -275,3 +353,45 @@ def _copy_params(params: Optional[Sequence[Any]]) -> Optional[Sequence[Any]]:
     if isinstance(params, tuple):
         return tuple(params)
     return list(params)
+
+
+class _SqlAlchemySession(SqlExecutorSession):
+    """SQLAlchemy 会话执行器：单连接、不自动提交（SQLAlchemy autobegin 开启隐式事务，
+    commit / rollback 由调用方收口；连接关闭由 session() 上下文负责归还连接池）"""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql: str, params: Optional[Sequence[Any]] = None) -> None:
+        self._conn.execute(self._text(sql, params))
+
+    def update(self, sql: str, params: Optional[Sequence[Any]] = None) -> int:
+        result = self._conn.execute(self._text(sql, params))
+        return result.rowcount or 0
+
+    def batch_update(self, sql: str, seq_params: Sequence[Sequence[Any]]) -> int:
+        total = 0
+        for params in seq_params:
+            result = self._conn.execute(self._text(sql, params))
+            total += result.rowcount or 0
+        return total
+
+    def query(self, sql: str, params: Optional[Sequence[Any]] = None) -> List[Row]:
+        result = self._conn.execute(self._text(sql, params))
+        return [dict(row) for row in result.mappings()]
+
+    def query_for_value(
+        self, sql: str, params: Optional[Sequence[Any]] = None
+    ) -> Optional[Any]:
+        row = self._conn.execute(self._text(sql, params)).first()
+        return row[0] if row is not None else None
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    @staticmethod
+    def _text(sql: str, params: Optional[Sequence[Any]]):
+        return SqlAlchemySqlExecutor._text(sql, params)
