@@ -174,12 +174,13 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
         return result_to_dict(result)
 
     # P10.1 T1.2：观测自健康端点（D13，JSON 序列化出口——只读 stats/depth 不触发行为；
-    # 熔断状态随 T1.7、当日 token/成本随 T3.3 在此区块扩展）
+    # T1.7 起附熔断区块，当日 token/成本随 T3.3 扩展）
     @app.get("/metrics")
     async def metrics() -> dict:
         container: AppContainer = app.state.container
         hub = container.observation_hub
         report = hub.metrics() if hub is not None else {}
+        report["breakers"] = container.breaker_snapshot()
         return result_to_dict(Results.success(report))
 
     # P9 §10.2/§17.5.2：版本化能力探针端点（按需触发实测三步；失败标 versioning_unavailable）

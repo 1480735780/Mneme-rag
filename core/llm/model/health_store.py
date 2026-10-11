@@ -45,9 +45,12 @@ core.llm.model.health_store - 模型健康状态存储（断路器模式）
 """
 import time
 import threading
+from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, List, Optional
+
+from core.llm.observation.events import BreakerEvent
 
 """
     熔断器状态枚举（对应 Java 的 State 枚举）
@@ -139,6 +142,10 @@ class ModelHealthStore():
         self._lock = threading.RLock()
         # 探测令牌自增序列：对应 Java 的 AtomicLong probeTokenSeq
         self._token_seq = 0
+        # P10.1 T1.7/D12：状态变更观察者（回调同步、非阻塞——观测队列 put_nowait 语义）；
+        # observer 异常吞掉并计数（observer_errors 进 /metrics）——观测 bug 永不打挂熔断器
+        self._observers: List[Callable[[BreakerEvent], None]] = []
+        self.observer_errors = 0
 
      def _now_ms(self) -> int:
         """
@@ -166,6 +173,42 @@ class ModelHealthStore():
         """
         self._token_seq += 1
         return self._token_seq
+
+     # ==================== P10.1 T1.7：状态变更观察者（D12 接缝） ====================
+
+     def add_state_observer(self, callback: Callable[[BreakerEvent], None]) -> None:
+        """注册状态变更观察者（既有方法签名零改动，新增注册口）。
+
+        回调契约：同步、非阻塞（观测队列 put_nowait 语义）、不得做任何阻塞 IO；
+        异常被吞掉并计入 observer_errors（观测 bug 永不打挂熔断器，第一戒律）。
+        """
+        self._observers.append(callback)
+
+     def _notify_transition(
+        self, model_id: str, from_state: HealthState, to_state: HealthState, failure_count: int
+    ) -> None:
+        """状态转换处投递事件（锁内调用——仅构造事件 + 非阻塞投递，无 IO，D12）"""
+        if not self._observers:
+            return
+        event = BreakerEvent(
+            model_id=model_id,
+            from_state=from_state.value,
+            to_state=to_state.value,
+            failure_count=failure_count,
+            create_time=datetime.now().isoformat(),
+        )
+        for observer in self._observers:
+            try:
+                observer(event)
+            except Exception:  # noqa: BLE001 —— D12：观测异常吞掉 + 计数
+                self.observer_errors += 1
+
+     def snapshot_states(self) -> dict:
+        """/metrics 熔断区块出口（只读；字段读取原子，best-effort 无锁）"""
+        return {
+            "states": {mid: h.state.value for mid, h in self.health_by_id.items()},
+            "observer_errors": self.observer_errors,
+        }
     
      def is_unavailable(self,model_id:str):
         """
@@ -247,6 +290,7 @@ class ModelHealthStore():
                 health.state = HealthState.HALF_OPEN
                 health.half_open_in_flight = True
                 health.half_open_token = self._next_token()
+                self._notify_transition(model_id, HealthState.OPEN, HealthState.HALF_OPEN, health.consecutive_failures)
                 return CallPermit(model_id, health.half_open_token)
 
             # ========== 状态：HALF_OPEN（半开探测中） ==========
@@ -284,10 +328,14 @@ class ModelHealthStore():
             if health is None:
                 self.health_by_id[model_id] = ModelHealth()
                 return
+            previous = health.state
             health.state = HealthState.CLOSED
             health.consecutive_failures = 0
             health.open_until = 0
             health.half_open_in_flight = False
+            # T1.7：恢复 CLOSED 才是事件（CLOSED 内成功重置计数不是状态变更）
+            if previous != HealthState.CLOSED:
+                self._notify_transition(model_id, previous, HealthState.CLOSED, 0)
 
      def mark_failure(self,model_id:str)-> None:
         """
@@ -319,13 +367,18 @@ class ModelHealthStore():
                 health.open_until = now_ms + self.open_duration_ms
                 health.consecutive_failures = 0
                 health.half_open_in_flight = False
+                # T1.7：探测失败立即重新熔断（快照 0 = 探测路径）
+                self._notify_transition(model_id, HealthState.HALF_OPEN, HealthState.OPEN, 0)
                 return
 
             health.consecutive_failures += 1
             if health.consecutive_failures >= self.failure_threshold:
+                triggered = health.consecutive_failures
                 health.state = HealthState.OPEN
                 health.open_until = now_ms + self.open_duration_ms
                 health.consecutive_failures = 0
+                # T1.7：阈值触发熔断（快照 = 触发计数）
+                self._notify_transition(model_id, HealthState.CLOSED, HealthState.OPEN, triggered)
 
      def release_half_open_permit(self,permit:CallPermit)-> None:
         """

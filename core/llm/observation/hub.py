@@ -15,11 +15,12 @@ T1.7 接入 BreakerEvent 时在此登记分支。
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional
+from collections import deque
+from typing import Any, Dict, Deque, List, Optional
 
 from core.llm.observation.collector import ObservationStats
 from core.llm.observation.dao import LlmCallDao
-from core.llm.observation.events import CallEvent
+from core.llm.observation.events import BreakerEvent, CallEvent
 from core.llm.observation.queue import ObservationQueue
 
 
@@ -37,6 +38,8 @@ class ObservationHub:
     ):
         self.dao = dao
         self.stats = stats if stats is not None else ObservationStats()
+        # P10.1 T1.7：熔断事件环形缓冲（调试/告警消费前兜底可见；T4.2 告警消费接此处）
+        self.recent_breaker_events: Deque[BreakerEvent] = deque(maxlen=50)
         self.queue = ObservationQueue(
             self._flush_events,
             maxsize=maxsize,
@@ -60,6 +63,11 @@ class ObservationHub:
         for item in batch:
             if isinstance(item, CallEvent):
                 self.dao.insert(item.to_row())
+            elif isinstance(item, BreakerEvent):
+                # T1.7：熔断事件不入库（无表），进环形缓冲供调试 + 计数；
+                # T4.2 在此处接告警分发
+                self.recent_breaker_events.append(item)
+                self.stats.breaker_events += 1
             else:
                 raise ValueError(f"未知观测事件类型，整批拒收: {type(item).__name__}")
 
@@ -83,4 +91,5 @@ class ObservationHub:
         """/metrics 的观测区块（采集与输出分离：只读 stats/depth，不触发任何行为）"""
         snapshot = self.stats.snapshot()
         snapshot["queue_depth"] = self.queue.depth()
+        snapshot["recent_breaker_events"] = len(self.recent_breaker_events)
         return {"observation": snapshot}

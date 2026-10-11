@@ -325,6 +325,8 @@ class AppContainer:
     # T1.3 起发射点经 hub.emit() 写入；双 profile 无差别装配）
     observation_hub: Any = None
     llm_call_dao: Any = None
+    # P10.1 T1.7：各路由栈（chat/embedding/rerank）的熔断器快照收集（/metrics 熔断区块）
+    _model_health_stores: list = field(default_factory=list)
     _owned: list = field(default_factory=list)
 
     # ==================== 双 profile 装配 ====================
@@ -1067,6 +1069,10 @@ class AppContainer:
             failure_threshold=int(getattr(selection, "failure_threshold", 2) or 2),
             open_duration_ms=int(getattr(selection, "open_duration_ms", 30000) or 30000),
         )
+        # P10.1 T1.7：熔断状态观察者（观测队列）+ 快照收集（/metrics 熔断区块）
+        self._model_health_stores.append(health_store)
+        if self.observation_hub is not None:
+            health_store.add_state_observer(self.observation_hub.emit)
         return RoutingEmbeddingService(
             ModelSelector(config, health_store),
             RoutingExecutor(
@@ -1104,6 +1110,10 @@ class AppContainer:
             failure_threshold=int(getattr(selection, "failure_threshold", 2) or 2),
             open_duration_ms=int(getattr(selection, "open_duration_ms", 30000) or 30000),
         )
+        # P10.1 T1.7：熔断状态观察者（观测队列）+ 快照收集（/metrics 熔断区块）
+        self._model_health_stores.append(health_store)
+        if self.observation_hub is not None:
+            health_store.add_state_observer(self.observation_hub.emit)
         selector = ModelSelector(config, health_store)
         executor = RoutingExecutor(
             health_store,
@@ -1189,6 +1199,10 @@ class AppContainer:
             failure_threshold=int(getattr(selection, "failure_threshold", 2) or 2),
             open_duration_ms=int(getattr(selection, "open_duration_ms", 30000) or 30000),
         )
+        # P10.1 T1.7：熔断状态观察者（观测队列）+ 快照收集（/metrics 熔断区块）
+        self._model_health_stores.append(health_store)
+        if self.observation_hub is not None:
+            health_store.add_state_observer(self.observation_hub.emit)
         return RoutingRerankService(
             ModelSelector(config, health_store),
             RoutingExecutor(
@@ -1801,6 +1815,10 @@ class AppContainer:
                     closer()
                 except Exception:  # noqa: BLE001 释放失败不阻断关闭
                     logger.warning("装配对象释放失败: %s", obj, exc_info=True)
+
+    def breaker_snapshot(self) -> dict:
+        """/metrics 熔断区块（T1.7）：各路由栈（chat/embedding/rerank）健康状态快照聚合"""
+        return {"stores": [store.snapshot_states() for store in self._model_health_stores]}
 
     async def aclose(self) -> None:
         """释放容器持有的全部资源（lifespan 退出调用）：同步 _owned + redis 连接池优雅断开

@@ -20,10 +20,11 @@ from typing import Dict
 class ObservationStats:
     """观测管线自健康计数（丢弃/失败可见，Q1/R2-Q1 冻结口径）"""
 
-    enqueued: int = 0       # 成功入队条数
-    dropped_full: int = 0   # 满载丢弃 + 停机后投递（均属「未能进入消费管道」）
-    flushed: int = 0        # 已交付 handler 的条数（含 stop_and_drain）
-    flush_errors: int = 0   # handler 抛异常的 flush 批次数（整批未落库，不重试）
+    enqueued: int = 0        # 成功入队条数
+    dropped_full: int = 0    # 满载丢弃 + 停机后投递（均属「未能进入消费管道」）
+    flushed: int = 0         # 已交付 handler 的条数（含 stop_and_drain）
+    flush_errors: int = 0    # handler 抛异常的 flush 批次数（整批未落库，不重试）
+    breaker_events: int = 0  # 熔断状态事件数（T1.7：进 recent 环形缓冲，告警消费在 T4.2）
 
     def snapshot(self) -> Dict[str, int]:
         """/metrics 序列化出口消费的只读快照（D13：采集与输出分离）"""
@@ -32,4 +33,5 @@ class ObservationStats:
             "dropped_full": self.dropped_full,
             "flushed": self.flushed,
             "flush_errors": self.flush_errors,
+            "breaker_events": self.breaker_events,
         }

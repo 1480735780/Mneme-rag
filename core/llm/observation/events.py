@@ -65,6 +65,26 @@ TOKEN_SOURCE_MIXED = "mixed"
 
 
 @dataclass(frozen=True)
+class BreakerEvent:
+    """
+    熔断器状态变更事件（P10.1 T1.7，D12：schema 随接缝冻结——T4.2 告警消费者
+    照此写码，P10.1 落地前即可开发）。
+
+    Attributes:
+        model_id: 模型唯一标识（熔断器粒度）。
+        from_state / to_state: 转换前后状态（closed / open / half_open）。
+        failure_count: 触发时刻的失败统计快照（阈值路径 = 触发计数；探测路径 = 0）。
+        create_time: 事件时间（发射点物化）。
+    """
+
+    model_id: str
+    from_state: str
+    to_state: str
+    failure_count: int
+    create_time: str
+
+
+@dataclass(frozen=True)
 class CallEvent:
     """
     一次真实 LLM API 调用的观测事件（发射点物化 → 队列 → flush 落库 t_llm_call）
