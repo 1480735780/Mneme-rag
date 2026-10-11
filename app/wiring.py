@@ -1106,7 +1106,14 @@ class AppContainer:
             max_fallback=getattr(selection, "max_fallback", None),
             transient_retries=int(getattr(selection, "transient_retries", 0) or 0),
         )
-        return RoutingLLMService(selector, health_store, executor, clients, config)
+        # P10.1 T1.3：观测端口注入（_wire_observation 在 build 序列最前，hub 必已装配；
+        # 测试桩经 llm_service 槽注入时绕过本方法，无观测属预期）
+        return RoutingLLMService(
+            selector, health_store, executor, clients, config,
+            observation_sink=(
+                self.observation_hub.emit if self.observation_hub is not None else None
+            ),
+        )
 
     # ==================== 跨域共享实例（对齐 Java 单例 bean） ====================
 

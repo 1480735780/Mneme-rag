@@ -45,6 +45,7 @@ from common.exception.model_client_exception import (
 )
 from core.llm.config.config import ProviderConfig
 from core.llm.model.model_target import ModelTarget
+from core.llm.result import ChatResult, UsageStats
 from core.llm.schema import ChatRequest
 from core.llm.sse_parser import OpenAIStyleSseParser
 
@@ -326,11 +327,14 @@ class OpenAIStyleChatClient(BaseChatClient):
             return base_url + "/" + path
         return base_url + path
 
-    def _extract_chat_content(self, data: Dict[str, Any]) -> str:
+    def _extract_chat_content(self, data: Dict[str, Any]) -> ChatResult:
         """
-        从 OpenAI 兼容响应中提取文本内容（对齐 Java 的 extractChatContent）。
+        从 OpenAI 兼容响应提取文本内容 + usage（对齐 Java 的 extractChatContent，P10.1 扩展）。
 
         校验链：choices 存在 → choices 非空 → choices[0].message → content 非空白。
+        usage 解析（P10.1/T1.3，D1 返回值子类化）：prompt/completion tokens 缺失或
+        非 int 时置 None（发射点据此回落估算并标 token_source，D6）；解析失败不影响
+        内容返回——观测元数据永远不能反过来破坏业务结果。
         """
         if not isinstance(data, dict) or "choices" not in data:
             raise ModelClientException(
@@ -366,7 +370,23 @@ class OpenAIStyleChatClient(BaseChatClient):
                 ModelClientErrorType.INVALID_RESPONSE,
             )
 
-        return content
+        return ChatResult(content, self._parse_usage(data))
+
+    @staticmethod
+    def _parse_usage(data: Dict[str, Any]) -> Optional[UsageStats]:
+        """响应 usage 字段 → UsageStats（任何形态异常都回落 None，观测不破坏业务）"""
+        raw = data.get("usage")
+        if not isinstance(raw, dict):
+            return None
+
+        def _int(value: Any) -> Optional[int]:
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+        prompt_tokens = _int(raw.get("prompt_tokens"))
+        completion_tokens = _int(raw.get("completion_tokens"))
+        if prompt_tokens is None and completion_tokens is None:
+            return None
+        return UsageStats(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
 
     # ===============================
     # 内部辅助

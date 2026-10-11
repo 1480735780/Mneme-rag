@@ -26,7 +26,7 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .callback import BaseStreamCallback, StreamCallback
 from .config.config import AIModelConfig, ModelCandidate, ProviderConfig
@@ -35,6 +35,7 @@ from .model.health_store import ModelHealthStore
 from .model.model_target import ModelTarget
 from .model.routing_executor import RoutingExecutionError, RoutingExecutor
 from .model.selector import ModelSelector
+from .observation.emit import ChatCallObserver
 from .providers.base import BaseChatClient
 from .schema import ChatRequest, Message
 
@@ -288,11 +289,20 @@ class RoutingLLMService(LLMService):
         executor: RoutingExecutor,
         clients: List[BaseChatClient],
         config: Optional[AIModelConfig] = None,
+        observation_sink: Optional[Callable[[Any], bool]] = None,
     ) -> None:
+        """
+        Args:
+            observation_sink: 观测事件投递端口（P10.1 T1.3，ObservationHub.emit；
+                None = 观测未装配，行为与既有完全一致）。非 None 时 chat() 经
+                ChatCallObserver 逐次真实调用记录（含 transient 重试），请求终态
+                统一投递 t_llm_call 明细（D1/D4/D5 发射点纪律）。
+        """
         self._selector = selector
         self._health_store = health_store
         self._executor = executor
         self._config = config
+        self._observation_sink = observation_sink
         self._clients_by_provider: Dict[str, BaseChatClient] = self._build_registry(clients)
 
     # ==================== 同步调用 ====================
@@ -317,12 +327,31 @@ class RoutingLLMService(LLMService):
         if preferred_model_id and not allow_fallback:
             # 显式禁用降级：仅保留指定模型（未解析到则 fail-fast）
             targets = self._only_preferred(targets, preferred_model_id)
-        return await self._executor.execute_with_fallback(
-            ModelCapability.CHAT,
-            targets,
-            lambda t: self._clients_by_provider.get(t.candidate.provider),#客户端不是从候选里“拿”出来的——候选（`ModelTarget` ）只携带`candidate.provider` 字符串（纯配置层信息），客户端实例是启动时由 _build_registry 按 provider 建的`Dict[str, BaseChatClient]` 。所以那行 lambda 本质就是一次字典查找
-            lambda client, t: client.chat(request, t),
+        # P10.1 T1.3：观测未装配时与既有路径完全一致（sink None → observer None）
+        observer = (
+            ChatCallObserver(
+                self._observation_sink,
+                request=request,
+                tier=tier.value if tier is not None else None,
+            )
+            if self._observation_sink is not None
+            else None
         )
+        caller: Callable[[Any, Any], Awaitable[Any]] = lambda client, t: client.chat(request, t)
+        if observer is not None:
+            caller = observer.wrap_caller(caller)
+        try:
+            return await self._executor.execute_with_fallback(
+                ModelCapability.CHAT,
+                targets,
+                lambda t: self._clients_by_provider.get(t.candidate.provider),#客户端不是从候选里“拿”出来的——候选（`ModelTarget` ）只携带`candidate.provider` 字符串（纯配置层信息），客户端实例是启动时由 _build_registry 按 provider 建的`Dict[str, BaseChatClient]` 。所以那行 lambda 本质就是一次字典查找
+                caller,
+            )
+        finally:
+            # 请求终态（成功返回 / 全部失败抛出）统一补标 is_final 并投递明细；
+            # 无候选可调（targets 空）时 observer 无记录，finish 幂等零副作用
+            if observer is not None:
+                observer.finish()
 
     # ==================== 流式调用 ====================
 
