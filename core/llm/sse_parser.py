@@ -23,7 +23,7 @@ import json
 from dataclasses import dataclass
 from typing import Optional
 
-from core.llm.result import UsageStats
+from core.llm.result import UsageStats, parse_usage_dict
 
 
 DATA_PREFIX = "data:"
@@ -136,19 +136,8 @@ class OpenAIStyleSseParser:
 
     @staticmethod
     def _extract_usage(chunk: dict) -> Optional[UsageStats]:
-        """usage 块 → UsageStats（形态异常一律 None，观测元数据不破坏解析降级链）"""
-        raw = chunk.get("usage")
-        if not isinstance(raw, dict):
-            return None
-
-        def _int(value) -> Optional[int]:
-            return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-        prompt_tokens = _int(raw.get("prompt_tokens"))
-        completion_tokens = _int(raw.get("completion_tokens"))
-        if prompt_tokens is None and completion_tokens is None:
-            return None
-        return UsageStats(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+        """usage 块 → UsageStats（统一口径见 result.parse_usage_dict）"""
+        return parse_usage_dict(chunk.get("usage"))
 
     @staticmethod
     def _extract_text(choice: dict, field_name: str) -> Optional[str]:

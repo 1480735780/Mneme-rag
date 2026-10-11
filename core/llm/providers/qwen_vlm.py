@@ -20,6 +20,7 @@ from common.exception.model_client_exception import (
 )
 from core.llm.config.config import ProviderConfig
 from core.llm.model.model_target import ModelTarget
+from core.llm.result import ChatResult, parse_usage_dict
 
 from .base_vlm import BaseVlmClient
 
@@ -156,8 +157,9 @@ class QwenVlmClient(BaseVlmClient):
             return base_url + "/" + path
         return base_url + path
 
-    def _extract_content(self, data: Dict[str, Any]) -> str:
-        """抽取 OpenAI 兼容响应的 choices[0].message.content。"""
+    def _extract_content(self, data: Dict[str, Any]) -> ChatResult:
+        """抽取 OpenAI 兼容响应的 choices[0].message.content；
+        ChatResult(str) 携带 usage（P10.1 T1.5，缺失为 None）。"""
         if not isinstance(data, dict) or "choices" not in data:
             raise ModelClientException(
                 "VLM 响应缺少 choices",
@@ -187,7 +189,7 @@ class QwenVlmClient(BaseVlmClient):
                 "VLM 响应 content 为空白",
                 ModelClientErrorType.INVALID_RESPONSE,
             )
-        return content
+        return ChatResult(content, parse_usage_dict(data.get("usage")))
 
     # ==================== 内部辅助 ====================
 

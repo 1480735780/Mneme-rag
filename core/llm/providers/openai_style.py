@@ -45,7 +45,7 @@ from common.exception.model_client_exception import (
 )
 from core.llm.config.config import ProviderConfig
 from core.llm.model.model_target import ModelTarget
-from core.llm.result import ChatResult, UsageStats
+from core.llm.result import ChatResult, UsageStats, parse_usage_dict
 from core.llm.schema import ChatRequest
 from core.llm.sse_parser import OpenAIStyleSseParser
 
@@ -390,19 +390,8 @@ class OpenAIStyleChatClient(BaseChatClient):
 
     @staticmethod
     def _parse_usage(data: Dict[str, Any]) -> Optional[UsageStats]:
-        """响应 usage 字段 → UsageStats（任何形态异常都回落 None，观测不破坏业务）"""
-        raw = data.get("usage")
-        if not isinstance(raw, dict):
-            return None
-
-        def _int(value: Any) -> Optional[int]:
-            return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-        prompt_tokens = _int(raw.get("prompt_tokens"))
-        completion_tokens = _int(raw.get("completion_tokens"))
-        if prompt_tokens is None and completion_tokens is None:
-            return None
-        return UsageStats(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+        """响应 usage 字段 → UsageStats（统一口径见 result.parse_usage_dict）"""
+        return parse_usage_dict(data.get("usage"))
 
     # ===============================
     # 内部辅助

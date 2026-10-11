@@ -21,6 +21,7 @@ from common.exception.model_client_exception import (
 )
 from core.llm.config.config import ProviderConfig
 from core.llm.model.model_target import ModelTarget
+from core.llm.result import RerankResult, parse_usage_dict
 from core.llm.schema import RetrievedChunk
 
 from .base_rerank import BaseRerankClient
@@ -257,7 +258,9 @@ class BaiLianRerankClient(BaseRerankClient):
                 if len(reranked) >= top_n:
                     break
 
-        return reranked
+        # P10.1 T1.5：RerankResult(list) 携带 usage——发射点据此区分真实调用
+        # （RerankResult）与短路直通（rerank() 提前返回的普通 list，不落行，D3）
+        return RerankResult(reranked, parse_usage_dict(data.get("usage")))
 
     # ==================== 内部辅助 ====================
 

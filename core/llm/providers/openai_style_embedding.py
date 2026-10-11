@@ -32,6 +32,7 @@ from common.exception.model_client_exception import (
 )
 from core.llm.config.config import ProviderConfig
 from core.llm.model.model_target import ModelTarget
+from core.llm.result import EmbeddingResult, merge_usage, parse_usage_dict
 
 from .base_embedding import BaseEmbeddingClient
 
@@ -84,17 +85,19 @@ class OpenAIStyleEmbeddingClient(BaseEmbeddingClient, ABC):
     async def embed(self, text: str, target: ModelTarget) -> List[float]:
         """
         单文本向量化（对应 Java embed）。
-        把单文本包成 [text]，调用 _do_embed，取第一个结果返回。
+        把单文本包成 [text]，调用 _do_embed，取第一个结果返回；
+        EmbeddingResult(list) 子类携带 usage（P10.1 T1.5），调用方零破坏。
         """
         result = await self._do_embed([text], target)
-        return result[0]
+        return EmbeddingResult(result[0], result.usage)
 
     async def embed_batch(
         self,
         texts: List[str],
         target: ModelTarget,
     ) -> List[List[float]]:
-        """批量向量化（对应 Java embedBatch），按 max_batch_size 分片。"""
+        """批量向量化（对应 Java embedBatch），按 max_batch_size 分片；
+        分片场景 usage 求和合并（merge_usage）。"""
         if not texts:
             return []
         batch = self.max_batch_size()
@@ -102,13 +105,15 @@ class OpenAIStyleEmbeddingClient(BaseEmbeddingClient, ABC):
             return await self._do_embed(texts, target)
 
         results: List[List[float]] = [None] * len(texts)  # type: ignore[list-item]
+        usages = []
         #分片的循环
         for i in range(0, len(texts), batch):
             slice_texts = texts[i:i + batch]
             part = await self._do_embed(slice_texts, target)
+            usages.append(part.usage)
             for k, vec in enumerate(part):
                 results[i + k] = vec
-        return results
+        return EmbeddingResult(results, merge_usage(*usages))
 
     # ===============================
     # 模板方法：核心请求逻辑
@@ -207,8 +212,9 @@ class OpenAIStyleEmbeddingClient(BaseEmbeddingClient, ABC):
             return base_url + "/" + path
         return base_url + path
 
-    def _extract_embeddings(self, data: Dict[str, Any]) -> List[List[float]]:
-        """解析 OpenAI 兼容 embedding 响应（对齐 Java doEmbed 的响应解析）。"""
+    def _extract_embeddings(self, data: Dict[str, Any]) -> EmbeddingResult:
+        """解析 OpenAI 兼容 embedding 响应（对齐 Java doEmbed 的响应解析）；
+        EmbeddingResult(list) 携带 usage（P10.1 T1.5，缺失为 None 由发射点估算兜底）。"""
         if not isinstance(data, dict):
             raise ModelClientException(
                 f"{self.provider} embedding 响应格式错误",
@@ -249,7 +255,7 @@ class OpenAIStyleEmbeddingClient(BaseEmbeddingClient, ABC):
                     ModelClientErrorType.INVALID_RESPONSE,
                 )
             results.append(vector)
-        return results
+        return EmbeddingResult(results, parse_usage_dict(data.get("usage")))
 
     # ===============================
     # 内部辅助

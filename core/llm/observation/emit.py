@@ -72,7 +72,12 @@ class _TokenUsage:
 def _resolve_token_usage(
     usage: Optional[UsageStats], prompt_estimate: int, completion_text: Optional[str]
 ) -> _TokenUsage:
-    """真实优先、估算兜底：两段各自独立判定，来源取二者的交集口径（real/mixed/estimated）"""
+    """真实优先、估算兜底：两段各自独立判定，来源取二者的交集口径（real/mixed/estimated）。
+
+    completion 只有在「存在输出概念」时才参与来源投票（真实用量或估算 > 0）——
+    embedding/rerank 无输出概念，否则仅凭 completion 票会把 prompt 真实值
+    污染成 mixed（T1.5）。
+    """
     prompt_real = usage.prompt_tokens if usage else None
     completion_real = usage.completion_tokens if usage else None
     prompt_tokens = prompt_real if prompt_real is not None else (prompt_estimate or None)
@@ -80,8 +85,9 @@ def _resolve_token_usage(
     completion_tokens = completion_real if completion_real is not None else (completion_est or None)
     sources = {
         TOKEN_SOURCE_REAL if prompt_real is not None else TOKEN_SOURCE_ESTIMATED,
-        TOKEN_SOURCE_REAL if completion_real is not None else TOKEN_SOURCE_ESTIMATED,
     }
+    if completion_real is not None or completion_est > 0:
+        sources.add(TOKEN_SOURCE_REAL if completion_real is not None else TOKEN_SOURCE_ESTIMATED)
     token_source = sources.pop() if len(sources) == 1 else TOKEN_SOURCE_MIXED
     return _TokenUsage(prompt_tokens, completion_tokens, token_source)
 
