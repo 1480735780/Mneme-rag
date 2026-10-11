@@ -5,9 +5,15 @@ scripts.eval.runner - P1 评测最小闭环 CLI
 读 JSONL 评测集 → httpx 并发调 GET /rag/eval?question= → 提取 retrievedDocIds/intentLeafIds
 → compute_metrics 单问指标 → aggregate 汇总 → 写 JSON 报告。
 
+可选 --qa（QA 标注集 qa.jsonl）会在 doc 级命中指标之外，追加证据可读性指标
+（答案片段在证据文本里是否完整 / 被覆盖、证据条数与字符数）——父块回填只改证据文本、
+不改命中集合，doc 级指标对它钝感，M4 的 A/B 靠这组指标读收益（见 metrics.evidence_metrics）。
+
 用法（项目根目录执行）：
     python -m scripts.eval.runner --dataset eval-set.jsonl \
         --endpoint http://127.0.0.1:8000/rag/eval --top-k 3 --output eval-report.json
+    python -m scripts.eval.runner --dataset evaluation/datasets/chunk-baseline/eval-set.jsonl \
+        --qa evaluation/datasets/chunk-baseline/qa.jsonl --output outputs/online-eval.json
 
 薄脚本（scripts/README 约定）：只做参数解析与流程编排，指标/加载逻辑在 scripts/eval 兄弟模块。
 """
@@ -24,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import httpx  # noqa: E402
 
-from scripts.eval.dataset import load_dataset  # noqa: E402
+from scripts.eval.dataset import load_dataset, load_qa_spans  # noqa: E402
 from scripts.eval.metrics import aggregate, compute_metrics  # noqa: E402
 
 
@@ -51,8 +57,24 @@ def _build_report(endpoint, top_k, total, per_question, errors) -> Dict:
     }
 
 
-def run_eval(records, endpoint, top_k=3, concurrency=4, client: Optional[httpx.AsyncClient] = None) -> Dict:
-    """同步入口：内部自建/复用 httpx 客户端；client 注入便于测试（httpx.MockTransport）"""
+def run_eval(
+    records,
+    endpoint,
+    top_k=3,
+    concurrency=4,
+    client: Optional[httpx.AsyncClient] = None,
+    qa_spans: Optional[Dict[str, List[str]]] = None,
+) -> Dict:
+    """同步入口：内部自建/复用 httpx 客户端；client 注入便于测试（httpx.MockTransport）
+
+    qa_spans 为 question → answer_spans 映射（qa.jsonl）；给了则合并进 record，
+    单问指标会附带证据可读性（见 metrics.compute_metrics）。
+    """
+    if qa_spans:
+        records = [
+            {**r, "answer_spans": qa_spans.get(r["question"], [])} for r in records
+        ]
+
     async def _go() -> Dict:
         own = client is None
         http = client or httpx.AsyncClient(timeout=30.0)
@@ -92,9 +114,12 @@ def main(argv=None) -> int:
     parser.add_argument("--top-k", type=int, default=3, help="检索截断 k（默认 3）")
     parser.add_argument("--concurrency", type=int, default=4, help="并发数（默认 4）")
     parser.add_argument("--output", default="", help="报告 JSON 输出路径（缺省打印到 stdout）")
+    parser.add_argument("--qa", default="", help="QA 标注集 JSONL（给了才追加证据可读性指标）")
     args = parser.parse_args(argv)
     records = load_dataset(args.dataset)
-    report = run_eval(records, args.endpoint, args.top_k, args.concurrency)
+    report = run_eval(
+        records, args.endpoint, args.top_k, args.concurrency, qa_spans=load_qa_spans(args.qa)
+    )
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         Path(args.output).write_text(text, encoding="utf-8")
