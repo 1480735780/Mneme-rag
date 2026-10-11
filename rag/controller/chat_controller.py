@@ -70,6 +70,7 @@ async def chat(
     """GET /rag/v3/chat：SSE 流式问答（对齐 Java chat）"""
     container = _container(request)
     user_id = UserContext.get_user_id()
+    #创建SSE队列
     queue = SseQueue()
 
     # 幂等（对齐 Java @IdempotentSubmit key=userId；重复提交 raise ClientException -> 统一 Result）

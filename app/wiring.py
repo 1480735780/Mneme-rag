@@ -141,10 +141,10 @@ def _build_chat_clients(config: Any) -> list:
         if client_cls is None:
             logger.warning("provider %s 暂无 chat client 实现，跳过", name)
             continue
-        api_key = str(getattr(provider, "api_key", "") or "").strip()
-        if name != "ollama" and (not api_key or api_key.startswith("${")):
-            # 占位符未解析（如 ${QWEN_API_KEY} 未设环境变量）→ 视为无 key，不进入候选
-            logger.info("provider %s 未配置有效 api_key（占位符未解析），跳过", name)
+        api_key = str(provider.resolve_api_key() or "").strip()
+        if name != "ollama" and not api_key:
+            # 占位符未解析（如 ${QWEN_API_KEY} 未设环境变量）→ resolve_api_key 返回空，视为无 key，不进入候选
+            logger.info("provider %s 未配置有效 api_key，跳过", name)
             continue
         try:
             clients.append(client_cls())
@@ -987,10 +987,19 @@ class AppContainer:
         postprocessors.append(EvidenceGatePostProcessor(EvidenceProperties.from_env(), rerank_enabled=rerank_active))
         postprocessors.append(MetadataEnrichmentPostProcessor())
 
+        parent_resolver = None
+        if self.settings.chunk_parent_child_enabled:
+            from rag.retrieval.parent_resolver import ParentChunkResolver
+
+            parent_resolver = ParentChunkResolver(
+                self.db, mode=self.settings.chunk_parent_child_mode
+            )
+
         return MultiChannelRetrievalEngine(
             channels=channels,
             postprocessors=postprocessors,
             scope_resolver=self._scope_resolver,
+            parent_resolver=parent_resolver,
         )
 
     def _build_memory_vector_retriever(self) -> Any:
@@ -1024,9 +1033,9 @@ class AppContainer:
             client_cls = factory.get(name)
             if client_cls is None:
                 continue
-            api_key = str(getattr(provider, "api_key", "") or "").strip()
-            if name != "ollama" and (not api_key or api_key.startswith("${")):
-                # 占位符未解析（如 ${SILICONFLOW_API_KEY} 未设环境变量）→ 视为无 key，不进入候选
+            api_key = str(provider.resolve_api_key() or "").strip()
+            if name != "ollama" and not api_key:
+                # 占位符未解析（如 ${SILICONFLOW_API_KEY} 未设环境变量）→ resolve_api_key 返回空，视为无 key，不进入候选
                 continue
             try:
                 clients.append(client_cls())
@@ -1135,9 +1144,9 @@ class AppContainer:
             client_cls = factory.get(name)
             if client_cls is None:
                 continue
-            api_key = str(getattr(provider, "api_key", "") or "").strip()
-            if not api_key or api_key.startswith("${"):
-                # 占位符未解析（如 ${SILICONFLOW_API_KEY} 未设环境变量）→ 视为无 key，不进入候选
+            api_key = str(provider.resolve_api_key() or "").strip()
+            if not api_key:
+                # 占位符未解析（如 ${SILICONFLOW_API_KEY} 未设环境变量）→ resolve_api_key 返回空，视为无 key，不进入候选
                 continue
             try:
                 clients.append(client_cls())
@@ -1525,13 +1534,36 @@ class AppContainer:
         RAGENT_CHUNK_BLOCKAWARE_ENABLED（默认 True）→ Block 感知切分
         （标题/表格/列表/代码，block_splitter.build_block_splitter）；
         False → 默认纯文本切分兜底（TextChunkDispatcher）。只影响新入库文档。
+
+        RAGENT_CHUNK_CONTEXTUAL_ENABLED（M2 3.3.4，默认 False）→ 额外注入 Contextualizer，
+        给 embedding_body 补相邻句等可检索上下文。这里把 include_outline_path 关掉是刻意的：
+        ChunkAssembler.compose_embedding_text 装配时已经拼了「正文未覆盖的章节路径前缀」，
+        再开一路会把「公司制度 / 薪资」这类路径在同一份向量文本里写两遍，只涨 token 不涨信息。
+
+        RAGENT_CHUNK_PARENT_CHILD_ENABLED（3.4.6，默认 False）→ 额外注入 ParentChildBuilder，
+        按结构组产出父块（Child 进向量库、Parent 只进关系库），检索侧由 _build_multi_channel_engine
+        注入 ParentChunkResolver 回填。入库与检索两处开关同源，不允许只开一半。
         """
         from rag.ingestion.splitter.base import ChunkingService
         from rag.ingestion.splitter.block_splitter import build_block_splitter
+        from rag.ingestion.splitter.contextualizer import Contextualizer
 
-        if self.settings.chunk_blockaware_enabled:
-            return ChunkingService(dispatcher=build_block_splitter())
-        return ChunkingService()
+        if not self.settings.chunk_blockaware_enabled:
+            return ChunkingService()
+        contextualizer = None
+        if self.settings.chunk_contextual_enabled:
+            contextualizer = Contextualizer(
+                include_outline_path=False,  # 路径前缀由 compose_embedding_text 负责，勿重复注入
+                include_adjacent_sentences=True,
+            )
+        parent_child_builder = None
+        if self.settings.chunk_parent_child_enabled:
+            from rag.ingestion.splitter.blockaware.parent_child_builder import ParentChildBuilder
+
+            parent_child_builder = ParentChildBuilder()
+        return ChunkingService(
+            dispatcher=build_block_splitter(contextualizer, parent_child_builder)
+        )
 
     def _wire_knowledge_services(self) -> None:
         """组装 P5 knowledge 域（N1-N3：KB/文档/分块 service + 支撑组件，plan 5.3.5）

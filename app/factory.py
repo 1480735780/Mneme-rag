@@ -167,4 +167,39 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
         )
         return result_to_dict(result)
 
+    # P9 §10.2/§17.5.2：版本化能力探针端点（按需触发实测三步；失败标 versioning_unavailable）
+    @app.get("/health/versioning")
+    async def health_versioning() -> dict:
+        container: AppContainer = app.state.container
+        from knowledge.versioning.probe import VersioningCapabilityProbe
+        from rag.ingestion.sink import ChunkIndexWriter, VectorStoreSink
+        from storage.vector.schema import VectorTarget
+
+        report: dict = {"channels": {}, "available": {}}
+        try:
+            store = container._get_shared_vector_store()  # noqa: SLF001
+            retriever = container.vector_retriever
+            backend = type(store).__name__
+            if backend not in ("PgVectorStoreService", "InMemoryVectorStore"):
+                report["channels"] = {backend: {"ok": False,
+                                                "detail": "后端不支持版本化（Milvus 拒绝，§10.1）"}}
+                report["available"] = {backend: False}
+            else:
+                writer = ChunkIndexWriter([VectorStoreSink(store)])
+                target = VectorTarget(
+                    partition=VersioningCapabilityProbe.PROBE_COLLECTION,
+                    embedding_model="probe", dimension=1024,
+                )
+                probe = VersioningCapabilityProbe(
+                    store=store, retriever=retriever, writer=writer, target=target,
+                )
+                probe_result = await probe.probe(channel=backend)
+                report["channels"] = {backend: {"ok": probe_result.ok,
+                                                "detail": probe_result.detail}}
+                report["available"] = {backend: probe_result.ok}
+        except Exception as exc:  # noqa: BLE001 - 探针端点的任何失败都如实上报
+            report["channels"] = {"error": {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}}
+            report["available"] = {}
+        return result_to_dict(Results.success(report))
+
     return app

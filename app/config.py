@@ -62,6 +62,17 @@ class AppSettings:
     # splitter/block_splitter.build_block_splitter）；False 回落纯文本切分。
     # 只影响新入库文档，存量向量不重建则同一 KB 内新旧切分风格并存
     chunk_blockaware_enabled: bool = True  # RAGENT_CHUNK_BLOCKAWARE_ENABLED
+    # M2 上下文增强开关：True 走 Contextualizer（把相邻句等上下文注入 embedding_body，
+    # 见 splitter/contextualizer.py），默认 False —— 开启只影响新入库文档，
+    # 存量向量不重建则同一 KB 内新旧向量文本口径并存，召回对比也就无从谈起
+    chunk_contextual_enabled: bool = False  # RAGENT_CHUNK_CONTEXTUAL_ENABLED
+    # 3.4 Parent-Child 开关：True 时新入库文档会按结构组产出父块（Child 进向量库召回，
+    # Parent 只进关系库作生成上下文，见 splitter/blockaware/parent_child_builder.py 与
+    # retrieval/parent_resolver.py）。默认 False：开启后同一 KB 内新旧文档的块口径并存，
+    # 且要重建存量文档才能召回父块，故先灰度
+    chunk_parent_child_enabled: bool = False  # RAGENT_CHUNK_PARENT_CHILD_ENABLED
+    # 父块回填模式：REPLACE（用父块替换子块，默认）| APPEND（子块后追加父块）
+    chunk_parent_child_mode: str = "REPLACE"  # RAGENT_CHUNK_PARENT_CHILD_MODE
     # P2 部署资源：MCP Server 列表（env RAGENT_MCP_SERVERS_JSON，形如
     # {"servers":[{"name":"ragent-mcp","url":"http://host:9099/mcp"}]} 或裸数组；空 → 不注册远程工具）
     mcp_servers_json: str = ""  # RAGENT_MCP_SERVERS_JSON
@@ -103,6 +114,9 @@ class AppSettings:
             auth_enabled=_env_bool("RAGENT_AUTH_ENABLED", False),
             eval_enabled=_env_bool("RAGENT_EVAL_ENABLED", False),
             chunk_blockaware_enabled=_env_bool("RAGENT_CHUNK_BLOCKAWARE_ENABLED", True),
+            chunk_contextual_enabled=_env_bool("RAGENT_CHUNK_CONTEXTUAL_ENABLED", False),
+            chunk_parent_child_enabled=_env_bool("RAGENT_CHUNK_PARENT_CHILD_ENABLED", False),
+            chunk_parent_child_mode=os.environ.get("RAGENT_CHUNK_PARENT_CHILD_MODE", "REPLACE"),
             mcp_servers_json=os.environ.get("RAGENT_MCP_SERVERS_JSON", ""),
             init_admin_username=os.environ.get("RAGENT_INIT_ADMIN_USERNAME", ""),
             init_admin_password=os.environ.get("RAGENT_INIT_ADMIN_PASSWORD", ""),
