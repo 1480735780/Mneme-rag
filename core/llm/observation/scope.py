@@ -68,3 +68,27 @@ def llm_call_scope(
         yield merged
     finally:
         _current.reset(token)
+
+
+def set_call_scope(
+    *,
+    scene: Optional[str] = None,
+    purpose: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+):
+    """非 with 形态的 scope 设置（trace_runner 等长生命周期包装用）：
+    返回 token，调用方在 finally 里传给 reset_call_scope（overlay 语义同上）。"""
+    outer = current_scope()
+    merged = CallScope(
+        scene=outer.scene if scene is None else scene,
+        purpose=outer.purpose if purpose is None else purpose,
+        trace_id=outer.trace_id if trace_id is None else trace_id,
+        user_id=outer.user_id if user_id is None else user_id,
+    )
+    return _current.set(merged)
+
+
+def reset_call_scope(token) -> None:
+    """还原 set_call_scope 设置的 scope（配对使用，勿跨 task）"""
+    _current.reset(token)

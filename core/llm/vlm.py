@@ -23,12 +23,15 @@ core.llm.vlm - 视觉大模型（VLM）服务（对应 ragent 的 VlmService / R
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .enums import ModelCapability
 from .model.model_target import ModelTarget
 from .model.routing_executor import RoutingExecutionError, RoutingExecutor
 from .model.selector import ModelSelector
+from .observation.emit import observed_call
+from .observation.events import CALL_KIND_VLM, PURPOSE_VLM_DESCRIBE, SCENE_KB_BUILD
+from .observation.scope import llm_call_scope
 from .providers.base_vlm import BaseVlmClient
 
 logger = logging.getLogger(__name__)
@@ -84,9 +87,11 @@ class RoutingVlmService(VlmService):
         selector: ModelSelector,
         executor: RoutingExecutor,
         clients: List[BaseVlmClient],
+        observation_sink: Optional[Any] = None,
     ) -> None:
         self._selector = selector
         self._executor = executor
+        self._observation_sink = observation_sink
         self._clients_by_provider: Dict[str, BaseVlmClient] = self._build_registry(clients)
 
     async def describe_image(
@@ -97,22 +102,32 @@ class RoutingVlmService(VlmService):
         max_output_tokens: Optional[int] = None,
         model_id: Optional[str] = None,
     ) -> str:
-        if model_id:
-            target = self._resolve_target(model_id)
-            client = self._resolve_client(target)
-            return await client.describe_image(image_bytes, mime, prompt, max_output_tokens, target)
+        # D3：VLM 仅索引侧图生文，scene 固定 kb_build（服务层自带，调用点无需包裹）
+        with llm_call_scope(scene=SCENE_KB_BUILD, purpose=PURPOSE_VLM_DESCRIBE):
+            with observed_call(
+                self._observation_sink, call_kind=CALL_KIND_VLM,
+                prompt_texts=[prompt], estimate_completion=True,
+            ) as wrap:
+                if model_id:
+                    target = self._resolve_target(model_id)
+                    client = self._resolve_client(target)
+                    return await wrap(
+                        lambda c, t: c.describe_image(image_bytes, mime, prompt, max_output_tokens, t)
+                    )(client, target)
 
-        targets = self._selector.select_vlm_candidates()
-        if not targets:
-            raise RoutingExecutionError("No VLM model candidates available")
-        # 取首个可用候选（对齐 Java resolveTarget 取 targets.get(0)）
-        target = targets[0]
-        client = self._resolve_client(target)
-        if client is None:
-            raise RoutingExecutionError(
-                f"VLM provider client missing: provider={target.candidate.provider}"
-            )
-        return await client.describe_image(image_bytes, mime, prompt, max_output_tokens, target)
+                targets = self._selector.select_vlm_candidates()
+                if not targets:
+                    raise RoutingExecutionError("No VLM model candidates available")
+                # 取首个可用候选（对齐 Java resolveTarget 取 targets.get(0)）
+                target = targets[0]
+                client = self._resolve_client(target)
+                if client is None:
+                    raise RoutingExecutionError(
+                        f"VLM provider client missing: provider={target.candidate.provider}"
+                    )
+                return await wrap(
+                    lambda c, t: c.describe_image(image_bytes, mime, prompt, max_output_tokens, t)
+                )(client, target)
 
     def _resolve_client(self, target: ModelTarget) -> Optional[BaseVlmClient]:
         return self._clients_by_provider.get(target.candidate.provider)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from core.llm.observation import PURPOSE_ENHANCE, SCENE_KB_BUILD, llm_call_scope
 from core.llm.chat import LLMService
 from core.llm.enums import Tier
 from core.llm.schema import ChatRequest, Message
@@ -59,9 +60,10 @@ class EnhancerNode(IngestionNode):
                 Message.system(system_prompt or ""),
                 Message.user(user_prompt),
             ])
-            response = await self._llm.chat(
-                request, tier=Tier.FAST, preferred_model_id=settings.model_id
-            )
+            with llm_call_scope(scene=SCENE_KB_BUILD, purpose=PURPOSE_ENHANCE):
+                response = await self._llm.chat(
+                    request, tier=Tier.FAST, preferred_model_id=settings.model_id
+                )
             _apply_task_result(context, type_, response)
 
         return NodeResult.ok("增强完成")

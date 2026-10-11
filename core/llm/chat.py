@@ -36,7 +36,7 @@ from .model.health_store import ModelHealthStore
 from .model.model_target import ModelTarget
 from .model.routing_executor import RoutingExecutionError, RoutingExecutor
 from .model.selector import ModelSelector
-from .observation.emit import ChatCallObserver, StreamCallObserver, resolve_error_type
+from .observation.emit import CallObserver, StreamCallObserver, resolve_error_type
 from .observation.events import STATUS_CANCELED, STATUS_FAILED, STATUS_SUCCESS
 from .providers.base import BaseChatClient
 from .result import UsageStats
@@ -359,9 +359,8 @@ class RoutingLLMService(LLMService):
             targets = self._only_preferred(targets, preferred_model_id)
         # P10.1 T1.3：观测未装配时与既有路径完全一致（sink None → observer None）
         observer = (
-            ChatCallObserver(
-                self._observation_sink,
-                request=request,
+            CallObserver.for_chat(
+                self._observation_sink, request=request,
                 tier=tier.value if tier is not None else None,
             )
             if self._observation_sink is not None

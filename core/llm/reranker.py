@@ -23,12 +23,15 @@ core.llm.reranker - 重排序（Rerank）服务（对应 ragent 的 RerankServic
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .enums import ModelCapability
 from .model.model_target import ModelTarget
 from .model.routing_executor import RoutingExecutionError, RoutingExecutor
 from .model.selector import ModelSelector
+from .observation.emit import observed_call
+from .observation.events import CALL_KIND_RERANK
+from .result import RerankResult
 from .providers.base_rerank import BaseRerankClient
 from .schema import RetrievedChunk
 
@@ -94,9 +97,13 @@ class RoutingRerankService(RerankService):
         selector: ModelSelector,
         executor: RoutingExecutor,
         clients: List[BaseRerankClient],
+        observation_sink: Optional[Any] = None,
     ) -> None:
+        """observation_sink: 观测投递端口（P10.1 T1.6）；None = 观测未装配。
+        短路直通（候选不足返回普通 list）不落行，真实调用（RerankResult）逐行落库（D3）。"""
         self._selector = selector
         self._executor = executor
+        self._observation_sink = observation_sink
         self._clients_by_provider: Dict[str, BaseRerankClient] = self._build_registry(clients)
 
     # ==================== 重排序 ====================
@@ -109,18 +116,29 @@ class RoutingRerankService(RerankService):
         model_id: Optional[str] = None,
         allow_fallback: bool = False,
     ) -> List[RetrievedChunk]:
+        prompt_texts = [query] + [getattr(c, "text", None) for c in candidates]
         if model_id and not allow_fallback:
             # 指定模型：不做降级（对齐 Java rerank 指定模型）
             target = self._resolve_target(model_id)
             client = self._resolve_client(target)
-            return await client.rerank(query, candidates, top_n, target)
+            with observed_call(
+                self._observation_sink, call_kind=CALL_KIND_RERANK,
+                prompt_texts=prompt_texts,
+                real_result_types=(RerankResult,),  # 短路直通不落行（D3）
+            ) as wrap:
+                return await wrap(lambda c, t: c.rerank(query, candidates, top_n, t))(client, target)
         # 默认 / 显式降级：多候选 + 故障转移
-        return await self._executor.execute_with_fallback(
-            ModelCapability.RERANK,
-            self._fallback_targets(model_id),
-            self._resolve_client,
-            lambda client, target: client.rerank(query, candidates, top_n, target),
-        )
+        with observed_call(
+            self._observation_sink, call_kind=CALL_KIND_RERANK,
+            prompt_texts=prompt_texts,
+            real_result_types=(RerankResult,),  # 短路直通不落行（D3）
+        ) as wrap:
+            return await self._executor.execute_with_fallback(
+                ModelCapability.RERANK,
+                self._fallback_targets(model_id),
+                self._resolve_client,
+                wrap(lambda client, target: client.rerank(query, candidates, top_n, target)),
+            )
 
     # ==================== 辅助 ====================
 

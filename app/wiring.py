@@ -1075,6 +1075,10 @@ class AppContainer:
                 transient_retries=int(getattr(selection, "transient_retries", 0) or 0),
             ),
             clients,
+            # P10.1 T1.6：观测端口注入（与 chat 同款；None = 观测未装配）
+            observation_sink=(
+                self.observation_hub.emit if self.observation_hub is not None else None
+            ),
         )
 
     def _build_llm(self) -> Any:
@@ -1193,6 +1197,10 @@ class AppContainer:
                 transient_retries=int(getattr(selection, "transient_retries", 0) or 0),
             ),
             clients,
+            # P10.1 T1.6：观测端口注入（rerank 短路直通不落行，D3）
+            observation_sink=(
+                self.observation_hub.emit if self.observation_hub is not None else None
+            ),
         )
 
     def _get_shared_vector_store(self) -> Any:

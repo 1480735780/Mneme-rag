@@ -40,6 +40,7 @@ from rag.dao.support import now_iso
 from rag.memory.config import MemoryProperties
 from rag.prompt.formatter import PromptTemplateLoader
 
+from core.llm.observation import PURPOSE_TITLE, SCENE_CHAT, llm_call_scope
 logger = logging.getLogger(__name__)
 
 # 标题生成模板路径（对应 Java RAGConstant.CONVERSATION_TITLE_PROMPT_PATH）
@@ -99,7 +100,8 @@ class ConversationTitleGenerator:
             # 未注入 LLM（M3 之前装配骨架）：直接回退默认标题，不发出请求
             return _TITLE_FALLBACK
         try:
-            return await self._llm_service.chat(request, tier=Tier.FAST)
+            with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_TITLE):
+                return await self._llm_service.chat(request, tier=Tier.FAST)
         except Exception as ex:  # noqa: BLE001 —— 对齐 Java catch Exception 兜底
             logger.warning("生成会话标题失败: %s", ex)
             return _TITLE_FALLBACK

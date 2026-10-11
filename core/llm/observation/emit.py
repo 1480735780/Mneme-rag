@@ -17,9 +17,10 @@ canceled 不在本发射器产生（用户断开属流式链路，T1.4 落地）
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, Iterable, List, Optional
 from uuid import uuid4
 
 from core.llm.observation.events import (
@@ -92,41 +93,93 @@ def _resolve_token_usage(
     return _TokenUsage(prompt_tokens, completion_tokens, token_source)
 
 
-class ChatCallObserver:
+@contextmanager
+def observed_call(
+    sink: Optional[EventSink],
+    *,
+    call_kind: str,
+    prompt_texts: Iterable[Optional[str]] = (),
+    tier: Optional[str] = None,
+    estimate_completion: bool = False,
+    real_result_types: Optional[tuple] = None,
+):
+    """服务层发射点统一包装（T1.6）：yield caller 包装器，退出 finish。
+
+    用法（embedding/rerank/vlm 服务层，与 chat 的编排层埋点同一套纪律）：
+        with observed_call(sink, call_kind=CALL_KIND_EMBEDDING, prompt_texts=texts) as wrap:
+            return await self._executor.execute_with_fallback(..., caller=wrap(raw_caller))
     """
-    一次非流式 chat 逻辑调用的观测记录器（RoutingLLMService.chat 专用）
+    if sink is None:
+        yield lambda caller: caller
+        return
+    observer = CallObserver(
+        sink, call_kind=call_kind, prompt_texts=prompt_texts, tier=tier,
+        estimate_completion=estimate_completion, real_result_types=real_result_types,
+    )
+    try:
+        yield observer.wrap_caller
+    finally:
+        observer.finish()
+
+
+class CallObserver:
+    """
+    一次非流式 LLM 逻辑调用的观测记录器（chat/embedding/rerank/vlm 共用，T1.6 泛化）
 
     用法：
-        observer = ChatCallObserver(sink, request=request, tier=tier)
+        observer = CallObserver.for_chat(sink, request=request, tier=tier)
         result = await executor.execute_with_fallback(..., caller=observer.wrap_caller(raw_caller))
         finally: observer.finish()
 
     Args:
         sink:    事件投递端口（ObservationHub.emit）；None = 观测未装配，记录但不投递。
-        request: 原始请求（prompt 估算来源）。
+        call_kind: 事件 call_kind（chat/embedding/rerank/vlm）。
+        prompt_texts: prompt 估算来源文本列表（chat=消息内容；embedding=输入文本；
+            rerank=query+候选文本；vlm=图生文提示词）。
         tier:    请求档位（Tier.value；None = 走默认档路由）。
-        call_kind: 事件 call_kind（预留：chat 之外的直连路径复用本记录器）。
+        estimate_completion: 是否存在输出概念（chat/vlm True；embedding/rerank False——
+            无输出概念时不投 completion 来源票，token_source 不被污染成 mixed）。
+        real_result_types: 真实 API 调用的返回类型白名单；None = 不判定。设置后
+            （rerank 场景 = (RerankResult,)），白名单外的成功结果为短路直通
+            （如候选数不足未调 API），不落行（D3）。
     """
 
     def __init__(
         self,
         sink: Optional[EventSink],
         *,
-        request: Any,
-        tier: Optional[str] = None,
         call_kind: str = CALL_KIND_CHAT,
+        prompt_texts: Iterable[Optional[str]] = (),
+        tier: Optional[str] = None,
+        estimate_completion: bool = True,
+        real_result_types: Optional[tuple] = None,
     ) -> None:
         self._sink = sink
         self._kind = call_kind
         self._tier = tier
+        self._estimate_completion = estimate_completion
+        self._real_result_types = real_result_types
         self._scope = current_scope()  # D5：发射点物化（此刻仍在请求 task 的 scope 内）
         self.request_uid = uuid4().hex  # 逻辑调用分组键（D4，VARCHAR(36) 内）
-        self._prompt_estimate = sum(
-            _estimate_text_tokens(getattr(message, "content", None))
-            for message in (getattr(request, "messages", None) or ())
-        )
+        self._prompt_estimate = sum(_estimate_text_tokens(text) for text in prompt_texts)
         self._events: List[CallEvent] = []
         self._finished = False
+
+    @classmethod
+    def for_chat(
+        cls, sink: Optional[EventSink], *, request: Any, tier: Optional[str] = None
+    ) -> "CallObserver":
+        """chat 便捷构造：prompt 估算来源 = 请求消息内容列表"""
+        return cls(
+            sink,
+            call_kind=CALL_KIND_CHAT,
+            prompt_texts=[
+                getattr(message, "content", None)
+                for message in (getattr(request, "messages", None) or ())
+            ],
+            tier=tier,
+            estimate_completion=True,
+        )
 
     # ==================== caller 包装（每次真实调用一行） ====================
 
@@ -150,14 +203,24 @@ class ChatCallObserver:
                 )
                 raise
             latency_ms = int((time.monotonic() - start) * 1000)
+            # D3：real_result_types 白名单外的成功结果 = 短路直通（如 rerank 候选不足
+            # 未调 API），不是真实计费调用，不落行
+            if (
+                self._real_result_types is not None
+                and not isinstance(result, self._real_result_types)
+            ):
+                return result
             # D1 纪律：usage 只在此消费；裸 str（无属性）按缺失处理回落估算
             usage = getattr(result, "usage", None)
             usage = usage if isinstance(usage, UsageStats) and not usage.is_empty else None
+            completion_text = (
+                str(result) if result is not None and self._estimate_completion else None
+            )
             self._events.append(
                 self._build_event(
                     target, attempt_no, latency_ms,
                     status=STATUS_SUCCESS, error=None,
-                    usage=usage, completion_text=str(result) if result is not None else "",
+                    usage=usage, completion_text=completion_text,
                 )
             )
             return result

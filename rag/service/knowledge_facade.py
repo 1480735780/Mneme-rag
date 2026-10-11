@@ -26,6 +26,7 @@ from rag.retrieval.schema import MULTI_CHANNEL_KEY, RetrievalBudget, RetrievalCo
 from rag.rewrite import QueryRewriteService
 from rag.source import CitationContextEnricher
 
+from core.llm.observation import PURPOSE_GENERATE, SCENE_CHAT, llm_call_scope
 logger = logging.getLogger(__name__)
 
 # 空检索兜底文案（对应 Java KnowledgeSearchFacade.EMPTY_RESULT）
@@ -115,9 +116,10 @@ class KnowledgeSearchFacade:
             list(rewrite_result.sub_questions),
         )
 
-        return await self._llm_service.chat(
-            ChatRequest(messages=messages, temperature=0.0, topP=1.0, thinking=False)
-        )
+        with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_GENERATE):
+            return await self._llm_service.chat(
+                ChatRequest(messages=messages, temperature=0.0, topP=1.0, thinking=False)
+            )
 
     # ==================== 内部辅助 ====================
 

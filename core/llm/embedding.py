@@ -35,12 +35,14 @@ core.llm.embedding - 向量化（Embedding）服务（对应 ragent 的 Embeddin
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .enums import ModelCapability
 from .model.model_target import ModelTarget
 from .model.routing_executor import RoutingExecutionError, RoutingExecutor
 from .model.selector import ModelSelector
+from .observation.emit import observed_call
+from .observation.events import CALL_KIND_EMBEDDING
 from .providers.base_embedding import BaseEmbeddingClient
 
 logger = logging.getLogger(__name__)
@@ -131,9 +133,17 @@ class RoutingEmbeddingService(EmbeddingService):
         selector: ModelSelector,
         executor: RoutingExecutor,
         clients: List[BaseEmbeddingClient],
+        observation_sink: Optional[Any] = None,
     ) -> None:
+        """
+        Args:
+            observation_sink: 观测事件投递端口（P10.1 T1.6，ObservationHub.emit；
+                None = 观测未装配）。每次 embed/embed_batch 真实 API 调用落一行
+                （call_kind=embedding，无输出概念不投 completion 来源票）。
+        """
         self._selector = selector
         self._executor = executor
+        self._observation_sink = observation_sink
         self._clients_by_provider: Dict[str, BaseEmbeddingClient] = self._build_registry(clients)
 
     # ==================== 单文本 ====================
@@ -148,14 +158,20 @@ class RoutingEmbeddingService(EmbeddingService):
             # 指定模型：不做降级（对齐 Java embed(text, modelId)）
             target = self._resolve_target(model_id)
             client = self._resolve_client(target)
-            return await client.embed(text, target)
+            with observed_call(
+                self._observation_sink, call_kind=CALL_KIND_EMBEDDING, prompt_texts=[text]
+            ) as wrap:
+                return await wrap(lambda c, t: c.embed(text, t))(client, target)
         # 降级：指定模型置首 + 默认候选追加（去重），失败切换下一候选
-        return await self._executor.execute_with_fallback(
-            ModelCapability.EMBEDDING,
-            self._fallback_targets(model_id),
-            self._resolve_client,
-            lambda client, target: client.embed(text, target),
-        )
+        with observed_call(
+            self._observation_sink, call_kind=CALL_KIND_EMBEDDING, prompt_texts=[text]
+        ) as wrap:
+            return await self._executor.execute_with_fallback(
+                ModelCapability.EMBEDDING,
+                self._fallback_targets(model_id),
+                self._resolve_client,
+                wrap(lambda client, target: client.embed(text, target)),
+            )
 
     # ==================== 批量 ====================
 
@@ -168,13 +184,19 @@ class RoutingEmbeddingService(EmbeddingService):
         if model_id and not allow_fallback:
             target = self._resolve_target(model_id)
             client = self._resolve_client(target)
-            return await client.embed_batch(texts, target)
-        return await self._executor.execute_with_fallback(
-            ModelCapability.EMBEDDING,
-            self._fallback_targets(model_id),
-            self._resolve_client,
-            lambda client, target: client.embed_batch(texts, target),
-        )
+            with observed_call(
+                self._observation_sink, call_kind=CALL_KIND_EMBEDDING, prompt_texts=texts
+            ) as wrap:
+                return await wrap(lambda c, t: c.embed_batch(texts, t))(client, target)
+        with observed_call(
+            self._observation_sink, call_kind=CALL_KIND_EMBEDDING, prompt_texts=texts
+        ) as wrap:
+            return await self._executor.execute_with_fallback(
+                ModelCapability.EMBEDDING,
+                self._fallback_targets(model_id),
+                self._resolve_client,
+                wrap(lambda client, target: client.embed_batch(texts, target)),
+            )
 
     # ==================== 维度 ====================
 

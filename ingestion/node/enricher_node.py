@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+from core.llm.observation import PURPOSE_ENRICH, SCENE_KB_BUILD, llm_call_scope
 from core.llm.chat import LLMService
 from core.llm.enums import Tier
 from core.llm.schema import ChatRequest, EmbeddedChunk, Message
@@ -66,9 +67,10 @@ class EnricherNode(IngestionNode):
                     Message.system(system_prompt or ""),
                     Message.user(user_prompt),
                 ])
-                response = await self._llm.chat(
-                    request, tier=Tier.FAST, preferred_model_id=settings.model_id
-                )
+                with llm_call_scope(scene=SCENE_KB_BUILD, purpose=PURPOSE_ENRICH):
+                    response = await self._llm.chat(
+                        request, tier=Tier.FAST, preferred_model_id=settings.model_id
+                    )
                 _apply_result(extras, type_, response)
             if extras:
                 enriched.append(EmbeddedChunk(

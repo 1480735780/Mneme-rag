@@ -55,6 +55,7 @@ from rag.intent.tree import IntentTreeCacheManager, IntentTreeFactory, flatten_i
 from rag.prompt.formatter import PromptTemplateLoader
 from rag.rewrite import RewriteResult
 
+from core.llm.observation import PURPOSE_INTENTS, SCENE_CHAT, llm_call_scope
 logger = logging.getLogger(__name__)
 
 # 分类器模板路径（对应 Java RAGConstant.INTENT_CLASSIFIER_PROMPT_PATH）
@@ -208,7 +209,8 @@ class DefaultIntentClassifier(IntentClassifier, IntentNodeRegistry):
 
         # 标准档调用；调用失败或 JSON 非法均返回空意图（下游把空意图当作"无意图"兜底）
         try:
-            raw = await self._llm.chat(request)
+            with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_INTENTS):
+                raw = await self._llm.chat(request)
         except Exception:
             logger.warning("意图识别 LLM 调用失败，返回空意图", exc_info=True)
             return []

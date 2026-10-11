@@ -25,6 +25,7 @@ from core.llm.schema import ChatRequest, Message
 from rag.intent.model import NodeScore
 from rag.prompt.formatter import PromptTemplateLoader
 
+from core.llm.observation import PURPOSE_GUIDANCE, SCENE_CHAT, llm_call_scope
 logger = logging.getLogger(__name__)
 
 # 歧义确认模板路径（对应 Java RAGConstant.GUIDANCE_AMBIGUITY_CHECK_PROMPT_PATH）
@@ -73,7 +74,8 @@ class AmbiguityLLMChecker:
         )
 
         try:
-            raw = await self._llm.chat(request, tier=Tier.FAST)
+            with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_GUIDANCE):
+                raw = await self._llm.chat(request, tier=Tier.FAST)
         except Exception:
             logger.warning("歧义确认 LLM 调用失败, 降级为触发澄清, question=%s", question, exc_info=True)
             return True

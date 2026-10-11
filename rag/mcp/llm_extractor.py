@@ -36,6 +36,7 @@ from rag.mcp.model import McpToolDefinition
 from rag.mcp.result import McpExtractionResult, Status
 from rag.prompt.formatter import PromptTemplateLoader
 
+from core.llm.observation import PURPOSE_MCP_EXTRACT, SCENE_CHAT, llm_call_scope
 logger = logging.getLogger(__name__)
 
 # 模板路径（对应 Java RAGConstant.MCP_PARAMETER_EXTRACT_PROMPT_PATH / MCP_PARAMETER_EXTRACT_USER_PROMPT_PATH）
@@ -113,7 +114,8 @@ class LLMMcpParameterExtractor(McpParameterExtractor):
 
         # 标准档调用；协议畸形 / 值非法或调用失败均判 FAILED、不调用工具
         try:
-            raw = await self._llm.chat(request)
+            with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_MCP_EXTRACT):
+                raw = await self._llm.chat(request)
         except Exception:
             logger.warning("MCP 参数提取 LLM 调用失败, toolId: %s", tool.name, exc_info=True)
             return McpExtractionResult.failed()

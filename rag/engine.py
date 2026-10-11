@@ -73,6 +73,7 @@ from rag.source import (
     SourcesAssembler,
 )
 
+from core.llm.observation import PURPOSE_GENERATE, SCENE_CHAT, llm_call_scope
 logger = logging.getLogger(__name__)
 
 # 空检索兜底文案（对应 Java StreamChatPipeline.handleEmptyRetrieval）
@@ -544,7 +545,8 @@ class RAGChatEngine:
         messages.append(Message.user(question))
 
         request = ChatRequest(messages=messages, temperature=0.7, thinking=False)
-        await self._llm_service.stream_chat(request, callback)
+        with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_GENERATE):
+            await self._llm_service.stream_chat(request, callback)
 
     async def _stream_llm_response(
         self,
@@ -577,7 +579,8 @@ class RAGChatEngine:
             temperature=0.3 if has_mcp else 0.0,  # MCP 场景稍微放宽温度（对齐 Java）
             topP=0.8 if has_mcp else 1.0,
         )
-        await self._llm_service.stream_chat(request, callback)
+        with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_GENERATE):
+            await self._llm_service.stream_chat(request, callback)
 
     # ==================== 私有辅助 ====================
 

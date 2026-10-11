@@ -31,6 +31,7 @@ from rag.intent import SubQuestionIntent
 from rag.mcp import McpToolExecutor, McpToolRegistry
 from rag.retrieval.schema import RetrievalBudget
 
+from core.llm.observation import PURPOSE_GENERATE, SCENE_CHAT, llm_call_scope
 logger = logging.getLogger(__name__)
 
 # 本 run 的近期历史（工具层经 ContextVar 读取，Task 隔离；管线实例跨请求共享不串会话）
@@ -254,9 +255,10 @@ class AgentPipeline:
         while iterations < limit:
             iterations += 1
             try:
-                text = await self._llm_service.chat(
-                    ChatRequest(messages=messages, temperature=0.3, thinking=False)
-                )
+                with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_GENERATE):
+                    text = await self._llm_service.chat(
+                        ChatRequest(messages=messages, temperature=0.3, thinking=False)
+                    )
             except Exception as exc:  # noqa: BLE001 LLM 调用失败即终止
                 logger.error("Agent LLM 调用失败: %s", exc)
                 return AgentResult(

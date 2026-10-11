@@ -35,6 +35,7 @@ from rag.dao.message_dao import MessageDao
 from rag.prompt.builder import AgentPromptResolver, AgentPromptSlot, StaticAgentPromptResolver
 from rag.source import CitationMarkup
 
+from core.llm.observation import PURPOSE_RECOMMEND, SCENE_CHAT, llm_call_scope
 logger = logging.getLogger(__name__)
 
 # 推荐追问生成常量（对齐 Java RecommendedQuestionGenerator）
@@ -119,7 +120,8 @@ class RecommendedQuestionGenerator:
                 maxTokens=MAX_OUTPUT_TOKENS,
                 thinking=False,
             )
-            raw = await self._llm_service.chat(request, Tier.FAST)
+            with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_RECOMMEND):
+                raw = await self._llm_service.chat(request, Tier.FAST)
             return self._parse_questions(raw, count)
         except Exception:  # noqa: BLE001 —— 生成失败降级 FAILED，不阻断
             logger.warning("生成推荐追问问题失败", exc_info=True)

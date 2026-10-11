@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Tuple
 
 from common.util.snowflake import default_generator
+from core.llm.observation.scope import reset_call_scope, set_call_scope
 from rag.dao.support import now_iso
 
 logger = logging.getLogger(__name__)
@@ -267,6 +268,9 @@ class StreamChatTraceRunner:
 
         RagTraceContext.set_trace_id(trace_id)
         RagTraceContext.set_task_id(task_id)
+        # P10.1 T1.6：trace 上下文顺带写入 LLM 观测 CallScope——core/llm 不反向依赖 rag，
+        # trace_id/user_id 由本处（rag 层）写入，发射点据此物化进 t_llm_call（D5）
+        scope_token = set_call_scope(trace_id=trace_id, user_id=user_id)
         try:
             await business_logic(trace_aware)
         except BaseException as ex:  # noqa: BLE001 —— 含 CancelledError（用户 stop → task.cancel）
@@ -283,6 +287,7 @@ class StreamChatTraceRunner:
             if is_cancel:
                 raise  # 取消需继续上抛（3.6 依赖其做用户侧补偿 + INTERRUPTED 落库）
         finally:
+            reset_call_scope(scope_token)
             RagTraceContext.clear()
 
     # ==================== 内部 ====================

@@ -47,6 +47,7 @@ from storage.cache import CacheManager, MemoryCacheManager
 from storage.cache.bridge import AsyncCacheBridge as _AsyncCacheBridge
 from storage.database import Condition, DatabaseClient
 
+from core.llm.observation import PURPOSE_REWRITE, SCENE_CHAT, llm_call_scope
 logger = logging.getLogger(__name__)
 
 # 改写 + 拆分模板路径（对应 Java RAGConstant.QUERY_REWRITE_AND_SPLIT_PROMPT_PATH）
@@ -523,7 +524,8 @@ class MultiQuestionRewriteService(QueryRewriteService):
         request = self._build_rewrite_request(system_prompt, normalized_question, history)
         fallback = RewriteResult(normalized_question, [normalized_question])
         try:
-            raw = await self._llm.chat(request, tier=Tier.FAST)
+            with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_REWRITE):
+                raw = await self._llm.chat(request, tier=Tier.FAST)
             parsed = self._parse_rewrite_and_split(raw)
             return parsed if parsed is not None else fallback
         except Exception:

@@ -64,6 +64,7 @@ from rag.prompt.formatter import CONTEXT_FORMAT_PATH, PromptTemplateLoader
 from rag.source import CitationMarkup
 from storage.database import Condition, DatabaseClient
 
+from core.llm.observation import PURPOSE_SUMMARY, SCENE_CHAT, llm_call_scope
 logger = logging.getLogger(__name__)
 
 # 摘要生成器：旧摘要（可为空串）+ 触发消息 → 新摘要（对齐 Java summarizeMessages 的调用方语义）
@@ -568,7 +569,8 @@ class DatabaseConversationMemorySummaryService(ConversationMemorySummaryService)
             thinking=False,
         )
         try:
-            raw = await self._llm.chat(request, tier=tier)
+            with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_SUMMARY):
+                raw = await self._llm.chat(request, tier=tier)
         except Exception:
             logger.exception(
                 "对话记忆摘要 LLM 调用失败, 消息数: %s, level: %s",
@@ -622,7 +624,8 @@ class DatabaseConversationMemorySummaryService(ConversationMemorySummaryService)
             thinking=False,
         )
         try:
-            raw = await self._llm.chat(request, tier=Tier.FAST)
+            with llm_call_scope(scene=SCENE_CHAT, purpose=PURPOSE_SUMMARY):
+                raw = await self._llm.chat(request, tier=Tier.FAST)
         except Exception:
             logger.exception("V1 fallback 摘要 LLM 调用失败")
             return None
