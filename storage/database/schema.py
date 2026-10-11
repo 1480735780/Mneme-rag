@@ -831,6 +831,55 @@ _T_KNOWLEDGE_CHUNK_IDENTITY = TableSchema(
     comment="chunk 自然键注册表（§3.4；完整自然键入表，截断 hash 碰撞必须失败）",
 )
 
+# P10.1：LLM 调用明细（D4：一行 = 一次真实 API 调用，含 transient 重试与 TTFT 切换；
+# append-only 不可变，无 deleted/update_time——保留期由 P10.5 sweeper 按 create_time
+# 物理删除；request_uid 为逻辑调用分组键，空 trace 请求级指标的 SQL 归组依据；
+# rerank 短路不调 API 不落行）
+_T_LLM_CALL = TableSchema(
+    name="t_llm_call",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("call_kind", "VARCHAR(20)"),
+            ("scene", "VARCHAR(20)"),
+            ("purpose", "VARCHAR(40)"),
+            ("tier", "VARCHAR(20)"),
+            ("provider", "VARCHAR(64)"),
+            ("model", "VARCHAR(128)"),
+            ("trace_id", "VARCHAR(32)"),
+            ("user_id", "VARCHAR(64)"),
+            ("request_uid", "VARCHAR(36)"),
+            ("attempt_no", "INTEGER"),
+            ("is_final", "INTEGER"),
+            ("status", "VARCHAR(20)"),
+            ("error_type", "VARCHAR(40)"),
+            ("prompt_tokens", "INTEGER"),
+            ("completion_tokens", "INTEGER"),
+            ("token_source", "VARCHAR(20)"),
+            ("latency_ms", "INTEGER"),
+            ("ttft_ms", "INTEGER"),
+            ("cost_usd", "NUMERIC(12,6)"),
+            ("pricing_snapshot", "JSONB"),
+            ("ext", "JSONB"),
+            ("create_time", "TIMESTAMP"),
+        ),
+    ),
+    indexes=(
+        IndexSpec(name="idx_llm_call_create_time", columns=("create_time",)),
+        IndexSpec(
+            name="idx_llm_call_scene_kind",
+            columns=("scene", "call_kind", "create_time"),
+        ),
+        # partial：kb_build 高峰期大量空 trace_id 行不进索引（T1.1 任务分解口径）
+        IndexSpec(
+            name="idx_llm_call_trace",
+            columns=("trace_id",),
+            where="trace_id IS NOT NULL",
+        ),
+    ),
+    comment="LLM 调用明细（P10.1/D4：append-only；request_uid = 逻辑调用分组键）",
+)
+
 DEFAULT_TABLES: List[TableSchema] = [
     _T_CONVERSATION,
     _T_MESSAGE,
@@ -861,4 +910,5 @@ DEFAULT_TABLES: List[TableSchema] = [
     _T_AGENT_CONVERSATION,
     _T_AGENT_MESSAGE,
     _T_AGENT_STATE,
+    _T_LLM_CALL,
 ]
