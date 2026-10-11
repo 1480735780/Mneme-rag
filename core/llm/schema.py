@@ -257,6 +257,7 @@ class RetrievedChunk:
         doc_id: 所属文档 ID（检索后由元数据富化补齐，未富化时为 None）。
         chunk_index: 分块在所属文档中的序号，从 0 开始（未富化时为 None）。
         doc_name: 所属文档名称（用于组装上下文时作为文档标题的内部锚点）。
+        parent_id: 命中的 child 块所属父块 ID（父子块回填用；父块与 standalone 块为 None）。
     """
 
     id: str
@@ -267,6 +268,7 @@ class RetrievedChunk:
     doc_id: Optional[str] = None
     chunk_index: Optional[int] = None
     doc_name: Optional[str] = None
+    parent_id: Optional[str] = None
 
     @staticmethod
     def by_score_desc(chunk: "RetrievedChunk") -> float:
@@ -383,6 +385,18 @@ class ChunkMetadata:
         return result
 
 
+# 块角色（对应方案 3.4.1）：召回粒度与生成粒度分离后，块在文档结构中的身份。
+#   parent     —— 结构组（一节）整体，只进关系库作生成上下文，不进向量库（不参与召回）
+#   child      —— 组内细粒度块，进向量库，是真正的召回单元
+#   standalone —— 未成组的块，召回与生成同粒度（父子块关闭时的既有行为，故取作默认值）
+# 这三种取值是跨「分块 → 索引 → 检索」三层共用的协议字面量，散落字面量会静默筛不到块，
+# 故集中在 core 定义（core 不得反向依赖 rag，所以角色常量只能落在这里）。
+CHUNK_ROLE_PARENT = "parent"
+CHUNK_ROLE_CHILD = "child"
+CHUNK_ROLE_STANDALONE = "standalone"
+CHUNK_ROLES = (CHUNK_ROLE_PARENT, CHUNK_ROLE_CHILD, CHUNK_ROLE_STANDALONE)
+
+
 @dataclass
 class ChunkData:
     """
@@ -396,6 +410,8 @@ class ChunkData:
         content:        文档原貌（markdown），回填 LLM 上下文与前端预览用
         embedding_text: 用什么文本去做向量化（章节路径 + 正文），不参与展示
         metadata:       块元数据
+        parent_id:      所属父块 ID（role=child 时非空；parent/standalone 为空）
+        chunk_role:     块角色：parent | child | standalone（方案 3.4.2）
 
     content与embedding_text的区别：content 保留文档原貌；而 embedding_text 可以主动补充章节路径等上下文，让 embedding 模型知道这句话到底属于哪个章节？”
     """
@@ -404,6 +420,8 @@ class ChunkData:
     content: str
     embedding_text: str
     metadata: ChunkMetadata = field(default_factory=ChunkMetadata.empty)
+    parent_id: Optional[str] = None
+    chunk_role: str = CHUNK_ROLE_STANDALONE
 
     def __post_init__(self):
         if not self.chunk_id or not self.chunk_id.strip():
@@ -414,6 +432,11 @@ class ChunkData:
             raise ValueError(f"content 不能为 None，chunk_id={self.chunk_id}")
         if not self.embedding_text or not self.embedding_text.strip():
             raise ValueError(f"embedding_text 不能为空，chunk_id={self.chunk_id}")
+        # 角色是三层共用的协议值：拼错的 role 会让块在向量/关系两侧被静默漏掉，构造期就拦下
+        if self.chunk_role not in CHUNK_ROLES:
+            raise ValueError(
+                f"chunk_role 必须是 {CHUNK_ROLES} 之一，实际 {self.chunk_role!r}，chunk_id={self.chunk_id}"
+            )
 
     def with_metadata(self, new_metadata: "ChunkMetadata") -> "ChunkData":
         """
@@ -433,6 +456,8 @@ class ChunkData:
             content=self.content,
             embedding_text=self.embedding_text,
             metadata=new_metadata,
+            parent_id=self.parent_id,
+            chunk_role=self.chunk_role,
         )
 
 

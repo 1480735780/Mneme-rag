@@ -244,6 +244,66 @@ class EsKeywordIndexService(KeywordIndexService):
                 return
             raise RuntimeError(f"ES 关键词索引按知识库删除失败, collection={collection_name}") from exc
 
+    # ==================== attempt 域写入（P9 §6.2，版本化路径专用） ====================
+
+    async def write_attempt(
+        self,
+        collection_name: str,
+        doc_id: str,
+        revision_id: str,
+        build_attempt_id: str,
+        chunks: List[EmbeddedChunk],
+    ) -> None:
+        """attempt 域纯追加写入：文档携带 revision_id / build_attempt_id，不删任何既有数据"""
+        if not chunks:
+            return
+        await self.ensure_shared_index()
+        ndjson: List[str] = []
+        for chunk in chunks:
+            meta = {"index": {"_index": self._index, "_id": chunk.chunk_id}}
+            doc = self._build_document(collection_name, doc_id, chunk)
+            doc["revision_id"] = revision_id
+            doc["build_attempt_id"] = build_attempt_id
+            ndjson.append(_json_line(meta))
+            ndjson.append(_json_line(doc))
+        try:
+            await self._request("POST", "/_bulk", raw_body="\n".join(ndjson) + "\n")
+        except EsApiError as exc:
+            raise RuntimeError(
+                f"ES attempt 域写入失败, collection={collection_name}, attempt={build_attempt_id}"
+            ) from exc
+
+    async def purge_attempt(self, collection_name: str, build_attempt_id: str) -> int:
+        """按 attempt 域清除（delete_by_query on build_attempt_id；幂等）。
+
+        Returns:
+            int: ES 报告的 removed 数；共享索引不存在返回 0；响应不可解析返回 -1
+            （调用方按「未知但已发起」处理，残留由对账兜底）
+        """
+        query: Dict[str, Any] = {
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"collection_name": collection_name}},
+                        {"term": {"build_attempt_id": build_attempt_id}},
+                    ]
+                }
+            }
+        }
+        try:
+            resp = await self._request(
+                "POST", f"/{self._index}/_delete_by_query", json_body=query,
+                params={"ignore_unavailable": "true", "allow_no_indices": "true"},
+            )
+        except EsApiError as exc:
+            if exc.is_not_found():
+                return 0
+            raise RuntimeError(
+                f"ES attempt 域清理失败, collection={collection_name}, attempt={build_attempt_id}"
+            ) from exc
+        removed = (resp or {}).get("deleted")
+        return int(removed) if isinstance(removed, int) else -1
+
     # ==================== 内部 ====================
 
     def _build_document(self, collection_name: str, doc_id: str, chunk: EmbeddedChunk) -> Dict[str, Any]:
@@ -345,17 +405,22 @@ class EsKeywordRetrieverService(KeywordRetrieverService):
         await self.aclose()
 
     async def search(
-        self, query: str, collection_names: List[str], top_k: int
+        self, query: str, collection_names: List[str], top_k: int,
+        committed_attempt_ids: Optional[List[str]] = None,
     ) -> List[RetrievedChunk]:
         #构建 ES 查询体（match 打 BM25 + filter 限定范围）
         body: Dict[str, Any] = {
             "size": top_k,
             "query": {"bool": {"must": [{"match": {"content": query}}]}},
         }
+        filters: List[Dict[str, Any]] = []
         if collection_names:
-            body["query"]["bool"]["filter"] = [
-                {"terms": {"collection_name": list(collection_names)}}
-            ]
+            filters.append({"terms": {"collection_name": list(collection_names)}})
+        # P9 §8 版本过滤：committed_attempt_id 白名单（未迁移行不含该字段，被自然排除）
+        if committed_attempt_ids is not None:
+            filters.append({"terms": {"build_attempt_id": list(committed_attempt_ids)}})
+        if filters:
+            body["query"]["bool"]["filter"] = filters
         try:
             resp = await self._request(
                 "POST", f"/{self._index}/_search", json_body=body,

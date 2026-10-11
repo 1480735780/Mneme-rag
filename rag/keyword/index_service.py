@@ -96,3 +96,30 @@ class KeywordIndexService(ABC):
             collection_name: 知识库 collection 名称
         """
         ...
+
+    # ==================== attempt 域写入（P9 §6.2，版本化路径专用） ====================
+
+    async def write_attempt(
+        self,
+        collection_name: str,
+        doc_id: str,
+        revision_id: str,
+        build_attempt_id: str,
+        chunks: List["EmbeddedChunk"],
+    ) -> None:
+        """
+        写入一个 build attempt 域的关键词索引（版本化路径专用；§6.2 只增不删，
+        文档携带 revision_id / build_attempt_id，检索只接受 committed_attempt_id）
+
+        默认不支持；各后端按需实现（Memory / ES 支持，Milvus 同构通道不涉及）。
+        """
+        raise NotImplementedError(f"{type(self).__name__} 不支持 attempt 域写入")
+
+    async def purge_attempt(self, collection_name: str, build_attempt_id: str) -> int:
+        """
+        清除指定 build attempt 域的关键词索引（§6.2：只动 attempt 域，幂等）
+
+        Returns:
+            int: 清除文档数（ES 后端返回 delete_by_query 的 removed，无法精确时返回 -1）
+        """
+        raise NotImplementedError(f"{type(self).__name__} 不支持 attempt 域清理")

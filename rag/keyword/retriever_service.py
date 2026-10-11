@@ -16,7 +16,7 @@ MVP：抽象接口 + MemoryKeywordRetrieverService 内存占位实现；真实 E
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 
 from core.llm.schema import RetrievedChunk
 
@@ -24,9 +24,9 @@ from core.llm.schema import RetrievedChunk
 class KeywordRetrieverService(ABC):
     """关键词检索服务 SPI（对应 Java KeywordRetrieverService 接口）"""
 
-    @abstractmethod
     async def search(
-        self, query: str, collection_names: List[str], top_k: int
+        self, query: str, collection_names: List[str], top_k: int,
+        committed_attempt_ids: Optional[List[str]] = None,
     ) -> List[RetrievedChunk]:
         """
         在共享索引内做关键词检索，按 collection 过滤（对应 Java search）
@@ -35,8 +35,10 @@ class KeywordRetrieverService(ABC):
             query:           用户问题（已重写）
             collection_names: 目标知识库 collection 集合（作为 collection_name 过滤条件），空表示不限库（全局）
             top_k:            召回数量
+            committed_attempt_ids: P9 §8 版本过滤（committed_attempt_id 白名单）；None = 无版本化
+                语义（旧路径不过滤）。默认实现忽略该参数（不破坏既有子类），支持过滤的后端覆写。
 
         Returns:
             List[RetrievedChunk]: 命中 Chunk 列表，按相关性（BM25）倒序，id 与向量库主键 chunkId 对齐
         """
-        ...
+        raise NotImplementedError

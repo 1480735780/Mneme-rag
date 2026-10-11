@@ -33,6 +33,15 @@ class RetrieveRequest:
     collection_name: Optional[str] = None
     collection_names: Optional[List[str]] = None
     metadata_filters: Optional[Dict[str, Any]] = None
+    # P9 §8 版本过滤（D1 方案 A）：请求级快照的 committed_attempt_id 扁平集合（主过滤键，
+    # 全局唯一）+ active revision_id 集合（A4 小集合精确路径的 btree 辅助键）。
+    # None = 请求无版本化语义（旧路径，不过滤）；二者必须同时为 None 或同时非空。
+    revision_ids: Optional[List[str]] = None
+    committed_attempt_ids: Optional[List[str]] = None
+
+    def has_revision_filter(self) -> bool:
+        """是否携带版本过滤（快照非空才携带；未开启版本化的 KB 不进请求）"""
+        return self.committed_attempt_ids is not None
 
     def get_effective_collection_names(self) -> List[str]:
         """
@@ -204,6 +213,23 @@ class SearchContext:
     budget: Optional[RetrievalBudget] = None
     retrieval_scope: Optional[RetrievalScope] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # P9 §8：请求级版本快照（请求开始读一次、请求内不可变；None = 本次请求无版本化 KB，
+    # 通道按旧路径不过滤）。快照由共享检索入口挂入（与意图分类并行加载，§17.5.3）。
+    revision_snapshot: Optional[Any] = None
+
+    def revision_attempt_ids(self) -> Optional[List[str]]:
+        """版本过滤主键（committed_attempt_id 扁平集合）；无快照或空快照返回 None"""
+        snapshot = self.revision_snapshot
+        if snapshot is None or snapshot.is_empty:
+            return None
+        return list(snapshot.attempt_ids)
+
+    def revision_id_allowlist(self) -> Optional[List[str]]:
+        """A4 精确路径辅助键（active revision_id 扁平集合）；无快照或空快照返回 None"""
+        snapshot = self.revision_snapshot
+        if snapshot is None or snapshot.is_empty:
+            return None
+        return list(snapshot.revision_ids)
 
     def get_main_question(self) -> str:
         """

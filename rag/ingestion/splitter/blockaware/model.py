@@ -12,6 +12,9 @@ ChunkAssembler：
     展示文本原样落地，章节上下文只补进向量文本：content 是文档原貌，标题按原文位置已在正文里，
     再拼一份合成前缀等于篡改原文。
 
+BlockChunker 负责“怎么切”，ChunkDraft 负责“保存切割结果”，
+ChunkPacker 负责“怎么组合”，ChunkAssembler 负责“生成最终可入库 ChunkData”。
+
 对应 ragent 源码：
     - com.nageoffer.ai.ragent.core.chunk.model.ChunkDraft
     - com.nageoffer.ai.ragent.core.chunk.model.ChunkAssembler
@@ -20,10 +23,23 @@ ChunkAssembler：
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from common.util.snowflake import default_generator
-from core.llm.schema import ChunkData, ChunkMetadata
+from core.llm.schema import (
+    CHUNK_ROLES,
+    CHUNK_ROLE_STANDALONE,
+    ChunkData,
+    ChunkMetadata,
+)
+
+if TYPE_CHECKING:  # 仅类型标注用：运行时导入会与 contextualizer → model 互相成环
+    from rag.ingestion.splitter.contextualizer import Contextualizer
+
+# 切分策略标记（对应方案 3.2.3）：块边界由 Block 结构决定，还是由语义切分器在段落内部决定。
+# 用常量而非散落字面量：下游（评测 / 检索排障）要按这个值筛块，拼错字符串会静默筛不到。
+STRATEGY_BLOCKAWARE = "blockaware"
+STRATEGY_SEMANTIC = "semantic"
 
 
 def _has_text(value: Optional[str]) -> bool:
@@ -42,6 +58,10 @@ class ChunkDraft:
         metadata:       块元数据，None 归一为 ChunkMetadata.empty()
         piece:          是否为单个 Block 被切开的其中一片（pieces() 标记）
         heading:        是否标题草稿（of_heading() 标记，打包阶段的分节标记）
+        source_span:    本片在所属 Block 正文（归一化后）中的 [起, 止) 字符区间；定位不到为 None
+        strategy:       产出本片的切分策略（STRATEGY_BLOCKAWARE | STRATEGY_SEMANTIC）
+        parent_id:      所属父块 ID（父块构建器在打包之后标记；未成组为 None）
+        chunk_role:     块角色：parent | child | standalone（默认为既有行为 standalone）
     """
 
     content: str
@@ -49,6 +69,10 @@ class ChunkDraft:
     metadata: ChunkMetadata = field(default_factory=ChunkMetadata.empty)
     piece: bool = False
     heading: bool = False
+    source_span: Optional[Tuple[int, int]] = None
+    strategy: str = STRATEGY_BLOCKAWARE
+    parent_id: Optional[str] = None
+    chunk_role: str = CHUNK_ROLE_STANDALONE
 
     def __post_init__(self):
         # Java record compact constructor：content 空 → ""、metadata 空 → empty()（frozen 需 object.__setattr__）
@@ -56,6 +80,8 @@ class ChunkDraft:
             object.__setattr__(self, "content", "")
         if self.metadata is None:
             object.__setattr__(self, "metadata", ChunkMetadata.empty())
+        if self.chunk_role not in CHUNK_ROLES:
+            raise ValueError(f"chunk_role 必须是 {CHUNK_ROLES} 之一，实际 {self.chunk_role!r}")
 
     @staticmethod
     def of(content: str, embedding_body=None, metadata: Optional[ChunkMetadata] = None) -> "ChunkDraft":
@@ -87,11 +113,24 @@ class ChunkDraft:
 
         一个 Block 该怎么分，切它的 chunker 才是权威，合并阶段不得撤销：表格按行数上限切出的片被
         并回去，上限就形同虚设；段落切出的片各自带着重叠文本，并回去等于把那段重叠在同一块里复制一遍。
+
+        source_span / strategy 原样透传：它们描述的是「这一片是原文哪一段、谁切出来的」，
+        与 piece 标记同属切片自身的事实，重打包成新草稿时丢了就再也补不回来。
         """
         if len(drafts) <= 1:
             return drafts
         return [
-            ChunkDraft(d.content, d.embedding_body, d.metadata, True, d.heading)
+            ChunkDraft(
+                content=d.content,
+                embedding_body=d.embedding_body,
+                metadata=d.metadata,
+                piece=True,
+                heading=d.heading,
+                source_span=d.source_span,
+                strategy=d.strategy,
+                parent_id=d.parent_id,
+                chunk_role=d.chunk_role,
+            )
             for d in drafts
         ]
 
@@ -113,10 +152,27 @@ class ChunkAssembler:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def assemble_all(drafts: List[ChunkDraft]) -> List[ChunkData]:
-        """批量装配：草稿须已完成切分与合并，序号按列表顺序从 0 起分配（对应 Java assembleAll）"""
+    def assemble_all(
+        drafts: List[ChunkDraft],
+        contextualizer: Optional["Contextualizer"] = None,
+    ) -> List[ChunkData]:
+        """批量装配：草稿须已完成切分与合并，序号按列表顺序从 0 起分配（对应 Java assembleAll）
+
+        contextualizer 非空时先逐块增强检索正文，再走同一条装配通道：增强只改 embedding_body，
+        故展示文本、序号、向量文本的合成规则一概不动，开关即回退。
+        相邻块直接取同一份草稿列表的邻居——列表就是同一文档的产物，前后即文档顺序上的前后。
+        """
         if not drafts:
             return []
+        if contextualizer is not None:
+            drafts = [
+                contextualizer.contextualize(
+                    draft,
+                    drafts[i - 1] if i > 0 else None,
+                    drafts[i + 1] if i + 1 < len(drafts) else None,
+                )
+                for i, draft in enumerate(drafts)
+            ]
         return [ChunkAssembler.assemble(i, draft) for i, draft in enumerate(drafts)]
 
     @staticmethod
@@ -138,6 +194,10 @@ class ChunkAssembler:
                 metadata, draft.effective_body(), draft.content
             ),
             metadata=metadata,
+            # 父子关系随装配落到成品块：角色/parent 由打包之后的父块构建器标记，
+            # 装配是草稿事实的搬运，不在此处重新判断
+            parent_id=draft.parent_id,
+            chunk_role=draft.chunk_role,
         )
 
     @staticmethod

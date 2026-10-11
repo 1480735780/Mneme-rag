@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from core.llm.schema import RetrievedChunk, retrieved_chunk_key
 from rag.retrieval.channel.base import SearchChannel
@@ -94,6 +94,8 @@ class MultiChannelRetrievalEngine:
         postprocessors: 后置处理器列表（按 get_order 升序执行）
         timeout_ms:     通道级超时；<=0 表示不设超时
         scope_resolver: 检索作用域解析器（B 层接线；retrieve_knowledge_channels 按子问题解析作用域）
+        parent_resolver: 父块回填器（3.4.4，ParentChunkResolver 等价物），需提供 async resolve(chunks)；
+                         为 None 时不回填，结果与升级前一致
     """
 
     def __init__(
@@ -102,25 +104,33 @@ class MultiChannelRetrievalEngine:
         postprocessors: List[SearchResultPostProcessor],
         timeout_ms: int = 15000,
         scope_resolver: Optional[RetrievalScopeResolver] = None,
+        parent_resolver: Optional[Any] = None,
+        versioning_policy: Optional[Any] = None,
     ):
         self._channels = channels
         self._postprocessors = postprocessors
         self._timeout_ms = timeout_ms
         self._scope_resolver = scope_resolver
+        self._parent_resolver = parent_resolver
+        # P9 §8/§10.3：版本化访问策略（None = 未装配版本化，全部走旧路径）；
+        # 职责：Agent 硬拒绝（作用域解析后、通道前）+ 版本快照加载（§8）
+        self._versioning_policy = versioning_policy
 
     async def retrieve(self, context: SearchContext) -> List[RetrievedChunk]:
-        """执行一次多通道检索：并行通道召回 → 后处理链 → 返回最终 chunks（低层入口）"""
+        """执行一次多通道检索：并行通道召回 → 后处理链 → 父块回填 → 返回最终 chunks（低层入口）"""
         channel_results = await self._execute_search_channels(context)
         if not channel_results:
             logger.warning("没有任何启用的检索通道，本次不做知识召回")
             return []
-        return await self._execute_post_processors(channel_results, context)
+        chunks = await self._execute_post_processors(channel_results, context)
+        return await self._resolve_parents(chunks, context)
 
     async def retrieve_knowledge_channels(
         self,
         sub_intent,
         budget,
         scope_resolver: Optional[RetrievalScopeResolver] = None,
+        caller: str = "rag",
     ) -> KnowledgeRetrievalResult:
         """
         按子问题执行多通道检索（对应 Java retrieveKnowledgeChannels）
@@ -138,16 +148,49 @@ class MultiChannelRetrievalEngine:
         """
         resolver = scope_resolver if scope_resolver is not None else self._scope_resolver
         context = self._build_search_context(sub_intent, budget, resolver)
+        self._apply_versioning_policy(context, caller)
 
         channel_results = await self._execute_search_channels(context)
         if not channel_results:
             return KnowledgeRetrievalResult.empty()
 
         chunks = await self._execute_post_processors(channel_results, context)
+        # 回填放在归因之前：父块继承了原子块的 collection，归因据此仍能把证据绑回原意图；
+        # 若先归因再回填，替换出来的父块键值在归因表里查不到，证据会整批变成「无归属」
+        chunks = await self._resolve_parents(chunks, context)
         return KnowledgeRetrievalResult(
             chunks=chunks,
             intent_ids_by_chunk_key=self._derive_attribution(chunks, context.retrieval_scope),
         )
+
+    def _apply_versioning_policy(self, context: SearchContext, caller: str) -> None:
+        """P9 §8/§10.3：版本化闸口——硬拒绝 + 请求级快照挂载（单次 DB 往返）。
+
+        fail-closed：快照加载失败必须让请求显式失败，绝不静默返回未过滤结果。
+        """
+        if self._versioning_policy is None:
+            return
+        scope = context.retrieval_scope
+        collections = scope.target_collections if scope is not None else []
+        if not collections:
+            return
+        # 硬拒绝必须穿透（VersionedKbAccessError 不得被吞成空结果，§10.3）
+        self._versioning_policy.assert_agent_access(caller, collections)
+        try:
+            context.revision_snapshot = self._versioning_policy.load_snapshot(collections)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("版本快照加载失败，fail-closed 拒绝本次检索: %s", exc)
+            raise
+
+    async def _resolve_parents(
+        self, chunks: List[RetrievedChunk], context: Optional[SearchContext] = None
+    ) -> List[RetrievedChunk]:
+        """父块回填：未注入回填器时原样返回（3.4.4 开关关闭 = 既有行为）；
+        版本快照（P9 §8）随上下文透传给回填器（§8 白名单消费方）"""
+        if self._parent_resolver is None or not chunks:
+            return chunks
+        attempts = context.revision_attempt_ids() if context is not None else None
+        return await self._parent_resolver.resolve(chunks, committed_attempt_ids=attempts)
 
     @staticmethod
     def _build_search_context(

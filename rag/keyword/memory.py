@@ -35,13 +35,15 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_\u4e00-\u9fff]+")
 
 @dataclass(frozen=True)
 class MemoryKeywordDoc:
-    """内存关键词索引记录（对齐 ES 文档：_id=chunkId + content/collection_name/doc_id/chunk_index）"""
+    """内存关键词索引记录（对齐 ES 文档：_id=chunkId + content/collection_name/doc_id/chunk_index；
+    build_attempt_id 仅版本化路径写入，遗留路径为 None）"""
 
     chunk_id: str
     collection_name: str
     doc_id: str
     chunk_index: int
     content: str
+    build_attempt_id: Optional[str] = None
 
 
 class MemoryKeywordStore:
@@ -107,6 +109,36 @@ class MemoryKeywordIndexService(KeywordIndexService):
             if doc.collection_name != collection_name
         }
 
+    async def write_attempt(
+        self,
+        collection_name: str,
+        doc_id: str,
+        revision_id: str,
+        build_attempt_id: str,
+        chunks: List[EmbeddedChunk],
+    ) -> None:
+        """attempt 域纯追加写入：文档携带 build_attempt_id（P9 §6.2），不删任何既有数据"""
+        for chunk in chunks:
+            self._store.docs[chunk.chunk_id] = MemoryKeywordDoc(
+                chunk_id=chunk.chunk_id,
+                collection_name=collection_name,
+                doc_id=doc_id,
+                chunk_index=chunk.index,
+                content=_truncate(chunk.content),
+                build_attempt_id=build_attempt_id,
+            )
+
+    async def purge_attempt(self, collection_name: str, build_attempt_id: str) -> int:
+        """按 attempt 域清除（只动 build_attempt_id 匹配的文档，幂等）"""
+        remaining = {
+            cid: doc
+            for cid, doc in self._store.docs.items()
+            if doc.build_attempt_id != build_attempt_id
+        }
+        removed = len(self._store.docs) - len(remaining)
+        self._store.docs = remaining
+        return removed
+
 
 class MemoryKeywordRetrieverService(KeywordRetrieverService):
     """
@@ -120,16 +152,21 @@ class MemoryKeywordRetrieverService(KeywordRetrieverService):
         self._store = store or MemoryKeywordStore()
 
     async def search(
-        self, query: str, collection_names: List[str], top_k: int
+        self, query: str, collection_names: List[str], top_k: int,
+        committed_attempt_ids: Optional[List[str]] = None,
     ) -> List[RetrievedChunk]:
         if not query or not query.strip():
             return []
         filter_by_collection = bool(collection_names)
+        attempt_filter = set(committed_attempt_ids) if committed_attempt_ids is not None else None
         terms = _tokenize(query)
 
         scored: List[tuple] = []
         for doc in self._store.docs.values():
             if filter_by_collection and doc.collection_name not in collection_names:
+                continue
+            # P9 §8 版本过滤：携带快照时只接受 attempt 白名单内的文档（未迁移行被排除）
+            if attempt_filter is not None and doc.build_attempt_id not in attempt_filter:
                 continue
             # 与 _tokenize 一致：查询词已小写化，文档内容也需小写比较（否则 ASCII（如 OA/API）大小写错配漏召回）
             content = doc.content.lower()

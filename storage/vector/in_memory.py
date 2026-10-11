@@ -123,6 +123,47 @@ class InMemoryVectorStore(VectorStoreService, VectorRetrieverService):
         if records is not None:
             records[:] = [r for r in records if r.chunk_id not in id_set]
 
+    # ── attempt 域写入（P9 §6.2） ──────────────────────────
+
+    async def write_attempt(
+        self,
+        collection_name: str,
+        doc_id: str,
+        revision_id: str,
+        build_attempt_id: str,
+        chunks: List[EmbeddedChunk],
+    ) -> None:
+        """attempt 域纯追加写入：行携带 revision_id / build_attempt_id 元数据，不删任何既有数据"""
+        records = self._collections.setdefault(collection_name, [])
+        for chunk in chunks:
+            flat = dict(chunk.metadata.to_flat_map())
+            flat["doc_id"] = doc_id
+            flat["revision_id"] = revision_id
+            flat["build_attempt_id"] = build_attempt_id
+            records.append(
+                _StoredRecord(
+                    chunk_id=chunk.chunk_id,
+                    doc_id=doc_id,
+                    text=chunk.content,
+                    embedding=_normalize(chunk.embedding),
+                    chunk_index=chunk.index,
+                    flat_metadata=flat,
+                )
+            )
+
+    async def purge_attempt(self, collection_name: str, build_attempt_id: str) -> int:
+        """按 attempt 域清除（只动 metadata.build_attempt_id 匹配的行，幂等）"""
+        records = self._collections.get(collection_name)
+        if records is None:
+            return 0
+        remaining = [
+            r for r in records
+            if r.flat_metadata.get("build_attempt_id") != build_attempt_id
+        ]
+        removed = len(records) - len(remaining)
+        self._collections[collection_name] = remaining
+        return removed
+
     # ── 读侧 ──────────────────────────────────────────────
 
     def supports_global_retrieval(self) -> bool:
@@ -148,6 +189,12 @@ class InMemoryVectorStore(VectorStoreService, VectorRetrieverService):
         for name in targets:
             for r in self._collections.get(name, []):
                 if not self._match_filters(r, request.metadata_filters):
+                    continue
+                # P9 §8 版本过滤：携带快照时只接受 committed_attempt_id 白名单内的行
+                # （未提交 attempt / 遗留未迁移行一律排除）
+                if request.has_revision_filter() and (
+                    r.flat_metadata.get("build_attempt_id") not in set(request.committed_attempt_ids or [])
+                ):
                     continue
                 score = sum(a * b for a, b in zip(query_vec, r.embedding))
                 scored.append(

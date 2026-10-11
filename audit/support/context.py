@@ -52,7 +52,9 @@ class BizChangeLogContext:
         _CURRENT.set(
             _AuditContext(
                 biz_id=str(biz_id) if biz_id is not None else _UNKNOWN_BIZ_ID,
-                snapshot=json.dumps(payload, ensure_ascii=False),
+                # default=str：real 栈从 PG 读回的行里时间列是 datetime（memory 栈是 ISO 串），
+                # 不兜底则删除文档这类带整行的快照会 TypeError（JSON serializable）而使请求整体失败
+                snapshot=json.dumps(payload, ensure_ascii=False, default=str),
             )
         )
 

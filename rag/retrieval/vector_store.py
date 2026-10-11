@@ -94,9 +94,49 @@ class VectorStoreService(ABC):
 
         Args:
             collection_name: 向量空间名称
-            chunk_ids: chunk 唯一标识列表
+            chunk_ids:       chunk 唯一标识列表
         """
         ...
+
+    # ==================== attempt 域写入（P9 §6.2，版本化路径专用） ====================
+
+    async def write_attempt(
+        self,
+        collection_name: str,
+        doc_id: str,
+        revision_id: str,
+        build_attempt_id: str,
+        chunks: List[EmbeddedChunk],
+    ) -> None:
+        """
+        写入一个 build attempt 域的数据（版本化路径专用）
+
+        语义（§6.2 写入隔离）：
+            - 只增不删：不触碰任何既有数据（包括同 revision 的其他 attempt）；
+            - chunk id 已是 attempt 域键（chunk_key_id，由构建管线用 §3.4 规范键生成）；
+            - 写入行必须携带 revision_id / build_attempt_id（metadata），检索与发布只接受
+              committed_attempt_id（§6.2）——未提交 attempt 对版本过滤检索不可见（阶段 4）。
+
+        默认不支持（Milvus 不实现——版本化 KB 在服务层拒绝 Milvus 后端，§10.1）。
+
+        Args:
+            collection_name: 向量空间名称
+            doc_id:          文档唯一标识
+            revision_id:     所属 revision（不可变版本）
+            build_attempt_id: 本次构建 attempt（重试递增/重新生成）
+            chunks:          已向量化块（chunk_id = chunk_key_id）
+        """
+        raise NotImplementedError(f"{type(self).__name__} 不支持 attempt 域写入")
+
+    async def purge_attempt(self, collection_name: str, build_attempt_id: str) -> int:
+        """
+        清除指定 build attempt 域的数据（版本化路径专用；§6.2：worker 只能删自己租约下
+        当前 attempt 域内的数据，禁止按 document_id / revision_id 删除）
+
+        Returns:
+            int: 清除行数（幂等：重复 purge 返回 0）
+        """
+        raise NotImplementedError(f"{type(self).__name__} 不支持 attempt 域清理")
 
 
 class VectorRetrieverService(ABC):

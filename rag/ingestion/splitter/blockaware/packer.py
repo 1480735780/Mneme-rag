@@ -32,13 +32,13 @@ class ChunkPacker:
         if not drafts or len(drafts) <= 1:
             return drafts if drafts else []
 
-        max_chars = budget.max_chars
-        min_chars = max(1, max_chars // self.MIN_CHARS_DIVISOR)
+        max_chars = budget.max_chars  #目标块大小。
+        min_chars = max(1, max_chars // self.MIN_CHARS_DIVISOR)  #防止产生太碎的小块
         result: List[ChunkDraft] = []
         buffer: List[ChunkDraft] = []
 
         for section in self.split_sections(drafts):
-            section_len = self.total_length(section)
+            section_len = self.total_length(section) #先计算这一节整体多大
             if section_len > budget.tolerance_chars():
                 buffer = self.pack_within(buffer, section, budget, min_chars, result)
                 continue
@@ -71,17 +71,28 @@ class ChunkPacker:
 
     @staticmethod
     def split_sections(drafts: List[ChunkDraft]) -> List[List[ChunkDraft]]:
-        """按标题切节：标题起一节，标题之前的散块自成一节"""
+        """按标题切节：标题起一节，标题之前的散块自成一节
+
+        只在「当前节已有正文」时切：父标题紧接子标题（## 五 后紧跟 ### 5.1）时，
+        若按标题逐个切，父标题会独自成一个十几字的节，再被 break_before 判为「装得下」
+        而并进上一块尾部——标题与它的正文分家，块尾落在一行标题上。
+        连续标题归入同一节，父标题就随它的第一个子节一起进退。
+        """
         sections: List[List[ChunkDraft]] = []
         current: List[ChunkDraft] = []
         for draft in drafts:
-            if draft.heading and current:
+            if draft.heading and current and ChunkPacker.has_body(current):
                 sections.append(current)
                 current = []
             current.append(draft)
         if current:
             sections.append(current)
         return sections
+
+    @staticmethod
+    def has_body(drafts: List[ChunkDraft]) -> bool:
+        """节里是否已攒下正文：整节全是标题说明后面还跟着它的正文，此时不该切节"""
+        return any(not draft.heading for draft in drafts)
 
     @staticmethod
     def pack_within(carried: List[ChunkDraft], section: List[ChunkDraft],
@@ -157,6 +168,10 @@ class ChunkPacker:
         检索正文按「显式值优先、否则回落展示文本」逐块拼接：图片块的检索正文特意去掉了 URL 噪声，
         一律取展示文本会让向量退化成带 URL 的文本；路径取公共前缀而非其中某一块的，
         前导语可能来自上一节，取大块那份等于把上一节的内容记到本节名下。
+
+        source_span / strategy 不跟着透传：合并后的块由 Packer 定边界，且各片可能来自不同 Block
+        （如表格的前导语取自上一段），单一区间表示不了跨块的合并结果，硬取首片的会指错位置；
+        故一并回落默认值（无区间 + blockaware），只保留「这一块是打包产物」这个事实。
         """
         content_parts: List[str] = []
         body_parts: List[str] = []
@@ -178,11 +193,11 @@ class ChunkPacker:
             extras=dict(parts[0].metadata.extras),
         )
         return ChunkDraft(
-            cls.SEPARATOR.join(content_parts),
-            cls.SEPARATOR.join(body_parts) if has_explicit_body else None,
-            merged,
-            False,
-            heading,
+            content=cls.SEPARATOR.join(content_parts),
+            embedding_body=cls.SEPARATOR.join(body_parts) if has_explicit_body else None,
+            metadata=merged,
+            piece=False,
+            heading=heading,
         )
 
     @staticmethod

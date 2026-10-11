@@ -72,16 +72,20 @@ class KeywordSearchChannel(SearchChannel):
                 return self.empty_result(int((time.monotonic() - start) * 1000))
             #真检索关键词
             question = context.get_main_question()
+            attempts = context.revision_attempt_ids()  # P9 §8 版本快照（None = 旧路径）
             quota = ScopeQuota.split(scope, context.budget.recall_budget, self._supplement_ratio)
 
-            primary = await self._retriever.search(question, collections, quota.primary)
+            primary = await self._retriever.search(
+                question, collections, quota.primary, committed_attempt_ids=attempts
+            )
 
             # 补充路失败必须只损失自己：它拿到的是兜底名额，异常只丢弃补充证据
             supplement: List[RetrievedChunk] = []
             if quota.supplement > 0:
                 try:
                     supplement = await self._retriever.search(
-                        question, scope.supplement_collections, quota.supplement
+                        question, scope.supplement_collections, quota.supplement,
+                        committed_attempt_ids=attempts,
                     )
                 except Exception as e:  # noqa: BLE001 补充路异常仅丢弃补充证据
                     logger.warning("关键词补充路检索失败，仅丢弃补充证据: %s", e)

@@ -5,6 +5,8 @@ ChunkSink：索引落点端口，内核只认这个接口，实现住在各自�
 ChunkIndexWriter：索引扇出，把块整体写进全部落点，事务边界在此；加一个索引后端 = 加一个 ChunkSink，
 本类与内核都一行不改。
 
+kernel 产生带向量的 chunk，ChunkIndexWriter 把它们整体替换到所有索引后端。
+
 对应 ragent 源码：
     - com.nageoffer.ai.ragent.core.ingest.sink.ChunkSink
     - com.nageoffer.ai.ragent.core.ingest.sink.ChunkIndexWriter
@@ -12,9 +14,10 @@ ChunkIndexWriter：索引扇出，把块整体写进全部落点，事务边界�
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Union
 
 from core.llm.schema import EmbeddedChunk
+from rag.ingestion.index_payload import IndexPayload
 from rag.retrieval.vector_store import VectorStoreService
 from storage.vector.schema import VectorTarget
 
@@ -57,6 +60,44 @@ class ChunkSink(ABC):
             doc: 文档身份
         """
         ...
+
+    async def replace_document_payload(
+        self,
+        target: VectorTarget,
+        doc: "DocumentRef",
+        payload: IndexPayload,
+    ) -> None:
+        """按双索引载荷写入（对应方案 3.4.2）
+
+        默认实现只写 Child：对「本来就不该收父块」的落点（向量库）这就是正确行为，
+        故它无需覆写、也就无需知道父子块的存在；需要收父块的落点（关系库）自行覆写。
+        """
+        await self.replace_document(target, doc, payload.child_chunks)
+
+    # ==================== attempt 域写入（P9 §6.2，版本化路径专用） ====================
+
+    async def write_attempt(
+        self,
+        target: VectorTarget,
+        doc: "DocumentRef",
+        revision_id: str,
+        build_attempt_id: str,
+        payload: IndexPayload,
+    ) -> None:
+        """写入一个 build attempt 域（版本化路径专用；§6.2 只增不删，不触碰既有数据）。
+
+        默认不支持——各落点按需实现（向量 InMemory/Pg、关键词 Memory/ES、关系库）；
+        Milvus 不实现（版本化 KB 服务层拒绝，§10.1）。
+        """
+        raise NotImplementedError(f"{type(self).__name__} 不支持 attempt 域写入")
+
+    async def purge_attempt(self, collection_name: str, build_attempt_id: str) -> int:
+        """清除指定 attempt 域（worker 只能删自己租约下当前 attempt 域内的数据，§6.2）
+
+        Returns:
+            int: 各通道清除量之和（语义按通道自述；未知返回 -1 视为「已发起」）
+        """
+        raise NotImplementedError(f"{type(self).__name__} 不支持 attempt 域清理")
 
 
 class VectorStoreSink(ChunkSink):
@@ -107,11 +148,40 @@ class ChunkIndexWriter:
         self,
         target: VectorTarget,
         doc: "DocumentRef",
-        chunks: List[EmbeddedChunk],
+        chunks: Union[List[EmbeddedChunk], IndexPayload],
     ) -> None:
+        """扇出到全部落点：传单列表走既有路径，传 IndexPayload 走双索引路径
+
+        单列表与 IndexPayload 都收，是为了让「没有父块的文档」不必造一个空载荷：
+        调用方按是否产出父块二选一，两条路径各自都是最直白的表达。
+        """
         for sink in self._sinks:
-            await sink.replace_document(target, doc, chunks)
+            if isinstance(chunks, IndexPayload):
+                await sink.replace_document_payload(target, doc, chunks)
+            else:
+                await sink.replace_document(target, doc, chunks)
 
     async def delete_document(self, target: VectorTarget, doc: "DocumentRef") -> None:
         for sink in self._sinks:
             await sink.delete_document(target, doc)
+
+    # ==================== attempt 域扇出（P9 §6.2，版本化路径专用） ====================
+
+    async def write_attempt(
+        self,
+        target: VectorTarget,
+        doc: "DocumentRef",
+        revision_id: str,
+        build_attempt_id: str,
+        payload: IndexPayload,
+    ) -> None:
+        """attempt 域扇出：全部落点纯追加写入（chunk id 已由构建管线赋 chunk_key_id）"""
+        for sink in self._sinks:
+            await sink.write_attempt(target, doc, revision_id, build_attempt_id, payload)
+
+    async def purge_attempt(self, collection_name: str, build_attempt_id: str) -> int:
+        """attempt 域扇出清理（重试前清自己上一 attempt / sweeper 精确清理共用）"""
+        total = 0
+        for sink in self._sinks:
+            total += await sink.purge_attempt(collection_name, build_attempt_id)
+        return total

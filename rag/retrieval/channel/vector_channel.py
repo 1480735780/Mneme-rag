@@ -70,13 +70,16 @@ class VectorSearchChannel(SearchChannel):
         try:
             #获取检索作用域
             scope = context.retrieval_scope  
+            # P9 §8 版本快照（None = 本次请求无版本化 KB，旧路径不过滤）
+            attempts = context.revision_attempt_ids()
+            revisions = context.revision_id_allowlist()
             #作用域是定向的
             if scope is not None and scope.directed:
-                chunks = await self._retrieve_directed(context, scope)
+                chunks = await self._retrieve_directed(context, scope, attempts, revisions)
                 metadata = {"scope": "directed", "top_score": scope.top_score}
             else:
             #作用域是全局的
-                chunks = await self._retrieve_global(context, scope)
+                chunks = await self._retrieve_global(context, scope, attempts, revisions)
                 metadata = {"scope": "global", "top_score": scope.top_score if scope else 0.0}
 
             latency_ms = int((time.monotonic() - start) * 1000)
@@ -95,15 +98,23 @@ class VectorSearchChannel(SearchChannel):
             logger.error("向量检索失败: %s", e)
             return self.empty_result(int((time.monotonic() - start) * 1000))
 
-    async def _retrieve_global(self, context: SearchContext, scope: RetrievalScope | None) -> List[RetrievedChunk]:
+    async def _retrieve_global(
+        self, context: SearchContext, scope: RetrievalScope | None,
+        attempts: Optional[List[str]], revisions: Optional[List[str]],
+    ) -> List[RetrievedChunk]:
         """全局作用域：跨全部有效库检索（只算一次查询向量）"""
         question = context.get_main_question()
         budget = context.budget.recall_budget if context.budget else 5
         collections = scope.target_collections if scope is not None else None
         query_vector = await self._retriever.embed_and_normalize(question)
-        return await self._retrieve_over(question, query_vector, collections, budget)
+        return await self._retrieve_over(
+            question, query_vector, collections, budget, attempts, revisions
+        )
 
-    async def _retrieve_directed(self, context: SearchContext, scope: RetrievalScope) -> List[RetrievedChunk]:
+    async def _retrieve_directed(
+        self, context: SearchContext, scope: RetrievalScope,
+        attempts: Optional[List[str]], revisions: Optional[List[str]],
+    ) -> List[RetrievedChunk]:
         """定向作用域：主路查命中库 + 并行补一路未命中库（两路共用一次查询向量）"""
         question = context.get_main_question()
         retrieval_budget = context.budget or RetrievalBudget.uniform(5)
@@ -117,7 +128,9 @@ class VectorSearchChannel(SearchChannel):
         async def fetch(collections, top_k):
             if not collections or top_k <= 0:
                 return []
-            return await self._retrieve_over(question, query_vector, collections, top_k)
+            return await self._retrieve_over(
+                question, query_vector, collections, top_k, attempts, revisions
+            )
 
         if supplement_quota > 0:
             # 补充路失败必须只损失自己：并行任务各自独立，异常由调用方兜底
@@ -183,11 +196,16 @@ class VectorSearchChannel(SearchChannel):
         query_vector: List[float],
         collections: List[str] | None,
         top_k: int,
+        attempts: Optional[List[str]] = None,
+        revisions: Optional[List[str]] = None,
     ) -> List[RetrievedChunk]:
         """在给定 collection 范围内取一路候选：按相关性降序、条数不超过 top_k"""
         if collections is not None and not collections:
             return []
         request = RetrieveRequest(query=question, top_k=top_k, collection_names=collections)
+        # P9 §8 版本快照透传（None = 旧路径不过滤）
+        request.committed_attempt_ids = attempts
+        request.revision_ids = revisions
 
         # 后端支持跨库单次查询则一次搞定；否则逐库并行 fan-out 再统一截断（预算即总量）
         if self._retriever.supports_global_retrieval():

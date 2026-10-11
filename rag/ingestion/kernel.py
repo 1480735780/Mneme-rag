@@ -27,7 +27,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from core.llm.embedding import EmbeddingService
-from core.llm.schema import ChunkData, EmbeddedChunk
+from core.llm.schema import CHUNK_ROLE_PARENT, ChunkData, EmbeddedChunk
+from rag.ingestion.index_payload import IndexPayload
 from rag.ingestion.parser.base import DocumentParser, ParseProfile
 from rag.ingestion.parser.model import Block, ParsedDocument
 from rag.ingestion.parser.registry import ParserRegistry, detect_mime
@@ -306,20 +307,32 @@ class DefaultIngestionKernel(IngestionKernel):
             raise ValueError(f"分块结果为空：doc_id={doc.doc_id}, mime={mime_type}")
 
         # ④ embed：模型与维度都来自落点，此处校验维度
+        # 父块不参与召回，也就不需要向量：只对召回单元（Child / standalone）算向量。
+        # 是否走双索引由分块结果自己决定而非另设开关——开关在 wiring 层（是否注入父块构建器），
+        # 两处各留一个开关迟早会配成「产出父块却不双索引」这种半生效状态。
+        retrieval_chunks = [c for c in chunks if c.chunk_role != CHUNK_ROLE_PARENT]
+        parent_chunks = [c for c in chunks if c.chunk_role == CHUNK_ROLE_PARENT]
         embed_start = time.time()
-        embedded: List[EmbeddedChunk] = await self._chunk_embedding_service.embed(chunks, target)
+        embedded: List[EmbeddedChunk] = await self._chunk_embedding_service.embed(retrieval_chunks, target)
         embed_millis = _elapsed(embed_start)
 
         # ⑤ index：扇出到全部落点，事务边界在写入器内
         index_start = time.time()
-        await self._chunk_index_writer.replace_document(target, doc, embedded)
+        if parent_chunks:
+            await self._chunk_index_writer.replace_document(
+                target, doc, IndexPayload(child_chunks=embedded, parent_chunks=parent_chunks)
+            )
+        else:
+            await self._chunk_index_writer.replace_document(target, doc, embedded)
         index_millis = _elapsed(index_start)
 
         return IngestionOutcome(
             mime_type=mime_type,
             parser_type=parser.parser_type,
             block_count=len(blocks),
-            chunks=chunks,
+            # 只回传召回单元：外层按 chunk_count 展示文档分块数、按 chunks 做后续加工，
+            # 父块是生成侧的中间物，混进来会让「文档有多少块」凭空翻倍
+            chunks=retrieval_chunks,
             timings=IngestionTimings(parse_millis, chunk_millis, embed_millis, index_millis),
         )
 

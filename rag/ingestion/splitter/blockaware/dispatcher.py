@@ -5,7 +5,7 @@ rag.ingestion.splitter.blockaware.dispatcher - 分块调度器（对应 Java Blo
 Block 类型 → chunker 查表分发，同一类型被两个 chunker 认领时启动即失败。
 标题先更新章节路径再照常分发，于是它拿到的是含自己在内的路径，与其后正文同节而自然同块；
 流程固定为分发产草稿 → 按节打包 → 统一装配，装配留在末端是因为向量文本要拼章节前缀，
-而打包只能发生在拼前缀之前。
+而打包只能发生在拼前缀之前。上下文增强（M2）也挂在装配这一步，因为它同样只动向量文本。
 
 heading_handler / packer 以鸭子类型注入（接口在 2.4 / 2.11 落地），此处定义最小契约：
     - heading_handler.update(outline, heading) -> outline，outline.path() -> 章节路径序列
@@ -38,15 +38,24 @@ class BlockAwareChunkerDispatcher(ChunkerDispatcher):
         packer: Any,
         heading_handler: Optional[Any] = None,
         chunkers: Optional[List[BlockChunker]] = None,
+        contextualizer: Optional[Any] = None,
+        parent_child_builder: Optional[Any] = None,
     ):
         """
         Args:
             packer:         块打包器（ChunkPacker 等价物），需提供 pack(drafts, budget)
             heading_handler: 标题处理器（HeadingHandler 等价物，2.4 落地），None 时标题不累积路径
             chunkers:       各 Block 类型专属切分器列表；同一类型被两个认领即启动失败
+            contextualizer: 上下文增强器（Contextualizer 等价物，M2 3.3.1），需提供
+                            contextualize(draft, prev, next)；None 时不增强，行为与 M2 前一致
+            parent_child_builder: 父子块构建器（ParentChildBuilder 等价物，3.4.1），需提供
+                            build(drafts, budget) -> (tagged_drafts, parent_chunks)；
+                            None 时不建父块，全部块保持 standalone（既有行为）
         """
         self._packer = packer
         self._heading_handler = heading_handler
+        self._contextualizer = contextualizer
+        self._parent_child_builder = parent_child_builder
         self._registry: Dict[Type[Block], BlockChunker] = {}
         for chunker in chunkers or []:
             block_type = chunker.block_type()
@@ -75,7 +84,12 @@ class BlockAwareChunkerDispatcher(ChunkerDispatcher):
             path = outline.path() if outline is not None else ()
             drafts.extend(self._chunk_one(block, ChunkContext.of(list(path), budget)))
 
-        return ChunkAssembler.assemble_all(self._packer.pack(drafts, budget))
+        packed = self._packer.pack(drafts, budget)
+        # 父子块标记发生在打包之后、装配之前：早于打包会被 merge/flush 抹掉，晚于装配则 ChunkData 已定型
+        if self._parent_child_builder is not None:
+            packed, parents = self._parent_child_builder.build(packed, budget)
+            return ChunkAssembler.assemble_all(packed, self._contextualizer) + parents
+        return ChunkAssembler.assemble_all(packed, self._contextualizer)
 
     def _chunk_one(self, block: Block, ctx: ChunkContext) -> List[ChunkDraft]:
         """按块类型查表分发到具体 chunker，未认领即失败"""
@@ -89,10 +103,14 @@ def build_block_aware_dispatcher(
     chunkers: Optional[List[BlockChunker]] = None,
     heading_handler: Optional[Any] = None,
     packer: Optional[Any] = None,
+    contextualizer: Optional[Any] = None,
+    parent_child_builder: Optional[Any] = None,
 ) -> BlockAwareChunkerDispatcher:
     """默认装配 BlockAware 分块器：全部 7 个 chunker + HeadingHandler + ChunkPacker
 
-    chunkers / heading_handler / packer 可覆盖注入（测试或定制用）。
+    chunkers / heading_handler / packer 可覆盖注入（测试或定制用）；
+    contextualizer 为 None 时不增强检索正文（M2 默认关闭，由 wiring 按开关传入）；
+    parent_child_builder 为 None 时不建结构组父块（3.4 默认关闭，由 wiring 按开关传入）。
     """
     if chunkers is None:
         from rag.ingestion.splitter.blockaware.code_chunker import CodeChunker
@@ -122,4 +140,6 @@ def build_block_aware_dispatcher(
         packer=packer,
         heading_handler=heading_handler,
         chunkers=chunkers,
+        contextualizer=contextualizer,
+        parent_child_builder=parent_child_builder,
     )

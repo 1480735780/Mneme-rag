@@ -149,7 +149,7 @@ class KnowledgeSearchFacade:
         for si in sub_intents:
             try:
                 result = await self._retrieval_engine.retrieve_knowledge_channels(
-                    si, self._budget, self._scope_resolver
+                    si, self._budget, self._scope_resolver, caller="agent"
                 )
             except Exception:  # noqa: BLE001 单子问题检索失败降级为空，不影响其余子问题
                 logger.error("子问题检索失败，降级为空，question：%s", si.sub_question, exc_info=True)
