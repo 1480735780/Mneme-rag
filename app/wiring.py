@@ -321,6 +321,10 @@ class AppContainer:
     agent_engine_tool_catalog: Any = None
     mcp_tool_registry: Any = None
     _mcp_autoconfig: Any = None
+    # P10.1 观测域：LLM 调用明细管线（hub = 队列+DAO+flush handler；lifespan 启停，
+    # T1.3 起发射点经 hub.emit() 写入；双 profile 无差别装配）
+    observation_hub: Any = None
+    llm_call_dao: Any = None
     _owned: list = field(default_factory=list)
 
     # ==================== 双 profile 装配 ====================
@@ -431,12 +435,26 @@ class AppContainer:
                 )
             logger.info("已播种智能体提示词槽位: %s", slot_key)
 
+    def _wire_observation(self) -> None:
+        """P10.1 T1.2：LLM 调用观测管线装配（队列 + DAO + flush handler；lifespan 启停）
+
+        双 profile 无差别装配——观测是常驻能力，不随 LLM 可用性开关（InMemory DAO 亦可用）。
+        批量落库经 asyncio.to_thread 出事件循环（executor 每操作独立连接，线程安全），
+        200 行/批同步 insert 不占 loop（D2：观测不反噬推理路径）。发射点自 T1.3 接入：
+        LLM 层经 hub.emit() 投递 CallEvent，本方法不触及 LLM 构造。
+        """
+        from core.llm.observation import LlmCallDao, ObservationHub
+
+        self.llm_call_dao = LlmCallDao(self.db)
+        self.observation_hub = ObservationHub(self.llm_call_dao)
+
     @classmethod
     def _build_memory(cls, settings: AppSettings) -> "AppContainer":
         """全内存栈（InMemory DB + Memory 缓存），测试/演示 profile"""
         db = InMemoryDatabaseClient()
         db.ensure_schema(DEFAULT_TABLES)
         container = cls(settings=settings, db=db, cache=MemoryCacheManager())
+        container._wire_observation()
         container._wire_conversation_services()
         container._wire_ingestion_services()
         container._wire_knowledge_services()
@@ -464,6 +482,7 @@ class AppContainer:
         db = _build_database(settings)
         cache, redis_client = _build_cache(settings)
         container = cls(settings=settings, db=db, cache=cache, redis=redis_client)
+        container._wire_observation()
         container._wire_conversation_services()
         container._wire_ingestion_services()
         container._wire_knowledge_services()

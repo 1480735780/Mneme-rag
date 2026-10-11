@@ -73,14 +73,20 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
         # P3-2 跨节点取消广播：随 lifespan 订阅取消频道（优雅停止；不可用时本地兜底）
         if container.stream_task_manager is not None:
             await container.stream_task_manager.start()
+        # P10.1 T1.2 观测 flush 后台任务：随 lifespan 启动（同步 create_task，先于任何发射源，D2）
+        if container.observation_hub is not None:
+            container.observation_hub.start()
         try:
             yield
         finally:
-            # 关闭：先停调度协程，再释放容器持有的资源（含 redis 连接池优雅断开，P6 3.1）
+            # 关闭顺序（D2 停机契约）：先停后台生产者/消费协程 → 观测 drain（不丢已入队，
+            # kill -9 除外）→ 再释放容器持有的资源（含 redis 连接池优雅断开，P6 3.1）
             if container.stream_task_manager is not None:
                 await container.stream_task_manager.stop()
             if container.knowledge_schedule_job is not None:
                 await container.knowledge_schedule_job.stop()
+            if container.observation_hub is not None:
+                await container.observation_hub.stop_and_drain()
             await container.aclose()
             logger.info("应用资源已释放")
 
@@ -166,6 +172,15 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
             {"status": "UP", "profile": container.settings.stack_profile}
         )
         return result_to_dict(result)
+
+    # P10.1 T1.2：观测自健康端点（D13，JSON 序列化出口——只读 stats/depth 不触发行为；
+    # 熔断状态随 T1.7、当日 token/成本随 T3.3 在此区块扩展）
+    @app.get("/metrics")
+    async def metrics() -> dict:
+        container: AppContainer = app.state.container
+        hub = container.observation_hub
+        report = hub.metrics() if hub is not None else {}
+        return result_to_dict(Results.success(report))
 
     # P9 §10.2/§17.5.2：版本化能力探针端点（按需触发实测三步；失败标 versioning_unavailable）
     @app.get("/health/versioning")

@@ -11,6 +11,7 @@ ObservationQueue，后台批量 flush 落库 t_llm_call；上下文传播遵循 
 """
 from core.llm.observation.collector import ObservationStats
 from core.llm.observation.dao import LLM_CALL_TABLE, LlmCallDao
+from core.llm.observation.hub import ObservationHub
 from core.llm.observation.events import (
     CALL_KINDS,
     CALL_KIND_CHAT,
@@ -62,5 +63,6 @@ __all__ = [
     "STATUSES", "STATUS_SUCCESS", "STATUS_FAILED", "STATUS_CANCELED",
     "TOKEN_SOURCE_REAL", "TOKEN_SOURCE_ESTIMATED", "TOKEN_SOURCE_MIXED",
     "ObservationQueue",
+    "ObservationHub",
     "CallScope", "current_scope", "llm_call_scope",
 ]
