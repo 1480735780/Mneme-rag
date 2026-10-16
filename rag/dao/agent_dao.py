@@ -264,3 +264,84 @@ class AgentPromptDao:
             ],
         )
         return count
+
+
+# 提示词版本表（P10.2 T2.1，D8——版本行只追加，激活指针在 t_agent_prompt.active_version_id）
+AGENT_PROMPT_VERSION_TABLE = "t_agent_prompt_version"
+
+
+class AgentPromptVersionDao:
+    """提示词版本数据访问（P10.2 T2.1，D8：保存 = 新版本行，行内容不可变）
+
+    不可变语义由接口缺失表达（同 t_llm_call append-only 纪律）：本类不提供
+    update/delete 入口，版本行一经写入永不修改——「改坏可回滚」建立在历史行
+    不被篡改之上。软删除同样未设：版本是审计与回滚依据，随槽位删除仍保留。
+
+    注意：激活/回滚（切 t_agent_prompt.active_version_id 指针）属 T2.2 服务层
+    职责（diff 展示 + 二次确认 + 审计入 t_biz_change_log），本 DAO 只管版本行。
+    """
+
+    def __init__(self, db: DatabaseClient):
+        self._db = db
+
+    def save_version(
+        self, agent_id: str, slot_key: str, content: Optional[str], actor: Optional[str] = None
+    ) -> Dict:
+        """
+        保存新版本行（version_no = 该槽位现有最大号 + 1）；返回完整版本行 dict
+
+        Args:
+            actor: 操作人；None 回落 UserContext.get_user_id()（缺省 anonymous，对齐 fill_audit 派式）
+
+        Note:
+            并发保存同槽位存在读-算-写竞态，可能出现重复 version_no：按 D8 口径
+            版本号仅作展示排序、回滚以 version_id 为准；如需收紧为唯一约束，
+            先回 P10 计划 §6 追加决策再动工。
+        """
+        existing = self.list_by_slot(agent_id, slot_key)
+        max_no = existing[-1].get("version_no") or 0 if existing else 0
+        row: Row = {
+            "id": default_generator.next_id(),
+            "agent_id": agent_id,
+            "slot_key": slot_key,
+            "version_no": max_no + 1,
+            "content": content,
+            "create_by": actor if actor is not None else UserContext.get_user_id(),
+            "create_time": now_iso(),
+        }
+        self._db.insert_row(AGENT_PROMPT_VERSION_TABLE, row)
+        return dict(row)
+
+    def get_by_id(self, version_id: str) -> Optional[Dict]:
+        """按主键取版本行；不存在返回 None"""
+        rows = self._db.select_rows(
+            AGENT_PROMPT_VERSION_TABLE,
+            where=[Condition.eq("id", version_id)],
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def get_by_slot_version(self, agent_id: str, slot_key: str, version_no: int) -> Optional[Dict]:
+        """按 (agent_id, slot_key, version_no) 取版本行；不存在返回 None"""
+        rows = self._db.select_rows(
+            AGENT_PROMPT_VERSION_TABLE,
+            where=[
+                Condition.eq("agent_id", agent_id),
+                Condition.eq("slot_key", slot_key),
+                Condition.eq("version_no", version_no),
+            ],
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def list_by_slot(self, agent_id: str, slot_key: str, limit: Optional[int] = None) -> List[Dict]:
+        """按槽位列版本历史（version_no 升序；limit 是严格上限，None = 不限）"""
+        return self._db.select_rows(
+            AGENT_PROMPT_VERSION_TABLE,
+            where=[
+                Condition.eq("agent_id", agent_id),
+                Condition.eq("slot_key", slot_key),
+            ],
+            order_by=[("version_no", "asc")],
+            limit=limit,
+        )

@@ -216,6 +216,9 @@ _T_AGENT_PROMPT = TableSchema(
             ("agent_id", "VARCHAR(32)"),
             ("slot_key", "VARCHAR(64)"),
             ("content", "TEXT"),
+            # P10.2 T2.1（D8）：激活指针列（P9 D2 增量对齐自动加列）。
+            # NULL = 未版本化（回落 content 列，兼容存量数据）；激活/回滚 = 切指针同路径
+            ("active_version_id", "VARCHAR(32)"),
             ("create_by", "VARCHAR(64)"),
             ("update_by", "VARCHAR(64)"),
             ("create_time", "TIMESTAMP"),
@@ -223,7 +226,31 @@ _T_AGENT_PROMPT = TableSchema(
             ("deleted", "INTEGER"),
         ),
     ),
-    comment="智能体提示词槽位（content 空白视为未配置并回落内置）",
+    comment="智能体提示词槽位（content 空白视为未配置并回落内置；active_version_id=NULL 时回落 content）",
+)
+
+# P10.2 T2.1（D8）：不可变版本表——保存 = 新版本行（永不 UPDATE 内容），生效 = 激活指针。
+# 无 deleted/update 列（不可变语义由列集与接口缺失共同表达，与 t_llm_call append-only 同纪律）
+_T_AGENT_PROMPT_VERSION = TableSchema(
+    name="t_agent_prompt_version",
+    columns=(
+        ColumnSpec(name="id", data_type="VARCHAR(32)", primary_key=True),
+        *_cols(
+            ("agent_id", "VARCHAR(32)"),
+            ("slot_key", "VARCHAR(64)"),
+            ("version_no", "INTEGER"),
+            ("content", "TEXT"),
+            ("create_by", "VARCHAR(64)"),
+            ("create_time", "TIMESTAMP"),
+        ),
+    ),
+    indexes=(
+        IndexSpec(
+            name="idx_agent_prompt_version_slot",
+            columns=("agent_id", "slot_key", "version_no"),
+        ),
+    ),
+    comment="智能体提示词版本表（只追加，激活入 t_agent_prompt.active_version_id 指针）",
 )
 
 _T_INTENT_NODE = TableSchema(
@@ -899,6 +926,7 @@ DEFAULT_TABLES: List[TableSchema] = [
     _T_INGESTION_TASK_NODE,
     _T_AGENT_PROFILE,
     _T_AGENT_PROMPT,
+    _T_AGENT_PROMPT_VERSION,
     _T_INTENT_NODE,
     _T_QUERY_TERM_MAPPING,
     _T_MESSAGE_FEEDBACK,
