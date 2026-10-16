@@ -11,8 +11,12 @@ rag.service.agent_profile_admin_service - 智能体档案管理 service（对应
       · 头像长度上限 32 →「头像标识过长」；
       · savePrompt：未知槽位 →「未知的提示词：{slotKey}」；必填占位符缺失 →
         「「{displayName}」缺少必需占位符：{...}」；
-    - 写后清 AgentPromptCacheManager 缓存（delete/activate/save_prompt 使提示词解析回源，对齐 Java clearCache）；
-    - 读路径（叠加回落）复用 DatabaseAgentPromptResolver（本层仅编辑态用 load_own_prompts / default）。
+    - 写后清 AgentPromptCacheManager 缓存（delete/activate 使提示词解析回源，对齐 Java clearCache；
+      save_prompt 自 P10.2 T2.2 起语义 = 新建版本行、不改生效内容，故不再清缓存）；
+    - 读路径（叠加回落）复用 DatabaseAgentPromptResolver（本层仅编辑态用 load_own_prompts / default）；
+    - P10.2 T2.2 版本化（D8）：保存 = 新不可变版本行（永不 UPDATE 内容）；激活/回滚 =
+      diff 预览 + 二次确认 + 切 t_agent_prompt.active_version_id 指针（回滚同路径无特例），
+      审计经 @record_biz_change 落 t_biz_change_log（ACTIVATE/ROLLBACK 按操作类型区分）。
 
 编排模式（mode）：由注入 `OrchestrationMode` 决定槽位生效集合（部署级决策，Java OrchestrationProperties；
 由 AppSettings.orchestration_mode 经 wiring 回注——见 app/wiring.py，缺省 WORKFLOW）。
@@ -26,11 +30,14 @@ rag.service.agent_profile_admin_service - 智能体档案管理 service（对应
 
 from __future__ import annotations
 
+import difflib
 import logging
 from typing import Dict, List, Optional
 
+from audit.support.context import BizChangeLogContext
+from audit.support.decorator import record_biz_change
 from common.exception.business import ClientException
-from rag.dao.agent_dao import AgentPromptDao, AgentProfileDao
+from rag.dao.agent_dao import AgentPromptDao, AgentProfileDao, AgentPromptVersionDao
 from rag.prompt.agent_resolver import AgentPromptResolver as _Resolver
 from rag.prompt.builder import (
     DEFAULT_AGENT_PROMPTS,
@@ -55,6 +62,7 @@ class AgentProfileAdminService:
         resolver: Optional[_Resolver] = None,
         prompt_cache_manager: Optional[AgentPromptCacheManager] = None,
         mode: Optional[OrchestrationMode] = None,
+        prompt_version_dao: Optional[AgentPromptVersionDao] = None,
     ):
         self._profile_dao = profile_dao
         self._prompt_dao = prompt_dao
@@ -63,6 +71,8 @@ class AgentProfileAdminService:
         # 写后清缓存对象（须与读路径共享同一实例，对齐 Java AgentPromptCacheManager）
         self._prompt_cache_manager = prompt_cache_manager
         self._mode = mode or OrchestrationMode.WORKFLOW
+        # P10.2 T2.2（D8）：提示词版本数据访问；未装配时版本方法显式报错（老用例不受影响）
+        self._prompt_version_dao = prompt_version_dao
 
     # ==================== 列表 ====================
 
@@ -157,12 +167,12 @@ class AgentProfileAdminService:
     # ==================== 提示词槽位 ====================
 
     def load_prompts(self, pid: str) -> Dict:
-        """槽位配置视图（对齐 Java loadPrompts：槽位元数据 + 自身内容，不回落）"""
+        """槽位配置视图（对齐 Java loadPrompts：槽位元数据 + 自身生效内容，不回落）"""
         profile = self._must_load(pid)
         builtin = self._load_builtin()
-        own = self._resolver.load_own_prompts(pid) if self._resolver else {}
         slots = []
         for slot in AgentPromptSlot:
+            manifest = self._effective_prompt(pid, slot.name)
             effective = slot.is_effective_in(self._mode)
             slots.append({
                 "slot_key": slot.name,
@@ -172,7 +182,8 @@ class AgentProfileAdminService:
                 "effective": effective,
                 "inactive_reason": None if effective else slot.inactive_reason,
                 "required_placeholders": sorted(slot.required_placeholders),
-                "content": own.get(slot.name, ""),
+                "content": manifest.get("content") or "",
+                "content_source": manifest["source"],
             })
         return {
             "agent_id": pid,
@@ -183,22 +194,134 @@ class AgentProfileAdminService:
             "slots": slots,
         }
 
-    def save_prompt(self, pid: str, slot_key: str, content: Optional[str] = None) -> None:
-        """保存槽位提示词（内置不可编辑；未知槽位/缺必需占位符拒绝；写后清提示词缓存）"""
+    def save_prompt(self, pid: str, slot_key: str, content: Optional[str] = None) -> Dict:
+        """保存槽位提示词 = 新建不可变版本行（内置不可编辑；未知槽位/缺必需占位符拒绝）
+
+        P10.2 T2.2（D8）：保存 ≠ 生效——版本行只入 t_agent_prompt_version（content
+        恒不覆盖既有生效内容、不清缓存：生效由 activate/rollback 显式切指针）。
+        空白内容同样成版本行（content=None），激活后恢复「未配置回落」语义。
+        版本行本身即保存审计（create_by/create_time 随行）。
+
+        Returns:
+            {"agent_id", "slot_key", "version_id", "version_no"} 版本行摘要
+        """
         self._must_load_editable(pid)
-        slot = AgentPromptSlot.find(slot_key)
-        if slot is None:
-            raise ClientException(f"未知的提示词：{slot_key}")
+        slot = self._must_slot(slot_key)
         self._assert_placeholders_present(slot, content)
 
-        content_blank = _is_blank(content)
-        blank_value = None if content_blank else content
-        # 对齐 Java：已存在则真写 null（空白可清空回落）；不存在且空白则不落库
-        if self._prompt_dao.find_by_agent_slot(pid, slot.name) is not None:
-            self._prompt_dao.save(pid, slot.name, blank_value)
-        elif not content_blank:
-            self._prompt_dao.save(pid, slot.name, content)
-        self._clear_prompt_cache()
+        blank_value = None if _is_blank(content) else content
+        version = self._must_version_dao().save_version(pid, slot.name, blank_value)
+        return {
+            "agent_id": pid,
+            "slot_key": slot.name,
+            "version_id": version["id"],
+            "version_no": version["version_no"],
+        }
+
+    # ==================== 提示词版本化（P10.2 T2.2，D8：保存≠生效） ====================
+
+    def list_prompt_versions(self, pid: str, slot_key: str, limit: int = 50) -> Dict:
+        """版本历史视图：版本行列表 + 当前生效指针与生效来源（编辑态/激活确认共用数据源）"""
+        self._must_load(pid)
+        slot = self._must_slot(slot_key)
+        effective = self._effective_prompt(pid, slot.name)
+        versions = [
+            {
+                "version_id": each["id"],
+                "version_no": each.get("version_no"),
+                "content": each.get("content"),
+                "create_by": each.get("create_by"),
+                "create_time": each.get("create_time"),
+                "is_active": each["id"] == effective.get("version_id"),
+            }
+            for each in self._must_version_dao().list_by_slot(pid, slot.name, limit=limit)
+        ]
+        return {
+            "agent_id": pid,
+            "slot_key": slot.name,
+            "active_source": effective["source"],
+            "active_version_id": effective.get("version_id"),
+            "versions": versions,
+        }
+
+    def preview_prompt_version(self, pid: str, slot_key: str, version_id: str) -> Dict:
+        """激活/回滚前 diff 预览（D8：当前生效 vs 目标版本，unified diff 行 + changed 标志）"""
+        self._must_load(pid)
+        slot = self._must_slot(slot_key)
+        target = self._must_version(pid, slot, version_id)
+        current = self._effective_prompt(pid, slot.name)
+        from_text = current.get("content") or ""
+        to_text = target.get("content") or ""
+        diff_lines = list(
+            difflib.unified_diff(
+                from_text.splitlines(),
+                to_text.splitlines(),
+                fromfile=f"当前生效({current['source']})",
+                tofile=f"目标版本 v{target.get('version_no')}",
+                lineterm="",
+            )
+        )
+        return {
+            "agent_id": pid,
+            "slot_key": slot.name,
+            "slot_display_name": slot.display_name,
+            "current": {
+                "source": current["source"],
+                "version_id": current.get("version_id"),
+                "version_no": current.get("version_no"),
+                "content": current.get("content"),
+            },
+            "target": {
+                "version_id": target["id"],
+                "version_no": target.get("version_no"),
+                "content": target.get("content"),
+            },
+            "changed": bool(diff_lines),
+            "unified_diff": diff_lines,
+        }
+
+    @record_biz_change("AGENT_PROMPT", "ACTIVATE_PROMPT_VERSION", "激活提示词版本")
+    def activate_prompt_version(
+        self, pid: str, slot_key: str, version_id: str, *, confirm: bool = False
+    ) -> Dict:
+        """激活版本：diff 二次确认（confirm=True）→ 切 t_agent_prompt.active_version_id → 审计"""
+        return self._switch_prompt_pointer(pid, slot_key, version_id, confirm=confirm)
+
+    @record_biz_change("AGENT_PROMPT", "ROLLBACK_PROMPT_VERSION", "回滚提示词版本")
+    def rollback_prompt_version(
+        self, pid: str, slot_key: str, version_id: str, *, confirm: bool = False
+    ) -> Dict:
+        """回滚 = 切指针同路径无特例（D8）：语义与激活一致，仅审计 operation_type 区分意图"""
+        return self._switch_prompt_pointer(pid, slot_key, version_id, confirm=confirm)
+
+    def _switch_prompt_pointer(
+        self, pid: str, slot_key: str, version_id: str, *, confirm: bool
+    ) -> Dict:
+        """激活/回滚共用核心（D8 回滚无特例）：校验 → 二次确认 → 切指针 → 快照入审计上下文"""
+        self._must_load_editable(pid)
+        slot = self._must_slot(slot_key)
+        target = self._must_version(pid, slot, version_id)
+        if not confirm:
+            raise ClientException("激活需二次确认：请先调用版本预览查看 diff，再以 confirm=true 提交")
+        current = self._effective_prompt(pid, slot.name)
+        before = {
+            "source": current["source"],
+            "version_id": current.get("version_id"),
+            "content": current.get("content"),
+        }
+        self._prompt_dao.set_active_version(pid, slot.name, version_id)
+        after = {
+            "source": "pointer",
+            "version_id": version_id,
+            "version_no": target.get("version_no"),
+        }
+        BizChangeLogContext().put(f"{pid}:{slot.name}", before, after)
+        return {
+            "agent_id": pid,
+            "slot_key": slot.name,
+            "version_id": version_id,
+            "version_no": target.get("version_no"),
+        }
 
     def default_prompt(self, slot_key: str) -> str:
         """槽位默认提示词（对齐 Java defaultPrompt）：内置智能体自身内容 → **内置默认模板** 兜底"""
@@ -215,14 +338,15 @@ class AgentProfileAdminService:
     # ==================== 内部辅助 ====================
 
     def _load_configured_slots(self) -> Dict[str, List[AgentPromptSlot]]:
-        """按智能体聚合已配置槽位（仅非空 content），未知 slot_key 忽略（对齐 Java loadConfiguredSlots）"""
+        """按智能体聚合已配置槽位（指针版本或存量 content 任一非空即计入），未知 slot_key 忽略"""
         configured: Dict[str, List[AgentPromptSlot]] = {}
         for profile in self._profile_dao.list():
             agent_id = profile.get("id")
             for prompt in self._prompt_dao.list_by_agent(agent_id):
-                if not _is_blank(prompt.get("content")):
-                    slot = AgentPromptSlot.find(prompt.get("slot_key"))
-                    if slot is not None:
+                slot = AgentPromptSlot.find(prompt.get("slot_key"))
+                if slot is not None:
+                    content = self._effective_prompt_from_row(prompt).get("content")
+                    if not _is_blank(content):
                         configured.setdefault(agent_id, []).append(slot)
         return configured
 
@@ -244,6 +368,50 @@ class AgentProfileAdminService:
         if _flag(profile.get("builtin")):
             raise ClientException("内置智能体不可编辑或删除，如需调整请复制一份新建")
         return profile
+
+    def _must_slot(self, slot_key: str) -> AgentPromptSlot:
+        slot = AgentPromptSlot.find(slot_key)
+        if slot is None:
+            raise ClientException(f"未知的提示词：{slot_key}")
+        return slot
+
+    def _must_version_dao(self) -> AgentPromptVersionDao:
+        if self._prompt_version_dao is None:
+            raise ClientException("提示词版本化未装配（AgentPromptVersionDao 缺失）")
+        return self._prompt_version_dao
+
+    def _must_version(self, pid: str, slot: AgentPromptSlot, version_id: str) -> Dict:
+        """版本存在且归属当前智能体当前槽位（防跨槽/跨智能体误切指针）"""
+        version = self._must_version_dao().get_by_id(version_id)
+        if version is None or version.get("agent_id") != pid or version.get("slot_key") != slot.name:
+            raise ClientException("提示词版本不存在")
+        return version
+
+    def _effective_prompt(self, agent_id: str, slot_name: str) -> Dict:
+        """槽位生效内容三态来源（D8 读侧约定）：pointer 版本内容 > 未版本化存量 content > 未配置"""
+        row = self._prompt_dao.find_by_agent_slot(agent_id, slot_name)
+        return self._effective_prompt_from_row(row)
+
+    def _effective_prompt_from_row(self, row: Optional[Dict]) -> Dict:
+        """按已查得的槽位行判生效来源（避免 list 场景 N+1 重复查询）"""
+        if not row:
+            return {"source": "unconfigured", "content": None, "version_id": None, "version_no": None}
+        pointer = row.get("active_version_id")
+        if pointer and self._prompt_version_dao is not None:
+            version = self._prompt_version_dao.get_by_id(pointer)
+            if version is not None:
+                return {
+                    "source": "pointer",
+                    "content": version.get("content"),
+                    "version_id": pointer,
+                    "version_no": version.get("version_no"),
+                }
+        return {
+            "source": "slot",
+            "content": row.get("content"),
+            "version_id": None,
+            "version_no": None,
+        }
 
     def _trimmed_name(self, name: Optional[str]) -> str:
         text = str(name).strip() if name is not None else ""

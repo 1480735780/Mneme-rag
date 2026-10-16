@@ -265,6 +265,47 @@ class AgentPromptDao:
         )
         return count
 
+    def set_active_version(self, agent_id: str, slot_key: str, version_id: Optional[str]) -> bool:
+        """
+        切换激活指针（P10.2 T2.2，D8）：版本行不可变，槽位行唯一可变状态就是该指针
+
+        - 槽位行已存在：update active_version_id + update 审计（content 列不动——它是
+          「未版本化存量快照」，指针 NULL 时生效，非空时被指针内容取代）；
+        - 槽位行不存在：补行（content=None + 指针）——「首次保存版本即激活」与既有
+          upsert 兼容；
+        - version_id=None：清除指针回落 content 列（逃生舱，正常流程不走）。
+
+        Returns:
+            bool: 指针是否落库成功（行不存在且为 update 分支时 False）
+        """
+        existing = self.find_by_agent_slot(agent_id, slot_key)
+        if existing is not None:
+            count = self._db.update_rows(
+                AGENT_PROMPT_TABLE,
+                {
+                    "active_version_id": version_id,
+                    "update_by": UserContext.get_user_id(),
+                    "update_time": now_iso(),
+                },
+                where=[
+                    Condition.eq("agent_id", agent_id),
+                    Condition.eq("slot_key", slot_key),
+                    Condition.eq("deleted", NOT_DELETED),
+                ],
+            )
+            return count > 0
+        row: Row = {
+            "id": default_generator.next_id(),
+            "agent_id": agent_id,
+            "slot_key": slot_key,
+            "content": None,
+            "active_version_id": version_id,
+            "deleted": NOT_DELETED,
+        }
+        fill_audit(row)
+        self._db.insert_row(AGENT_PROMPT_TABLE, row)
+        return True
+
 
 # 提示词版本表（P10.2 T2.1，D8——版本行只追加，激活指针在 t_agent_prompt.active_version_id）
 AGENT_PROMPT_VERSION_TABLE = "t_agent_prompt_version"

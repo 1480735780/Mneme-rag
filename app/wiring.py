@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from app.config import AppSettings
-from rag.dao.agent_dao import AgentPromptDao, AgentProfileDao
+from rag.dao.agent_dao import AgentPromptDao, AgentProfileDao, AgentPromptVersionDao
 from rag.dao.conversation_dao import ConversationDao
 from rag.dao.feedback_dao import MessageFeedbackDao
 from rag.dao.intent_node_dao import IntentNodeAdminDao
@@ -557,6 +557,7 @@ class AppContainer:
             resolver=DatabaseAgentPromptResolver(self.db, cache_manager=self.agent_prompt_cache),
             prompt_cache_manager=self.agent_prompt_cache,
             mode=orchestration_mode,  # 从 AppSettings 回注，槽位生效集随编排模式
+            prompt_version_dao=AgentPromptVersionDao(self.db),  # P10.2 T2.2（D8）提示词版本化
         )
         # M5 5.6 设置聚合：ai 模型配置单次加载注入（settings ai 区块 + _build_llm 共享）
         self.ai_config = _load_ai_config()
