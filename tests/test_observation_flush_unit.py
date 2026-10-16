@@ -89,7 +89,7 @@ class TestObservationHub:
         assert set(metrics) == {"observation"}
         assert set(metrics["observation"]) == {
             "enqueued", "dropped_full", "flushed", "flush_errors",
-            "breaker_events", "recent_breaker_events", "queue_depth",
+            "breaker_events", "pricing_errors", "recent_breaker_events", "queue_depth",
         }
         assert metrics["observation"]["queue_depth"] == 0
 

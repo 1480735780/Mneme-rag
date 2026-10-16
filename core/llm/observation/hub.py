@@ -10,7 +10,8 @@ engine.connect()（连接池线程安全）、InMemoryDatabaseClient 全路径 R
 顺序 flush 保证同一时刻至多一个落库批次在途）。
 
 事件分派严格白名单：未知类型整批拒收（flush_errors 计数，观测管道不吞未知数据）；
-T1.7 接入 BreakerEvent 时在此登记分支。
+T1.7 接入 BreakerEvent 时在此登记分支。CallEvent 落库前过成本固化点（T1.8：
+unpriced 占位、pricing_snapshot 始终写，P10.3 注入真实计算器；异常吞掉计数）。
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from typing import Any, Dict, Deque, List, Optional
 from core.llm.observation.collector import ObservationStats
 from core.llm.observation.dao import LlmCallDao
 from core.llm.observation.events import BreakerEvent, CallEvent
+from core.llm.observation.pricing import Pricer, apply_unpriced
 from core.llm.observation.queue import ObservationQueue
 
 
@@ -35,9 +37,12 @@ class ObservationHub:
         flush_count: int = 200,
         flush_interval: float = 1.0,
         stats: Optional[ObservationStats] = None,
+        pricer: Optional[Pricer] = None,
     ):
         self.dao = dao
         self.stats = stats if stats is not None else ObservationStats()
+        # T1.8 成本固化钩子（D7）：None = 默认 unpriced 占位；P10.3 T3.2 注入 yaml 计算器
+        self._pricer = pricer
         # P10.1 T1.7：熔断事件环形缓冲（调试/告警消费前兜底可见；T4.2 告警消费接此处）
         self.recent_breaker_events: Deque[BreakerEvent] = deque(maxlen=50)
         self.queue = ObservationQueue(
@@ -62,7 +67,7 @@ class ObservationHub:
     def _insert_batch(self, batch: List[Any]) -> None:
         for item in batch:
             if isinstance(item, CallEvent):
-                self.dao.insert(item.to_row())
+                self.dao.insert(self._fix_cost(item.to_row()))
             elif isinstance(item, BreakerEvent):
                 # T1.7：熔断事件不入库（无表），进环形缓冲供调试 + 计数；
                 # T4.2 在此处接告警分发
@@ -70,6 +75,21 @@ class ObservationHub:
                 self.stats.breaker_events += 1
             else:
                 raise ValueError(f"未知观测事件类型，整批拒收: {type(item).__name__}")
+
+    # ===================== 成本固化（T1.8，D7：P10.3 接管前 unpriced 占位） =====================
+
+    def _fix_cost(self, row: Dict) -> Dict:
+        """落库前的成本固化点：注入 pricer 优先，否则 unpriced 占位（快照始终写）。
+
+        钩子异常吞掉并计数（执行纪律 4），失败行照常落库并兜底 unpriced 快照——
+        「可观测的丢」同样适用于固化失败：pricing_errors 进 /metrics。
+        """
+        try:
+            (self._pricer if self._pricer is not None else apply_unpriced)(row)
+        except Exception:  # noqa: BLE001 — 观测故障不得反噬业务（D2），失败可见可计数
+            self.stats.pricing_errors += 1
+            apply_unpriced(row)  # 兜底占位：固化点故障也不留 NULL 快照
+        return row
 
     # ===================== 生命周期（factory lifespan 调用） =====================
 
