@@ -455,22 +455,76 @@ class AppContainer:
         from core.llm.observation import LlmCallDao, ObservationHub
         from core.llm.observation.pricing import YamlSnapshotPricer
 
+        # P10.4a T4.x：告警装配产物默认缺席（配置加载/构建方法负责置位，测试可直接读取）
+        self.alert_config = None
+        self.webhook_alerter = None
         self.llm_call_dao = LlmCallDao(self.db)
         pricing = self._load_pricing_config()
         # P10.3 T3.2（D7）：价格快照就绪 → 注入真实计算器（纯内存查价；固化点异常
         # 仍由 hub 吞掉并计数 pricing_errors——观测故障不得反噬业务）
         pricer = YamlSnapshotPricer(pricing) if pricing is not None else None
-        self.observation_hub = ObservationHub(self.llm_call_dao, pricer=pricer)
+        # P10.4a T4.2（D11①）：告警通道配置就绪 → 熔断事件接告警消费者（无配置不装配）
+        breaker_alert = self._build_breaker_alert(self._load_alert_config())
+        self.observation_hub = ObservationHub(self.llm_call_dao, pricer=pricer, breaker_alert=breaker_alert)
+
+    @staticmethod
+    def _resolve_repo_yaml(path_setting: str) -> Path:
+        """yaml 相对路径先按 cwd、再兜仓库根一次（装配期一次性 IO 共用；pricing/alerts 同款）"""
+        path = Path(path_setting)
+        if not path.is_absolute() and not path.exists():
+            candidate = Path(__file__).resolve().parent.parent / path_setting
+            if candidate.exists():
+                return candidate
+        return path
+
+    def _load_alert_config(self) -> "Any | None":
+        """P10.4a T4.1（D10）：告警通道 yaml 启动时一次性加载
+
+        加载失败/未启用均不装配（log 内显著提示）：告警缺失好过假活着；
+        装配结果挂 self.alert_config 供测试/排障读取。
+        """
+        from core.llm.observation.alert_config import load_alert_config
+
+        path = self._resolve_repo_yaml(self.settings.alerts_yaml_path)
+        try:
+            self.alert_config = load_alert_config(str(path))
+        except Exception as exc:  # noqa: BLE001 — 配置非法不阻断装配（首次戒律：观测/告警永不打挂启动）
+            logger.warning(
+                "告警配置不可用（%s：%s: %s）——告警通道不装配",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            self.alert_config = None
+            return None
+        if not self.alert_config.enabled:
+            logger.info(
+                "告警通道未启用（alerts.enabled=false，来自 %s）——熔断事件仅进环形缓冲与 /metrics",
+                path,
+            )
+        return self.alert_config
+
+    def _build_breaker_alert(self, alert_config: "Any | None") -> "Any | None":
+        """P10.4a T4.2（D11①）：仅当总开关开且具备 webhook 目标时装配熔断告警消费者"""
+        from core.llm.observation.alert import BreakerAlertConsumer, WebhookAlerter
+
+        if alert_config is None or not alert_config.enabled or not alert_config.webhook_url:
+            return None
+        alerter = WebhookAlerter(alert_config)
+        self.webhook_alerter = alerter
+        logger.info(
+            "熔断告警已装配（format=%s env=%r silence=%ss）",
+            alert_config.fmt,
+            alert_config.env,
+            alert_config.silence_seconds,
+        )
+        return BreakerAlertConsumer(alerter)
 
     def _load_pricing_config(self) -> "Any | None":
         """P10.3 T3.1（D7）：启动时加载价格快照（启动期是唯一允许的 IO；此后纯内存）"""
         from core.llm.observation.pricing_config import load_pricing_config
 
-        path = Path(self.settings.pricing_yaml_path)
-        if not path.is_absolute() and not path.exists():
-            candidate = Path(__file__).resolve().parent.parent / self.settings.pricing_yaml_path
-            if candidate.exists():
-                path = candidate
+        path = self._resolve_repo_yaml(self.settings.pricing_yaml_path)
         try:
             self.pricing_config = load_pricing_config(str(path))
             logger.info(
@@ -1867,6 +1921,12 @@ class AppContainer:
         P6 3.1：redis.asyncio 客户端须经 aclose() 异步断开（redis-py>=5 `close()` 已废弃为协程），
         无 redis 注入时与 close() 等价；释放失败不阻断关闭。
         """
+        # P10.4a T4.x：告警投递线程先停（已入队消息交付完再退出，1s 内不悬挂停机）
+        if getattr(self, "webhook_alerter", None) is not None:
+            try:
+                self.webhook_alerter.stop(timeout=1.0)
+            except Exception:  # noqa: BLE001 — 停产失败不阻断资源释放
+                logger.warning("告警投递线程停止失败", exc_info=True)
         self.close()
         if self.redis is not None:
             acloser = getattr(self.redis, "aclose", None)

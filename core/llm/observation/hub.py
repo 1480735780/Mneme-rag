@@ -19,6 +19,7 @@ import asyncio
 from collections import deque
 from typing import Any, Dict, Deque, List, Optional
 
+from core.llm.observation.alert import BreakerAlertConsumer
 from core.llm.observation.collector import ObservationStats
 from core.llm.observation.dao import LlmCallDao
 from core.llm.observation.events import BreakerEvent, CallEvent
@@ -38,11 +39,14 @@ class ObservationHub:
         flush_interval: float = 1.0,
         stats: Optional[ObservationStats] = None,
         pricer: Optional[Pricer] = None,
+        breaker_alert: Optional[BreakerAlertConsumer] = None,
     ):
         self.dao = dao
         self.stats = stats if stats is not None else ObservationStats()
         # T1.8 成本固化钩子（D7）：None = 默认 unpriced 占位；P10.3 T3.2 注入 yaml 计算器
         self._pricer = pricer
+        # P10.4a T4.2（D11①）：熔断告警消费者（None = 告警通道未装配，事件仅进环形缓冲）
+        self.breaker_alert = breaker_alert
         # P10.1 T1.7：熔断事件环形缓冲（调试/告警消费前兜底可见；T4.2 告警消费接此处）
         self.recent_breaker_events: Deque[BreakerEvent] = deque(maxlen=50)
         self.queue = ObservationQueue(
@@ -73,8 +77,19 @@ class ObservationHub:
                 # T4.2 在此处接告警分发
                 self.recent_breaker_events.append(item)
                 self.stats.breaker_events += 1
+                self._dispatch_breaker_alert(item)
             else:
                 raise ValueError(f"未知观测事件类型，整批拒收: {type(item).__name__}")
+
+    def _dispatch_breaker_alert(self, event: BreakerEvent) -> None:
+        """T4.2 告警分发：消费者异常吞掉 + 计数（与 health_store observer 同戒律），
+        熔断告警的任何 bug 都不得破坏本批观测落账与后续事件消费。"""
+        if self.breaker_alert is None:
+            return
+        try:
+            self.breaker_alert.on_breaker_event(event)
+        except Exception:  # noqa: BLE001 —— D2/D12：观测异常吞掉 + 计数，绝不反噬管线
+            self.stats.breaker_alert_errors += 1
 
     # ===================== 成本固化（T1.8，D7：P10.3 接管前 unpriced 占位） =====================
 
@@ -112,4 +127,11 @@ class ObservationHub:
         snapshot = self.stats.snapshot()
         snapshot["queue_depth"] = self.queue.depth()
         snapshot["recent_breaker_events"] = len(self.recent_breaker_events)
+        if self.breaker_alert is not None:
+            # P10.4a T4.2（D13）：告警最近触发时间 + 消费者语义计数/通道自健康；
+            # 消费者自身有 bug（连 metrics 都炸）也吞掉计数——/metrics 不得 5xx
+            try:
+                snapshot["alerting"] = self.breaker_alert.metrics()
+            except Exception:  # noqa: BLE001 —— 观测端序列化失败只计数
+                self.stats.breaker_alert_errors += 1
         return {"observation": snapshot}

@@ -26,6 +26,7 @@ class ObservationStats:
     flush_errors: int = 0    # handler 抛异常的 flush 批次数（整批未落库，不重试）
     breaker_events: int = 0  # 熔断状态事件数（T1.7：进 recent 环形缓冲，告警消费在 T4.2）
     pricing_errors: int = 0  # 成本固化钩子异常行数（T1.8：吞掉计数，失败行照常落库兜底 unpriced）
+    breaker_alert_errors: int = 0  # 熔断告警消费者异常数（T4.2：hub 兜底吞掉计数，不影响落账）
 
     def snapshot(self) -> Dict[str, int]:
         """/metrics 序列化出口消费的只读快照（D13：采集与输出分离）"""
@@ -36,4 +37,5 @@ class ObservationStats:
             "flush_errors": self.flush_errors,
             "breaker_events": self.breaker_events,
             "pricing_errors": self.pricing_errors,
+            "breaker_alert_errors": self.breaker_alert_errors,
         }
