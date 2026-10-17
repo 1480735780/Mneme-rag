@@ -21,7 +21,7 @@
 
 Mneme（希腊记忆女神）+ RAG（检索增强生成）。基于 [ragent](https://github.com/nageoffer/ragent) 架构思想的 **纯 Python 实现**，覆盖从文档入库到智能问答的完整链路。
 
-> 当前版本 **v1.1**（2026-08-30）：已完成对 ragent-new 的全量对齐——新增 v2 ReAct Agent 引擎、证据闸门、RAG-as-Tool 门面与 Agent 对话前端，登记偏离全部清零。对齐过程见 `docs/v1.1-agent-alignment-gap-report.md` 与 `docs/mneme-rag-ragent-new-alignment-audit.md`。
+> 新增 v2 ReAct Agent 引擎、证据闸门、RAG-as-Tool 门面与 Agent 对话前端，登记偏离全部清零。
 
 - **混合检索**：向量、关键词、知识图谱（LightRAG + Neo4j）、联网搜索四通道并行召回，支持去重、RRF 融合、Rerank 与证据闸门。
 - **问题理解**：查询词映射、问题重写与拆分、LLM 树形意图识别与向量意图分类，多知识库路由。
