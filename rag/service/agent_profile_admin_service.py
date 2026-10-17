@@ -150,19 +150,25 @@ class AgentProfileAdminService:
         )
 
     def delete(self, pid: str) -> None:
-        """删除档案（内置不可删；激活中不可删）；级联软删其全部提示词 + 清提示词缓存"""
+        """删除档案（内置不可删；激活中不可删）；级联软删其全部提示词
+
+        P10.2 T2.3（D9）：不再手动清缓存——被删方既非内置也非激活，不参与运行时
+        解析；指纹机制（版本号入 key）正常链路无需手动失效。
+        """
         profile = self._must_load_editable(pid)
         if _flag(profile.get("active")):
             raise ClientException("该智能体正在激活中，请先激活其他智能体再删除")
         self._prompt_dao.delete_by_agent(pid)
         self._profile_dao.delete(pid)
-        self._clear_prompt_cache()
 
     def activate(self, pid: str) -> None:
-        """激活档案（全局仅一条 active=1，对齐 Java activate）；写后清提示词缓存"""
+        """激活档案（全局仅一条 active=1，对齐 Java activate）
+
+        P10.2 T2.3（D9）：不再手动清缓存——激活换人即指针指纹（含 active_id）必变，
+        缓存 key 必然 miss，改动 ≤5s（指纹 TTL）自然生效。
+        """
         self._must_load(pid)
         self._profile_dao.activate(pid)
-        self._clear_prompt_cache()
 
     # ==================== 提示词槽位 ====================
 
@@ -440,7 +446,11 @@ class AgentProfileAdminService:
             raise ClientException(f"「{slot.display_name}」缺少必需占位符：{'、'.join(missing)}")
 
     def _clear_prompt_cache(self) -> None:
-        """写后清提示词解析缓存（对齐 Java cacheManager.clearCache）；失败仅告警"""
+        """清提示词解析缓存（运维逃生舱；失败仅告警）
+
+        P10.2 T2.3（D9）起 deprecated：正常链路已不依赖手动失效（版本号入缓存 key，
+        激活/回滚切指针后指纹必变、key 自然 miss），本方法保留给显式运维干预场景。
+        """
         if self._prompt_cache_manager is None:
             return
         try:

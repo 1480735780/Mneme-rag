@@ -320,23 +320,26 @@ class AgentPromptCacheManager:
     Java 侧缓存激活智能体叠加自定义提示词后的结果于 Redis（1 小时过期）；
     本类为进程内兜底 / 测试注入用：命中直接返回、未命中返回 None、clear 后强制重载。
     Redis 版（TTL 1 小时、经 5.0 CacheManager 抽象）见 agent_resolver.RedisAgentPromptCacheManager。
-    任何写操作后调用 clear_cache() 使缓存失效。
+    P10.2 T2.3（D9）：解析结果按「指针指纹」分键——激活/回滚切指针后机制自然失效，
+    正常链路不再依赖手动 clear_cache；本进程内版为单槽快照，fingerprint 仅作形参兼容
+    （签名对齐 Redis 版，语义上最新 save 即最新态）。
     """
 
     def __init__(self):
-        self._store: Optional[Dict[str, str]] = None
+        # 按「指纹 → 快照」分槽（D9 版本号入 key）：激活/回滚换指纹即 miss，机制自管失效
+        self._store: Dict[str, Dict[str, str]] = {}
 
-    def get_from_cache(self) -> Optional[Dict[str, str]]:
-        """返回槽位到提示词的映射；缓存不存在返回 None"""
-        return self._store
+    def get_from_cache(self, fingerprint: Optional[str] = None) -> Optional[Dict[str, str]]:
+        """返回槽位到提示词的映射；该指纹未缓存时返回 None"""
+        return self._store.get(fingerprint or "")
 
-    def save_to_cache(self, prompts: Dict[str, str]) -> None:
+    def save_to_cache(self, prompts: Dict[str, str], fingerprint: Optional[str] = None) -> None:
         """保存解析结果快照"""
-        self._store = dict(prompts or {})
+        self._store[fingerprint or ""] = dict(prompts or {})
 
     def clear_cache(self) -> None:
-        """清除缓存，下次解析强制重载"""
-        self._store = None
+        """清除缓存，下次解析强制重载（运维逃生舱；正常链路指纹机制自管失效）"""
+        self._store = {}
 
 
 class AgentPromptResolver(ABC):
