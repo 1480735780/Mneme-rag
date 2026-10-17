@@ -98,6 +98,15 @@ class AgentPromptSaveRequest(BaseModel):
     content: Optional[str] = None
 
 
+class AgentPromptVersionActionRequest(BaseModel):
+    """提示词版本动作（激活/回滚）请求（P10.2 T2.4）
+
+    D8 二次确认：confirm=True 才执行切指针；False（缺省）直接拒绝并提示先看 diff。
+    """
+
+    confirm: bool = False
+
+
 # ==================== 意图节点（对应 IntentNodeCreateRequest / UpdateRequest / BatchRequest） ====================
 
 

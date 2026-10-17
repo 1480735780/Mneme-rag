@@ -3,7 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { activateAgent, createAgent, deleteAgent, getAgentPrompts, getAgents, saveAgentPrompt } from "../api";
+import { activateAgent, activateAgentPromptVersion, createAgent, deleteAgent, getAgentPrompts, getAgents, listPromptVersions, previewPromptVersion, saveAgentPrompt } from "../api";
 import AgentListPage from "./AgentListPage";
 
 vi.mock("../api", () => ({
@@ -15,6 +15,10 @@ vi.mock("../api", () => ({
   getAgentPrompts: vi.fn(),
   saveAgentPrompt: vi.fn(),
   getDefaultAgentPrompt: vi.fn(),
+  listPromptVersions: vi.fn(),
+  previewPromptVersion: vi.fn(),
+  activateAgentPromptVersion: vi.fn(),
+  rollbackAgentPromptVersion: vi.fn(),
 }));
 
 const mockList = vi.mocked(getAgents);
@@ -130,5 +134,55 @@ describe("AgentListPage", () => {
     expect(await screen.findByText("删除智能体")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "删除" }));
     await waitFor(() => expect(mockDelete).toHaveBeenCalledWith("a-1"));
+  });
+
+  it("版本管理：diff 预览后二次确认才激活（P10.2 T2.4/D8）", async () => {
+    mockList.mockResolvedValue({ mode: "workflow", effectiveSlotTotal: 4, agents: [agent()] } as never);
+    mockPrompts.mockResolvedValue({
+      agentId: "a-1",
+      agentName: "客服助手",
+      builtin: false,
+      mode: "workflow",
+      slots: [
+        { slotKey: "SYSTEM", displayName: "系统提示词", group: "CORE", groupName: "核心", effective: true, inactiveReason: null, requiredPlaceholders: [], content: "你是客服助手", contentSource: "pointer" },
+      ],
+    } as never);
+    vi.mocked(listPromptVersions).mockResolvedValue({
+      agentId: "a-1",
+      slotKey: "SYSTEM",
+      activeSource: "pointer",
+      activeVersionId: "ver-2",
+      versions: [
+        { versionId: "ver-1", versionNo: 1, content: "你是客服助手", isActive: false, createTime: "2026-10-16T08:00:00" },
+        { versionId: "ver-2", versionNo: 2, content: "你是客服，语气友好", isActive: true, createTime: "2026-10-16T09:00:00" },
+      ],
+    } as never);
+    vi.mocked(previewPromptVersion).mockResolvedValue({
+      agentId: "a-1",
+      slotKey: "SYSTEM",
+      slotDisplayName: "系统提示词",
+      current: { source: "pointer", versionId: "ver-2", versionNo: 2, content: "你是客服，语气友好" },
+      target: { versionId: "ver-1", versionNo: 1, content: "你是客服助手" },
+      changed: true,
+      unifiedDiff: ["--- 当前生效(pointer)", "+++ 目标版本 v1", "@@", "-你是客服，语气友好", "+你是客服助手"],
+    } as never);
+    const mockActivateVersion = vi.mocked(activateAgentPromptVersion);
+    mockActivateVersion.mockResolvedValue({ agentId: "a-1", slotKey: "SYSTEM", versionId: "ver-1", versionNo: 1 });
+    render(<AgentListPage />);
+    await screen.findByText("客服助手");
+    await userEvent.click(screen.getByRole("button", { name: "操作" }));
+    await userEvent.click(await screen.findByText("提示词"));
+    expect(await screen.findByText("版本生效")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /版本/ }));
+    expect(await screen.findByText("系统提示词 · 版本管理")).toBeInTheDocument();
+    expect(screen.getByText("生效中")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /激活/ }));
+    const diffBox = await screen.findByLabelText("版本 diff 预览");
+    expect(diffBox.textContent).toContain("-你是客服，语气友好");
+    expect(diffBox.textContent).toContain("+你是客服助手");
+    await userEvent.click(screen.getByRole("button", { name: /确认激活 v1/ }));
+    await waitFor(() =>
+      expect(mockActivateVersion).toHaveBeenCalledWith("a-1", "SYSTEM", "ver-1", true),
+    );
   });
 });

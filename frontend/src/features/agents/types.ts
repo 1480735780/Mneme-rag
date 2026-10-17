@@ -32,6 +32,8 @@ export interface AgentPromptSlotConfig {
   inactiveReason?: string | null;
   requiredPlaceholders: string[];
   content: string;
+  /** P10.2 T2.4：生效内容来源（pointer=版本指针 / slot=存量 content / unconfigured=未配置） */
+  contentSource?: string | null;
 }
 
 /** 槽位配置视图（loadPrompts 返回） */
@@ -49,4 +51,53 @@ export interface AgentProfilePayload {
   name: string;
   description?: string | null;
   avatar?: string | null;
+}
+
+/** ================ P10.2 T2.4 提示词版本管理（D8：保存≠生效，激活=显式动作） ================ */
+
+/** 保存槽位提示词返回的版本摘要（D8：保存=新建不可变版本行，不生效） */
+export interface AgentPromptSavedVersion {
+  agentId: string;
+  slotKey: string;
+  versionId: string;
+  versionNo: number | null;
+}
+
+/** 提示词版本行（版本历史条目） */
+export interface PromptVersionItem {
+  versionId: string;
+  versionNo: number | null;
+  content?: string | null;
+  createBy?: string | null;
+  createTime?: string | null;
+  isActive: boolean;
+}
+
+/** 版本历史视图（GET /agents/{id}/prompts/{slotKey}/versions） */
+export interface PromptVersionList {
+  agentId: string;
+  slotKey: string;
+  /** 当前生效来源：pointer / slot / unconfigured */
+  activeSource: string;
+  activeVersionId?: string | null;
+  versions: PromptVersionItem[];
+}
+
+/** 版本当前生效侧（diff 预览的 from） */
+export interface PromptVersionCurrent {
+  source: string;
+  versionId?: string | null;
+  versionNo?: number | null;
+  content?: string | null;
+}
+
+/** diff 预览（GET …/versions/{versionId}/preview）：当前生效 vs 目标版本 unified diff */
+export interface PromptVersionPreview {
+  agentId: string;
+  slotKey: string;
+  slotDisplayName: string;
+  current: PromptVersionCurrent;
+  target: { versionId: string; versionNo?: number | null; content?: string | null };
+  changed: boolean;
+  unifiedDiff: string[];
 }
