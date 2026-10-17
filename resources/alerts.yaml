@@ -1,0 +1,17 @@
+# P10.4a T4.1 告警通道配置出厂样例（D10/D11）——总开关默认 false，未显式开启不装配，
+# 与 pricing.yaml 同「诚实起点」策略。env RAGENT_ALERTS_YAML 可换路径（默认本文件）。
+#
+# 消息最小形态（D10 冻结契约）：级别(P1/P2) + 规则名 + 当前值 vs 阈值 + 维度(model/scene)
+# + env 标记 + 时间 + [已恢复] 标记 + 建议动作一行；feishu/dingtalk/generic 三格式共用文本底稿。
+# 配置校验即拒绝（未知键/非法 format 会拒绝启动装配并显著告警——拼写错宁可响不要静默失效）。
+#
+# 飞书自定义群机器人 webhook 的获取：群设置 → 群机器人 → 添加「自定义机器人」，
+# 安全设置选「出参校验」或「关键词」均可（本通道发 2xx 即认成功，无签名加签）。
+alerts:
+  enabled: false                  # 总开关：true 且 webhook_url 非空才真正装配
+  env: ""                         # 环境标记（进消息头：dev/prod/…；空则不携带）
+  format: feishu                  # feishu | dingtalk | generic（D10 三格式，默认 feishu）
+  webhook_url: ""                 # 自定义群机器人 webhook 地址
+  headers: {}                     # 自定义请求头（如 Authorization: Bearer xxx）
+  timeout_seconds: 5.0            # 单次投递超时；失败吞掉计数、不重试（D10）
+  silence_seconds: 600.0          # 同告警键冷却（D11①：熔断 OPEN 同模型 10min）

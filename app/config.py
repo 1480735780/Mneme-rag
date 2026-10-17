@@ -83,6 +83,9 @@ class AppSettings:
     # P10.3 T3.1（D7）价格 yaml 路径：启动时一次性加载为内存快照供成本固化（改价走 git）；
     # 相对路径按 cwd 解析（装配侧再兜仓库根一次），文件缺失/非法回落 unpriced 占位（不阻断启动）
     pricing_yaml_path: str = "resources/pricing.yaml"  # RAGENT_PRICING_YAML
+    # P10.4a T4.1（D10）告警通道 yaml 路径：出厂样例总开关 false（未显式开不装配通道）；
+    # 解析失败同样不阻断启动，仅在启动日志显著提示
+    alerts_yaml_path: str = "resources/alerts.yaml"  # RAGENT_ALERTS_YAML
 
     def is_memory(self) -> bool:
         """是否内存栈（对齐 Java @ConditionalOnProperty 语义）"""
@@ -124,6 +127,7 @@ class AppSettings:
             init_admin_username=os.environ.get("RAGENT_INIT_ADMIN_USERNAME", ""),
             init_admin_password=os.environ.get("RAGENT_INIT_ADMIN_PASSWORD", ""),
             pricing_yaml_path=os.environ.get("RAGENT_PRICING_YAML", "resources/pricing.yaml"),
+            alerts_yaml_path=os.environ.get("RAGENT_ALERTS_YAML", "resources/alerts.yaml"),
         )
 
 
