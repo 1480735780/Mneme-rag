@@ -159,7 +159,7 @@ def test_stats_snapshot_shape():
     assert stats.snapshot() == {
         "enqueued": 0, "dropped_full": 0, "flushed": 0, "flush_errors": 0,
         "breaker_events": 0, "pricing_errors": 0,
-        "breaker_alert_errors": 0, "call_alert_errors": 0,
+        "breaker_alert_errors": 0, "call_alert_errors": 0, "budget_alert_errors": 0,
     }
 
 

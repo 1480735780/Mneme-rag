@@ -28,6 +28,7 @@ class ObservationStats:
     pricing_errors: int = 0  # 成本固化钩子异常行数（T1.8：吞掉计数，失败行照常落库兜底 unpriced）
     breaker_alert_errors: int = 0  # 熔断告警消费者异常数（T4.2：hub 兜底吞掉计数，不影响落账）
     call_alert_errors: int = 0     # 成功率告警规则异常数（T4.3：hub 兜底吞掉计数，不影响落账）
+    budget_alert_errors: int = 0   # 预算/P2 规则序列化异常数（T4.4：hub 兜底吞掉计数）
 
     def snapshot(self) -> Dict[str, int]:
         """/metrics 序列化出口消费的只读快照（D13：采集与输出分离）"""
@@ -40,4 +41,5 @@ class ObservationStats:
             "pricing_errors": self.pricing_errors,
             "breaker_alert_errors": self.breaker_alert_errors,
             "call_alert_errors": self.call_alert_errors,
+            "budget_alert_errors": self.budget_alert_errors,
         }

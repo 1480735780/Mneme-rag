@@ -76,6 +76,9 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
         # P10.1 T1.2 观测 flush 后台任务：随 lifespan 启动（同步 create_task，先于任何发射源，D2）
         if container.observation_hub is not None:
             container.observation_hub.start()
+        # P10.4b T4.4 预算告警定时评估：随 lifespan 启停（60s 轮询 load_cost，同口径喂规则）
+        if container.budget_alert_job is not None:
+            await container.budget_alert_job.start()
         try:
             yield
         finally:
@@ -85,6 +88,8 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
                 await container.stream_task_manager.stop()
             if container.knowledge_schedule_job is not None:
                 await container.knowledge_schedule_job.stop()
+            if container.budget_alert_job is not None:
+                await container.budget_alert_job.stop()
             if container.observation_hub is not None:
                 await container.observation_hub.stop_and_drain()
             await container.aclose()

@@ -55,12 +55,16 @@ class AlertConfig:
     headers: Dict[str, str] = field(default_factory=dict)
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     silence_seconds: float = DEFAULT_SILENCE_SECONDS
+    budget_daily_usd: float = 0.0          # 每日预算（USD；0=不启用水位告警——诚实不动账）
+    dropped_threshold: int = 0             # 观测队列丢弃告警阈值（0=不启用）
+    estimation_ratio_pct: float = 0.0      # 估算占比告警阈值（%；0=不启用）
 
 
 # alerts 下合法键白名单（未知键=拼写错误——校验即拒绝，拒绝静默失效）
 _KNOWN_ALERT_KEYS = frozenset({
     "enabled", "env", "format", "webhook_url", "headers",
     "timeout_seconds", "silence_seconds",
+    "budget_daily_usd", "dropped_threshold", "estimation_ratio_pct",
 })
 
 
@@ -121,12 +125,33 @@ def load_alert_from_dict(data: Any) -> AlertConfig:
         silence_seconds=_require_number(
             alerts.get("silence_seconds", DEFAULT_SILENCE_SECONDS), "silence_seconds"
         ),
+        budget_daily_usd=_require_number(
+            alerts.get("budget_daily_usd", 0.0), "budget_daily_usd"
+        ),
+        dropped_threshold=int(
+            _require_number(alerts.get("dropped_threshold", 0), "dropped_threshold")
+        ),
+        estimation_ratio_pct=_require_number(
+            alerts.get("estimation_ratio_pct", 0.0), "estimation_ratio_pct"
+        ),
     )
     if config.timeout_seconds <= 0:
         raise AlertConfigError(f"alerts.timeout_seconds 必须为正，得 {config.timeout_seconds}")
     if config.silence_seconds < 0:
         raise AlertConfigError(
             f"alerts.silence_seconds 不得为负，得 {config.silence_seconds}"
+        )
+    if config.budget_daily_usd < 0:
+        raise AlertConfigError(
+            f"alerts.budget_daily_usd 不得为负（0=关闭），得 {config.budget_daily_usd}"
+        )
+    if config.dropped_threshold < 0:
+        raise AlertConfigError(
+            f"alerts.dropped_threshold 不得为负（0=关闭），得 {config.dropped_threshold}"
+        )
+    if not 0 <= config.estimation_ratio_pct <= 100:
+        raise AlertConfigError(
+            f"alerts.estimation_ratio_pct 须在 [0,100]（0=关闭），得 {config.estimation_ratio_pct}"
         )
     return config
 

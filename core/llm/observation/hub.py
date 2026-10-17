@@ -20,6 +20,7 @@ from collections import deque
 from typing import Any, Dict, Deque, List, Optional
 
 from core.llm.observation.alert import BreakerAlertConsumer
+from core.llm.observation.alert_budget import BudgetAlertRule
 from core.llm.observation.alert_rules import SuccessRateAlertRule
 from core.llm.observation.collector import ObservationStats
 from core.llm.observation.dao import LlmCallDao
@@ -42,6 +43,7 @@ class ObservationHub:
         pricer: Optional[Pricer] = None,
         breaker_alert: Optional[BreakerAlertConsumer] = None,
         call_alert: Optional[SuccessRateAlertRule] = None,
+        budget_alert: Optional[BudgetAlertRule] = None,
     ):
         self.dao = dao
         self.stats = stats if stats is not None else ObservationStats()
@@ -51,6 +53,9 @@ class ObservationHub:
         self.breaker_alert = breaker_alert
         # P10.4b T4.3（D11②）：成功率告警规则（None = 未装配；CallEvent 分支同款吞错）
         self.call_alert = call_alert
+        # P10.4b T4.4（D11③）：预算/P2 规则——触发归 BudgetAlertPollJob 定时评估，
+        # 挂到 hub 仅为 /metrics 组装（触发路径不经事件流）
+        self.budget_alert = budget_alert
         # P10.1 T1.7：熔断事件环形缓冲（调试/告警消费前兜底可见；T4.2 告警消费接此处）
         self.recent_breaker_events: Deque[BreakerEvent] = deque(maxlen=50)
         self.queue = ObservationQueue(
@@ -142,7 +147,9 @@ class ObservationHub:
         snapshot["queue_depth"] = self.queue.depth()
         snapshot["recent_breaker_events"] = len(self.recent_breaker_events)
         alerting = self._alerting_metrics() if (
-            self.breaker_alert is not None or self.call_alert is not None
+            self.breaker_alert is not None
+            or self.call_alert is not None
+            or self.budget_alert is not None
         ) else None
         if alerting is not None:
             # P10.4a/b（D13）：告警最近触发时间 + 消费者语义计数/通道自健康；
@@ -162,4 +169,9 @@ class ObservationHub:
                 blocks["success_rate"] = self.call_alert.metrics()
             except Exception:  # noqa: BLE001 —— 观测端序列化失败只计数
                 self.stats.call_alert_errors += 1
+        if self.budget_alert is not None:
+            try:
+                blocks["budget"] = self.budget_alert.metrics()
+            except Exception:  # noqa: BLE001 —— 观测端序列化失败只计数
+                self.stats.budget_alert_errors += 1
         return blocks

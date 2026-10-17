@@ -15,3 +15,8 @@ alerts:
   headers: {}                     # 自定义请求头（如 Authorization: Bearer xxx）
   timeout_seconds: 5.0            # 单次投递超时；失败吞掉计数、不重试（D10）
   silence_seconds: 600.0          # 同告警键冷却（D11①：熔断 OPEN 同模型 10min）
+  # ---- P10.4b T4.4：预算水位 + P2 规则（0 = 不启用；数据源与看板 load_cost 同口径）----
+  budget_daily_usd: 0.0           # 每日预算（USD）；80% P2 预警 / 100% P1 / 每 +20% 追加（同水位不重复）
+  dropped_threshold: 0            # 观测队列丢弃告警阈值（行数）；每日一次（D2 丢弃最终信号）
+  estimation_ratio_pct: 0         # 估算占比告警阈值（%）；>阈值每日一次（D6：成本打折看的信号）
+

@@ -458,17 +458,27 @@ class AppContainer:
         # P10.4a T4.x：告警装配产物默认缺席（配置加载/构建方法负责置位，测试可直接读取）
         self.alert_config = None
         self.webhook_alerter = None
+        self.budget_alert_job = None
         self.llm_call_dao = LlmCallDao(self.db)
         pricing = self._load_pricing_config()
         # P10.3 T3.2（D7）：价格快照就绪 → 注入真实计算器（纯内存查价；固化点异常
         # 仍由 hub 吞掉并计数 pricing_errors——观测故障不得反噬业务）
         pricer = YamlSnapshotPricer(pricing) if pricing is not None else None
-        # P10.4a T4.2 / P10.4b T4.3（D11①②）：告警通道就绪 → 熔断+成功率双消费者
-        # （共用同一 WebhookAlerter 出口；通道未装配时双双缺省）
-        breaker_alert, call_alert = self._build_alert_consumers(self._load_alert_config())
-        self.observation_hub = ObservationHub(
-            self.llm_call_dao, pricer=pricer, breaker_alert=breaker_alert, call_alert=call_alert
+        # P10.4a T4.2 / P10.4b T4.3/T4.4（D11①②③）：告警通道就绪 → 三消费者
+        #（共用同一 WebhookAlerter 出口；通道未装配时全数缺省）
+        breaker_alert, call_alert, budget_alert = self._build_alert_consumers(
+            self._load_alert_config()
         )
+        self.observation_hub = ObservationHub(
+            self.llm_call_dao,
+            pricer=pricer,
+            breaker_alert=breaker_alert,
+            call_alert=call_alert,
+            budget_alert=budget_alert,
+        )
+        # P10.4b T4.4：预算定时评估 job 须在 hub 之后建（喂 KPI 的 loader/stats_getter
+        # 引用 dashboard_service 与 hub.stats 快照；仅当预算/P2 阈值任一配置才启动）
+        self.budget_alert_job = self._build_budget_alert_job(budget_alert)
 
     @staticmethod
     def _resolve_repo_yaml(path_setting: str) -> Path:
@@ -507,31 +517,60 @@ class AppContainer:
             )
         return self.alert_config
 
-    def _build_alert_consumers(self, alert_config: "Any | None") -> "tuple[Any | None, Any | None]":
-        """P10.4a/T4.2 + P10.4b/T4.3：告警消费者构建
+    def _build_alert_consumers(self, alert_config: "Any | None") -> "tuple[Any | None, Any | None, Any | None]":
+        """P10.4a/T4.2 + P10.4b/T4.3/T4.4：告警消费者构建
 
-        仅当总开关开且具备 webhook 目标时装配；熔断告警与成功率规则共用同一
-        WebhookAlerter（同一通道出口，投递线程唯一）。
+        仅当总开关开且具备 webhook 目标时装配；熔断/成功率/预算三规则共用同一
+        WebhookAlerter（同一通道出口，投递线程唯一）。预算规则仅当日预算或任一
+        P2 阈值配置（>0）才构建——零配置构建无意义规则只会污染 /metrics。
         """
         from core.llm.observation.alert import BreakerAlertConsumer, WebhookAlerter
+        from core.llm.observation.alert_budget import BudgetAlertRule
         from core.llm.observation.alert_rules import SuccessRateAlertRule
 
         if alert_config is None or not alert_config.enabled or not alert_config.webhook_url:
-            return None, None
+            return None, None, None
         alerter = WebhookAlerter(alert_config)
         self.webhook_alerter = alerter
         logger.info(
-            "告警已装配（熔断+成功率；format=%s env=%r silence=%ss）",
+            "告警已装配（熔断+成功率+预算；format=%s env=%r silence=%ss）",
             alert_config.fmt,
             alert_config.env,
             alert_config.silence_seconds,
         )
-        # 熔断冷却与成功率窗口冷却各取配置（D10 静默期单一来源：silence_seconds
-        # 归熔断 10min 口径，成功率窗口固定 30min——D11①② 各自冻结语义）
+        # 冷却口径：熔断取 D10 静默期（silence_seconds，默认 10min）；成功率窗口
+        # 冷却固定 30min（D11② 冻结语义，不随通道配置漂移）
+        budget_rule = None
+        if (
+            alert_config.budget_daily_usd > 0
+            or alert_config.dropped_threshold > 0
+            or alert_config.estimation_ratio_pct > 0
+        ):
+            budget_rule = BudgetAlertRule(
+                alerter,
+                budget_daily_usd=alert_config.budget_daily_usd,
+                dropped_threshold=alert_config.dropped_threshold,
+                estimation_ratio_pct=alert_config.estimation_ratio_pct,
+            )
         return (
             BreakerAlertConsumer(alerter),
             SuccessRateAlertRule(alerter),
+            budget_rule,
         )
+
+    def _build_budget_alert_job(self, budget_alert: "Any | None") -> "Any | None":
+        """P10.4b T4.4：预算定时评估 job（loader=看板 load_cost 同源口径；hub 建好才调）"""
+        from core.llm.observation.alert_budget import BudgetAlertPollJob
+
+        if budget_alert is None:
+            return None
+        job = BudgetAlertPollJob(
+            budget_alert,
+            loader=lambda: self.dashboard_service.load_cost(),
+            stats_getter=lambda: self.observation_hub.stats.snapshot(),
+        )
+        logger.info("预算告警定时评估已装配（60s 轮询 load_cost 同口径）")
+        return job
 
     def _load_pricing_config(self) -> "Any | None":
         """P10.3 T3.1（D7）：启动时加载价格快照（启动期是唯一允许的 IO；此后纯内存）"""
