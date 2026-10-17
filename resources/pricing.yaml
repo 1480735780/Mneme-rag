@@ -1,0 +1,25 @@
+# P10.3 T3.1（D7）价格配置出厂样例——改价走 git：提交即变更，历史行价格已在
+# 落库时固化（cost_usd + pricing_snapshot），报表不因改价漂移（承诺 12）。
+#
+# 启动时一次性加载为内存快照（env RAGENT_PRICING_YAML 可换路径，默认本文件）。
+# 未在 models/call_kinds 登记的模型：cost_usd 留空、快照 status=unpriced（写 0 会伪造免费）。
+# 以下样例条目仅说明格式，启用前按实际单价核对，并连同 pricing_version 一起提交。
+pricing:
+  pricing_version: "blank-initial"   # 改价必升版本（随每行快照落库，可追溯凭据）
+  currency: USD
+  aliases:
+    # qwen-max-2025-xx: qwen-max      # 模型别名 → 规范模型 id（先解析别名再查价）
+  models:
+    # qwen-max:
+    #   input_per_million_usd: 1.6
+    #   output_per_million_usd: 6.4
+    # embedding-only 模型显式填 0（静默缺省=半价，比 unpriced 更危险）：
+    # text-embedding-v4:
+    #   input_per_million_usd: 0.07
+    #   output_per_million_usd: 0
+  # call_kinds: 按 call_kind 扩展计价维度（D7 预留 VLM per-image；发射行未携 image_count 时不适用）
+  #   vlm:
+  #     billing_unit: per_image
+  #     models:
+  #       qwen-vl-max:
+  #         per_image_usd: 0.02

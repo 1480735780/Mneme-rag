@@ -80,6 +80,9 @@ class AppSettings:
     # 两者齐备才在装配时确保管理员存在，幂等；任一为空则不播种）
     init_admin_username: str = ""
     init_admin_password: str = ""
+    # P10.3 T3.1（D7）价格 yaml 路径：启动时一次性加载为内存快照供成本固化（改价走 git）；
+    # 相对路径按 cwd 解析（装配侧再兜仓库根一次），文件缺失/非法回落 unpriced 占位（不阻断启动）
+    pricing_yaml_path: str = "resources/pricing.yaml"  # RAGENT_PRICING_YAML
 
     def is_memory(self) -> bool:
         """是否内存栈（对齐 Java @ConditionalOnProperty 语义）"""
@@ -120,6 +123,7 @@ class AppSettings:
             mcp_servers_json=os.environ.get("RAGENT_MCP_SERVERS_JSON", ""),
             init_admin_username=os.environ.get("RAGENT_INIT_ADMIN_USERNAME", ""),
             init_admin_password=os.environ.get("RAGENT_INIT_ADMIN_PASSWORD", ""),
+            pricing_yaml_path=os.environ.get("RAGENT_PRICING_YAML", "resources/pricing.yaml"),
         )
 
 

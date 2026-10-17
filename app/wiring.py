@@ -325,6 +325,9 @@ class AppContainer:
     # T1.3 起发射点经 hub.emit() 写入；双 profile 无差别装配）
     observation_hub: Any = None
     llm_call_dao: Any = None
+    # P10.3 T3.1（D7）：启动时加载的价格 yaml 快照（None=配置不可用，unpriced 兜底；
+    # T3.2 计算器在固化点纯内存查此快照，禁运行期 IO）
+    pricing_config: Any = None
     # P10.1 T1.7：各路由栈（chat/embedding/rerank）的熔断器快照收集（/metrics 熔断区块）
     _model_health_stores: list = field(default_factory=list)
     _owned: list = field(default_factory=list)
@@ -444,11 +447,48 @@ class AppContainer:
         批量落库经 asyncio.to_thread 出事件循环（executor 每操作独立连接，线程安全），
         200 行/批同步 insert 不占 loop（D2：观测不反噬推理路径）。发射点自 T1.3 接入：
         LLM 层经 hub.emit() 投递 CallEvent，本方法不触及 LLM 构造。
+
+        P10.3 T3.1（D7）：价格 yaml 启动时一次性加载为内存快照挂容器（pricing_config），
+        T3.2 计算器经它填 cost_usd + pricing_snapshot；配置缺失/非法不阻断装配
+        （unpriced 占位兜底 + 显著告警——观测数据宁可 unpriced，不可静默半价）。
         """
         from core.llm.observation import LlmCallDao, ObservationHub
+        from core.llm.observation.pricing import YamlSnapshotPricer
 
         self.llm_call_dao = LlmCallDao(self.db)
-        self.observation_hub = ObservationHub(self.llm_call_dao)
+        pricing = self._load_pricing_config()
+        # P10.3 T3.2（D7）：价格快照就绪 → 注入真实计算器（纯内存查价；固化点异常
+        # 仍由 hub 吞掉并计数 pricing_errors——观测故障不得反噬业务）
+        pricer = YamlSnapshotPricer(pricing) if pricing is not None else None
+        self.observation_hub = ObservationHub(self.llm_call_dao, pricer=pricer)
+
+    def _load_pricing_config(self) -> "Any | None":
+        """P10.3 T3.1（D7）：启动时加载价格快照（启动期是唯一允许的 IO；此后纯内存）"""
+        from core.llm.observation.pricing_config import load_pricing_config
+
+        path = Path(self.settings.pricing_yaml_path)
+        if not path.is_absolute() and not path.exists():
+            candidate = Path(__file__).resolve().parent.parent / self.settings.pricing_yaml_path
+            if candidate.exists():
+                path = candidate
+        try:
+            self.pricing_config = load_pricing_config(str(path))
+            logger.info(
+                "价格配置已加载（pricing_version=%s，token 计价模型 %d 个，来自 %s）",
+                self.pricing_config.pricing_version,
+                len(self.pricing_config.token_models),
+                path,
+            )
+            return self.pricing_config
+        except Exception as exc:  # noqa: BLE001 — 配置不可用须显著但不阻断装配（unpriced 兜底）
+            logger.warning(
+                "价格配置不可用（%s：%s: %s）——成本固化保持 unpriced 占位",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            self.pricing_config = None
+            return None
 
     @classmethod
     def _build_memory(cls, settings: AppSettings) -> "AppContainer":
