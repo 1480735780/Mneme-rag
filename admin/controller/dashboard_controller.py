@@ -5,6 +5,7 @@ admin.controller.dashboard_controller - 管理大盘端点（对应 Java Dashboa
     - GET /admin/dashboard/overview    总览六 KPI（camelCase）
     - GET /admin/dashboard/performance 延迟/成功率/无文档/慢查询（camelCase）
     - GET /admin/dashboard/trends      day/hour 粒度序列（camelCase）
+    - GET /admin/dashboard/cost        P10.3 T3.3 成本区（KPI/趋势/分布；?traceId= 下钻，camelCase）
 
 方案 B：service 返回 snake_case dict，边界经 camelize 递归转 camelCase（对齐 Java VO）。
 """
@@ -52,4 +53,21 @@ async def trends(
     """GET /admin/dashboard/trends：day/hour 粒度序列（metric 为空 → 空 series）"""
     container = _container(request)
     data = container.dashboard_service.load_trends(metric, window, granularity)
+    return result_to_dict(Results.success(camelize(data)))
+
+
+@router.get("/cost", name="dashboard_cost")
+async def cost(
+    request: Request,
+    trace_id: Optional[str] = Query(default=None),
+    traceId: Optional[str] = Query(default=None, include_in_schema=False),
+) -> dict:
+    """GET /admin/dashboard/cost（P10.3 T3.3）：成本 KPI/按日趋势/模型分布；
+    给出 trace 参数时下钻到该 trace 的 P10.1 调用明细（camelCase VO）。
+
+    trace 双拼写：traceId（camel，前端契约优先）与 trace_id（snake，调试友好）。
+    """
+    container = _container(request)
+    desired = traceId if traceId is not None else trace_id
+    data = container.dashboard_service.load_cost(trace_id=desired)
     return result_to_dict(Results.success(camelize(data)))

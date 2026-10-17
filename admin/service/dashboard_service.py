@@ -21,12 +21,16 @@ admin.service.dashboard_service - 管理大盘聚合服务（对应 Java Dashboa
 """
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from common.util.business_time import business_day_window, business_month_window
+from core.llm.observation.dao import LLM_CALL_TABLE
+from core.llm.observation.events import TOKEN_SOURCE_REAL
 from rag.dao.conversation_dao import CONVERSATION_TABLE
 from rag.dao.message_dao import MESSAGE_TABLE
 from rag.dao.support import NOT_DELETED
@@ -41,6 +45,10 @@ NO_DOC_REPLY = "未检索到与问题相关的文档内容。"
 GRANULARITY_DAY = "day"
 GRANULARITY_HOUR = "hour"
 SLOW_LATENCY_THRESHOLD_MS = 20000
+# P10.3 T3.3（D14 成本区参数）
+COST_TREND_DAYS = 7      # 按日成本曲线的窗口（业务日，含今日）
+COST_TOP_TRACES = 5      # 当日成本 Top trace_id（下钻入口）
+COST_TRACE_CALL_LIMIT = 200  # 下钻明细行的单次上限（一次问答 2~5 行，200 远够）
 
 
 @dataclass(frozen=True)
@@ -157,6 +165,204 @@ class DashboardService:
             "window": range_.window_label,
             "granularity": resolved_granularity,
             "series": series,
+        }
+
+    # ==================== Cost（P10.3 T3.3：成本区，D11/D14 契约） ====================
+
+    def load_cost(self, trace_id: Optional[str] = None) -> Dict[str, Any]:
+        """Cost：成本 KPI 三张 + 按日成本趋势 + 按模型分布 + trace_id 下钻明细
+
+        - D11 日界（Asia/Shanghai 00:00）经 common.util.business_time 单一实现
+          （与预算告警/月累计同源——「当日」口径不分叉）；
+        - 聚合沿用 Condition API + Python 侧归并（双后端无感知）；t_llm_call 为
+          append-only 无 deleted 列，**不加 deleted 条件**（对齐 DAO 接口缺失语义）；
+        - 估算占比（D6 一等公民）= 当日 token_source 非 real（estimated/mixed）行占比；
+          未定价占比 = 当月 cost_usd 空行占比——成本数字打折看的两个信号；
+        - 聚合只读已固化的 cost_usd 列，**从不按价格重算**（承诺 12：改价后报表不漂移）。
+        """
+        desired_trace = (trace_id or "").strip()
+        if desired_trace:
+            return self._load_cost_by_trace(desired_trace)
+
+        now = self._now_fn()
+        day = business_day_window(now)
+        month = business_month_window(now)
+
+        month_rows = self._select_calls_in_range(month.start, month.end)
+        day_start_iso = day.start.isoformat()
+        day_end_iso = day.end.isoformat()
+        day_rows = [
+            each for each in month_rows
+            if day_start_iso <= str(each.get("create_time") or "") < day_end_iso
+        ]
+
+        day_cost = self._sum_costs(day_rows)
+        month_cost = self._sum_costs(month_rows)
+        estimated_count = sum(
+            1 for each in day_rows if (each.get("token_source") or "") != TOKEN_SOURCE_REAL
+        )
+        estimated_share = (
+            self._round1((estimated_count * 100.0) / len(day_rows)) if day_rows else 0.0
+        )
+        unpriced_count = sum(1 for each in month_rows if each.get("cost_usd") is None)
+        unpriced_share = (
+            self._round1((unpriced_count * 100.0) / len(month_rows)) if month_rows else 0.0
+        )
+
+        return {
+            "updated_at": int(time.time() * 1000),
+            "business_day": day.date_label(),
+            "kpis": {
+                "cost_today": {
+                    "value_usd": day_cost,
+                    "calls": len(day_rows),
+                    "unpriced_calls": sum(1 for each in day_rows if each.get("cost_usd") is None),
+                },
+                "cost_month": {
+                    "value_usd": month_cost,
+                    "calls": len(month_rows),
+                    "unpriced_calls": unpriced_count,
+                },
+                "estimated_share": {
+                    "value_pct": estimated_share,
+                    "estimated_rows": estimated_count,
+                    "total_rows": len(day_rows),
+                },
+            },
+            "unpriced": {
+                "share_pct": unpriced_share,
+                "rows": unpriced_count,
+                "total_rows": len(month_rows),
+            },
+            "daily": self._cost_daily_points(now, day),
+            "by_model": self._cost_by_model(month_rows),
+            "top_traces": self._cost_top_traces(day_rows),
+        }
+
+    def _load_cost_by_trace(self, trace_id: str) -> Dict[str, Any]:
+        """trace_id 下钻：一次请求链路的全部调用明细（成本口径行级可追溯，D14）"""
+        rows = self._db.select_rows(
+            LLM_CALL_TABLE,
+            where=[Condition.eq("trace_id", trace_id)],
+            order_by=[("create_time", "asc"), ("attempt_no", "asc")],
+            limit=COST_TRACE_CALL_LIMIT,
+        )
+        return {
+            "trace_id": trace_id,
+            "updated_at": int(time.time() * 1000),
+            "calls": [self._cost_call_row(each) for each in rows],
+        }
+
+    def _cost_daily_points(self, now: datetime, today_window) -> List[Dict[str, Any]]:
+        """按业务日成本曲线（近 COST_TREND_DAYS 个业务日，含今日；可能跨月独立取数）"""
+        windows = [
+            business_day_window(now - timedelta(days=offset))
+            for offset in range(COST_TREND_DAYS - 1, -1, -1)
+        ]
+        trend_rows = self._select_calls_in_range(windows[0].start, today_window.end)
+        points: List[Dict[str, Any]] = []
+        for window in windows:
+            start_iso = window.start.isoformat()
+            end_iso = window.end.isoformat()
+            rows_in = [
+                each for each in trend_rows
+                if start_iso <= str(each.get("create_time") or "") < end_iso
+            ]
+            points.append({
+                "ts": window.start_epoch_ms(),
+                "value": self._sum_costs(rows_in),
+                "date": window.date_label(),
+                "calls": len(rows_in),
+                "unpriced": sum(1 for each in rows_in if each.get("cost_usd") is None),
+            })
+        return points
+
+    def _cost_by_model(self, month_rows: List[Dict]) -> List[Dict[str, Any]]:
+        """按模型成本分布（当月口径；成本 0 的模型仍列出——覆盖了哪些模型是事实本身）"""
+        slots: Dict[str, Dict[str, Any]] = {}
+        for each in month_rows:
+            model = str(each.get("model") or "unknown")
+            slot = slots.setdefault(model, {"model": model, "cost_usd": 0.0, "calls": 0})
+            if each.get("cost_usd") is not None:
+                slot["cost_usd"] += float(each["cost_usd"])
+            slot["calls"] += 1
+        ranked = sorted(slots.values(), key=lambda entry: -entry["cost_usd"])
+        return [
+            {"model": entry["model"], "cost_usd": round(entry["cost_usd"], 6), "calls": entry["calls"]}
+            for entry in ranked
+        ]
+
+    def _cost_top_traces(self, day_rows: List[Dict]) -> List[Dict[str, Any]]:
+        """当日成本 Top trace（下钻入口；无 trace_id 的后台行不参与）"""
+        slots: Dict[str, Dict[str, Any]] = {}
+        for each in day_rows:
+            trace = each.get("trace_id")
+            if not trace:
+                continue
+            key = str(trace)
+            slot = slots.setdefault(key, {"trace_id": key, "cost_usd": 0.0, "calls": 0})
+            if each.get("cost_usd") is not None:
+                slot["cost_usd"] += float(each["cost_usd"])
+            slot["calls"] += 1
+        ranked = sorted(slots.values(), key=lambda entry: -entry["cost_usd"])
+        return [
+            {
+                "trace_id": entry["trace_id"],
+                "cost_usd": round(entry["cost_usd"], 6),
+                "calls": entry["calls"],
+            }
+            for entry in ranked[:COST_TOP_TRACES]
+        ]
+
+    def _select_calls_in_range(self, start: datetime, end: datetime) -> List[Dict]:
+        """t_llm_call 时间范围取数（ISO 字符串条件；无 deleted 列 → 无 deleted 条件）"""
+        return self._db.select_rows(
+            LLM_CALL_TABLE,
+            where=[
+                Condition.gte("create_time", start.isoformat()),
+                Condition.lt("create_time", end.isoformat()),
+            ],
+        )
+
+    @staticmethod
+    def _sum_costs(rows: List[Dict]) -> float:
+        """已固化成本求和（6 位小数；unpriced 行 cost_usd 空——贡献 0 是「无记录」，不伪造）"""
+        return round(
+            sum(float(each["cost_usd"]) for each in rows if each.get("cost_usd") is not None), 6
+        )
+
+    def _cost_call_row(self, row: Dict) -> Dict[str, Any]:
+        """下钻投影：成本明细行的可读视图（快照解析为 dict 供前端徽标）"""
+        snapshot_text = row.get("pricing_snapshot")
+        if isinstance(snapshot_text, str):
+            try:
+                snapshot = json.loads(snapshot_text)
+            except ValueError:
+                snapshot = {"status": "unpriced"}
+        else:
+            snapshot = snapshot_text
+        return {
+            "id": str(row.get("id") or ""),
+            "request_uid": row.get("request_uid"),
+            "trace_id": row.get("trace_id"),
+            "call_kind": row.get("call_kind"),
+            "scene": row.get("scene"),
+            "purpose": row.get("purpose"),
+            "tier": row.get("tier"),
+            "provider": row.get("provider"),
+            "model": row.get("model"),
+            "status": row.get("status"),
+            "error_type": row.get("error_type"),
+            "attempt_no": row.get("attempt_no"),
+            "is_final": row.get("is_final"),
+            "prompt_tokens": row.get("prompt_tokens"),
+            "completion_tokens": row.get("completion_tokens"),
+            "token_source": row.get("token_source"),
+            "latency_ms": row.get("latency_ms"),
+            "ttft_ms": row.get("ttft_ms"),
+            "cost_usd": row.get("cost_usd"),
+            "pricing_snapshot": snapshot,
+            "create_time": row.get("create_time"),
         }
 
     # ==================== 指标序列（day / hour） ====================
