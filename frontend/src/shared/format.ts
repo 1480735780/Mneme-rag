@@ -52,3 +52,10 @@ export function formatDeltaPct(v?: number | null): string {
   const sign = n > 0 ? "+" : "";
   return `${sign}${n.toFixed(1)}%`;
 }
+
+/** 美元成本 → 展示（P10.3 成本区）：微美元级精度（4 位小数），null/undefined 回 "-"。
+ * 注意：0 是合法展示（token 全 0 的真实读数）；做空值判断而非隐藏 0。 */
+export function formatUsd(v?: number | null): string {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return "-";
+  return `$${Number(v).toFixed(4)}`;
+}

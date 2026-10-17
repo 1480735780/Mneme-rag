@@ -2,7 +2,14 @@
 // 统一经 Axios interceptor 解包；响应为 camelCase VO（后端边界 camelize）
 import { get } from "@/shared/api/client";
 
-import type { DashboardOverview, DashboardPerformance, DashboardTrends, TrendMetric } from "./types";
+import type {
+  DashboardCost,
+  DashboardCostDetail,
+  DashboardOverview,
+  DashboardPerformance,
+  DashboardTrends,
+  TrendMetric,
+} from "./types";
 
 /** GET /admin/dashboard/overview：总览六 KPI（window 可选，如 24h/7d） */
 export function getDashboardOverview(window?: string): Promise<DashboardOverview> {
@@ -26,5 +33,13 @@ export function getDashboardTrends(params: {
       window: params.window || undefined,
       granularity: params.granularity || undefined,
     },
+  });
+}
+
+/** GET /admin/dashboard/cost（P10.3 T3.3/T3.4）：成本 KPI/按日趋势/模型分布；
+ * traceId 给出时下钻到该 trace 的调用明细（响应形态用 isCostDetail 守卫窄化）。 */
+export function getDashboardCost(traceId?: string): Promise<DashboardCost | DashboardCostDetail> {
+  return get("/admin/dashboard/cost", {
+    params: { traceId: traceId || undefined },
   });
 }

@@ -56,3 +56,96 @@ export interface DashboardTrends {
 
 /** 趋势可选指标 */
 export type TrendMetric = "sessions" | "messages" | "activeusers" | "avglatency" | "quality";
+
+// ==================== 成本区（P10.3 T3.3/T3.4：GET /admin/dashboard/cost，camelCase） ====================
+
+/** 成本 KPI 卡（当日/当月）：valueUsd 已固化成本合计（unpriced 行不贡献金额，不伪造 0）；unpricedCalls 该窗未定价行数 */
+export interface CostKpiValue {
+  valueUsd: number;
+  calls: number;
+  unpricedCalls: number;
+}
+
+/** 估算占比 KPI（D6 一等公民）：token_source 非 real（estimated/mixed）行占比；>30% 出 P2 提示 */
+export interface CostEstimatedShare {
+  valuePct: number;
+  estimatedRows: number;
+  totalRows: number;
+}
+
+/** 按日成本点：近 7 个业务日；ts 为东八区 00:00 绝对时刻（epoch ms），unpriced 为该日未定价行数 */
+export interface CostDailyPoint {
+  ts: number;
+  value: number;
+  date: string;
+  calls: number;
+  unpriced: number;
+}
+
+/** 按模型分布（当月口径）：unpriced 行零金额但计入 calls——「进行了哪些调用」是事实本身 */
+export interface CostModelShare {
+  model: string;
+  costUsd: number;
+  calls: number;
+}
+
+/** 当日成本 Top trace（下钻入口） */
+export interface CostTopTrace {
+  traceId: string;
+  costUsd: number;
+  calls: number;
+}
+
+/** 调用明细行（trace 下钻投影；pricingSnapshot 已解析为 dict，status=priced|unpriced） */
+export interface CostCallRow {
+  id: string;
+  requestUid?: string | null;
+  traceId?: string | null;
+  callKind?: string | null;
+  scene?: string | null;
+  purpose?: string | null;
+  tier?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  status?: string | null;
+  errorType?: string | null;
+  attemptNo?: number | null;
+  isFinal?: number | null;
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  tokenSource?: string | null;
+  latencyMs?: number | null;
+  ttftMs?: number | null;
+  costUsd?: number | null;
+  pricingSnapshot?: Record<string, unknown> | null;
+  createTime?: string | null;
+}
+
+/** GET /admin/dashboard/cost 应答（无 traceId：KPI/趋势/分布） */
+export interface DashboardCost {
+  updatedAt?: number | null;
+  businessDay?: string | null;
+  kpis: {
+    costToday: CostKpiValue;
+    costMonth: CostKpiValue;
+    estimatedShare: CostEstimatedShare;
+  };
+  unpriced: { sharePct: number; rows: number; totalRows: number };
+  daily: CostDailyPoint[];
+  byModel: CostModelShare[];
+  topTraces: CostTopTrace[];
+}
+
+/** GET /admin/dashboard/cost?traceId= 应答（下钻：一次请求链路的调用明细） */
+export interface DashboardCostDetail {
+  traceId: string;
+  updatedAt?: number | null;
+  calls: CostCallRow[];
+}
+
+/** 成本应答的窄化守卫：响应含 calls 数组即下钻形态 */
+export function isCostDetail(
+  data: DashboardCost | DashboardCostDetail,
+): data is DashboardCostDetail {
+  return Array.isArray((data as DashboardCostDetail).calls);
+}
