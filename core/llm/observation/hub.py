@@ -20,6 +20,7 @@ from collections import deque
 from typing import Any, Dict, Deque, List, Optional
 
 from core.llm.observation.alert import BreakerAlertConsumer
+from core.llm.observation.alert_rules import SuccessRateAlertRule
 from core.llm.observation.collector import ObservationStats
 from core.llm.observation.dao import LlmCallDao
 from core.llm.observation.events import BreakerEvent, CallEvent
@@ -40,6 +41,7 @@ class ObservationHub:
         stats: Optional[ObservationStats] = None,
         pricer: Optional[Pricer] = None,
         breaker_alert: Optional[BreakerAlertConsumer] = None,
+        call_alert: Optional[SuccessRateAlertRule] = None,
     ):
         self.dao = dao
         self.stats = stats if stats is not None else ObservationStats()
@@ -47,6 +49,8 @@ class ObservationHub:
         self._pricer = pricer
         # P10.4a T4.2（D11①）：熔断告警消费者（None = 告警通道未装配，事件仅进环形缓冲）
         self.breaker_alert = breaker_alert
+        # P10.4b T4.3（D11②）：成功率告警规则（None = 未装配；CallEvent 分支同款吞错）
+        self.call_alert = call_alert
         # P10.1 T1.7：熔断事件环形缓冲（调试/告警消费前兜底可见；T4.2 告警消费接此处）
         self.recent_breaker_events: Deque[BreakerEvent] = deque(maxlen=50)
         self.queue = ObservationQueue(
@@ -72,6 +76,7 @@ class ObservationHub:
         for item in batch:
             if isinstance(item, CallEvent):
                 self.dao.insert(self._fix_cost(item.to_row()))
+                self._dispatch_call_alert(item)
             elif isinstance(item, BreakerEvent):
                 # T1.7：熔断事件不入库（无表），进环形缓冲供调试 + 计数；
                 # T4.2 在此处接告警分发
@@ -90,6 +95,15 @@ class ObservationHub:
             self.breaker_alert.on_breaker_event(event)
         except Exception:  # noqa: BLE001 —— D2/D12：观测异常吞掉 + 计数，绝不反噬管线
             self.stats.breaker_alert_errors += 1
+
+    def _dispatch_call_alert(self, event: CallEvent) -> None:
+        """T4.3 成功率规则分发：同款吞掉 + 计数（call_alert_errors 进 /metrics）"""
+        if self.call_alert is None:
+            return
+        try:
+            self.call_alert.on_call_event(event)
+        except Exception:  # noqa: BLE001 —— 规则 bug 吞掉计数，绝不反噬落账管线
+            self.stats.call_alert_errors += 1
 
     # ===================== 成本固化（T1.8，D7：P10.3 接管前 unpriced 占位） =====================
 
@@ -127,11 +141,25 @@ class ObservationHub:
         snapshot = self.stats.snapshot()
         snapshot["queue_depth"] = self.queue.depth()
         snapshot["recent_breaker_events"] = len(self.recent_breaker_events)
-        if self.breaker_alert is not None:
-            # P10.4a T4.2（D13）：告警最近触发时间 + 消费者语义计数/通道自健康；
+        alerting = self._alerting_metrics() if (
+            self.breaker_alert is not None or self.call_alert is not None
+        ) else None
+        if alerting is not None:
+            # P10.4a/b（D13）：告警最近触发时间 + 消费者语义计数/通道自健康；
             # 消费者自身有 bug（连 metrics 都炸）也吞掉计数——/metrics 不得 5xx
+            snapshot["alerting"] = alerting
+        return {"observation": snapshot}
+
+    def _alerting_metrics(self) -> Dict[str, Any]:
+        blocks: Dict[str, Any] = {}
+        if self.breaker_alert is not None:
             try:
-                snapshot["alerting"] = self.breaker_alert.metrics()
+                blocks["breaker"] = self.breaker_alert.metrics()
             except Exception:  # noqa: BLE001 —— 观测端序列化失败只计数
                 self.stats.breaker_alert_errors += 1
-        return {"observation": snapshot}
+        if self.call_alert is not None:
+            try:
+                blocks["success_rate"] = self.call_alert.metrics()
+            except Exception:  # noqa: BLE001 —— 观测端序列化失败只计数
+                self.stats.call_alert_errors += 1
+        return blocks

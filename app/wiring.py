@@ -463,9 +463,12 @@ class AppContainer:
         # P10.3 T3.2（D7）：价格快照就绪 → 注入真实计算器（纯内存查价；固化点异常
         # 仍由 hub 吞掉并计数 pricing_errors——观测故障不得反噬业务）
         pricer = YamlSnapshotPricer(pricing) if pricing is not None else None
-        # P10.4a T4.2（D11①）：告警通道配置就绪 → 熔断事件接告警消费者（无配置不装配）
-        breaker_alert = self._build_breaker_alert(self._load_alert_config())
-        self.observation_hub = ObservationHub(self.llm_call_dao, pricer=pricer, breaker_alert=breaker_alert)
+        # P10.4a T4.2 / P10.4b T4.3（D11①②）：告警通道就绪 → 熔断+成功率双消费者
+        # （共用同一 WebhookAlerter 出口；通道未装配时双双缺省）
+        breaker_alert, call_alert = self._build_alert_consumers(self._load_alert_config())
+        self.observation_hub = ObservationHub(
+            self.llm_call_dao, pricer=pricer, breaker_alert=breaker_alert, call_alert=call_alert
+        )
 
     @staticmethod
     def _resolve_repo_yaml(path_setting: str) -> Path:
@@ -504,21 +507,31 @@ class AppContainer:
             )
         return self.alert_config
 
-    def _build_breaker_alert(self, alert_config: "Any | None") -> "Any | None":
-        """P10.4a T4.2（D11①）：仅当总开关开且具备 webhook 目标时装配熔断告警消费者"""
+    def _build_alert_consumers(self, alert_config: "Any | None") -> "tuple[Any | None, Any | None]":
+        """P10.4a/T4.2 + P10.4b/T4.3：告警消费者构建
+
+        仅当总开关开且具备 webhook 目标时装配；熔断告警与成功率规则共用同一
+        WebhookAlerter（同一通道出口，投递线程唯一）。
+        """
         from core.llm.observation.alert import BreakerAlertConsumer, WebhookAlerter
+        from core.llm.observation.alert_rules import SuccessRateAlertRule
 
         if alert_config is None or not alert_config.enabled or not alert_config.webhook_url:
-            return None
+            return None, None
         alerter = WebhookAlerter(alert_config)
         self.webhook_alerter = alerter
         logger.info(
-            "熔断告警已装配（format=%s env=%r silence=%ss）",
+            "告警已装配（熔断+成功率；format=%s env=%r silence=%ss）",
             alert_config.fmt,
             alert_config.env,
             alert_config.silence_seconds,
         )
-        return BreakerAlertConsumer(alerter)
+        # 熔断冷却与成功率窗口冷却各取配置（D10 静默期单一来源：silence_seconds
+        # 归熔断 10min 口径，成功率窗口固定 30min——D11①② 各自冻结语义）
+        return (
+            BreakerAlertConsumer(alerter),
+            SuccessRateAlertRule(alerter),
+        )
 
     def _load_pricing_config(self) -> "Any | None":
         """P10.3 T3.1（D7）：启动时加载价格快照（启动期是唯一允许的 IO；此后纯内存）"""

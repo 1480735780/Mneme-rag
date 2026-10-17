@@ -228,11 +228,11 @@ def test_hub_invokes_consumer_and_metrics_expose_alerting():
     assert hub.stats.breaker_events == 1
     assert hub.stats.breaker_alert_errors == 0
     metrics = hub.metrics()["observation"]
-    assert metrics["alerting"]["counters"]["seen"] == 1
-    assert metrics["alerting"]["counters"]["opened_alerted"] == 1
+    assert metrics["alerting"]["breaker"]["counters"]["seen"] == 1
+    assert metrics["alerting"]["breaker"]["counters"]["opened_alerted"] == 1
     # generic 格式 → 结构化全字段（含 D13 通道记账）
     assert sent[0]["rule"] == "breaker.open" and sent[0]["env"] == "dev"
-    assert metrics["alerting"]["alerter"]["accepted"] == 1
+    assert metrics["alerting"]["breaker"]["alerter"]["accepted"] == 1
 
 
 def test_hub_swallows_consumer_errors_and_keeps_batch():
