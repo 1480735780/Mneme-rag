@@ -1,0 +1,9 @@
+# P10.5 T5 保留清理（D14）：t_llm_call 按 create_time 物理清理的运营配置
+# 首跑必须 dry-run（只统计将删行数与最早行日期，不动数据）；人工核对日志输出
+# 后人工把 dry_run 置 false 启用真删（承诺 8 的保留期兑现点）。
+# 校验即拒绝：未知键/类型错/非法值（days<1、batch_size<1、interval_seconds<=0）不装配。
+retention:
+  days: 180                  # 保留天数（t_llm_call 全量不采样，成本结算用途）
+  batch_size: 5000           # 分块删除批量（批间让锁，防长事务拖慢在线写）
+  interval_seconds: 21600    # 扫描间隔（默认 6h：低频后台任务，低峰执行）
+  dry_run: true              # 首跑必须 dry-run；核对输出后人工置 false 真删

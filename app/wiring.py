@@ -459,6 +459,9 @@ class AppContainer:
         self.alert_config = None
         self.webhook_alerter = None
         self.budget_alert_job = None
+        # P10.5 T5：保留清理 sweeper 默认缺席（yaml 指向出厂样例= dry-run 安全模式）
+        self.retention_config = None
+        self.retention_sweeper = None
         self.llm_call_dao = LlmCallDao(self.db)
         pricing = self._load_pricing_config()
         # P10.3 T3.2（D7）：价格快照就绪 → 注入真实计算器（纯内存查价；固化点异常
@@ -479,6 +482,9 @@ class AppContainer:
         # P10.4b T4.4：预算定时评估 job 须在 hub 之后建（喂 KPI 的 loader/stats_getter
         # 引用 dashboard_service 与 hub.stats 快照；仅当预算/P2 阈值任一配置才启动）
         self.budget_alert_job = self._build_budget_alert_job(budget_alert)
+        # P10.5 T5（D14）：t_llm_call 保留清理 sweeper（出厂样例=dry-run 安全模式，
+        # 人工核对后置 false 真删；异常全吞掉计数，装配失败不阻断启动）
+        self.retention_sweeper = self._build_retention_sweeper()
 
     @staticmethod
     def _resolve_repo_yaml(path_setting: str) -> Path:
@@ -570,6 +576,42 @@ class AppContainer:
             stats_getter=lambda: self.observation_hub.stats.snapshot(),
         )
         logger.info("预算告警定时评估已装配（60s 轮询 load_cost 同口径）")
+        return job
+
+    def _load_retention_config(self) -> "Any | None":
+        """P10.5 T5（D14）：保留清理 yaml 启动时一次性加载（alerts 同款作息）
+
+        加载失败降级 None 不阻断启动（清理缺失是运营债不是事故）；产物挂
+        self.retention_config 供测试/排障读取。
+        """
+        from core.llm.observation.sweeper import load_retention_config
+
+        path = self._resolve_repo_yaml(self.settings.retention_yaml_path)
+        try:
+            self.retention_config = load_retention_config(str(path))
+        except Exception as exc:  # noqa: BLE001 — 配置非法不阻断装配（清理缺失≤运营债）
+            logger.warning(
+                "保留清理配置不可用（%s：%s: %s）——t_llm_call 清理 sweeper 不装配",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            self.retention_config = None
+            return None
+        return self.retention_config
+
+    def _build_retention_sweeper(self) -> "Any | None":
+        """P10.5 T5（D14）：保留清理 sweeper 构建（yaml 未配置/非法 → 缺席）"""
+        from core.llm.observation.sweeper import RetentionSweeperJob
+
+        config = self._load_retention_config()
+        if config is None:
+            return None
+        job = RetentionSweeperJob(self.llm_call_dao, config)
+        logger.info(
+            "保留清理 sweeper 已装配（保留 %s 天 / 批 %s 行 / dry_run=%s / %ss 一扫）",
+            config.days, config.batch_size, config.dry_run, config.interval_seconds,
+        )
         return job
 
     def _load_pricing_config(self) -> "Any | None":

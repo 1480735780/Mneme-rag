@@ -79,6 +79,9 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
         # P10.4b T4.4 预算告警定时评估：随 lifespan 启停（60s 轮询 load_cost，同口径喂规则）
         if container.budget_alert_job is not None:
             await container.budget_alert_job.start()
+        # P10.5 T5 保留清理 sweeper：随 lifespan 启停（出厂样例 dry-run 安全模式，首跑只统计）
+        if container.retention_sweeper is not None:
+            await container.retention_sweeper.start()
         try:
             yield
         finally:
@@ -90,6 +93,8 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
                 await container.knowledge_schedule_job.stop()
             if container.budget_alert_job is not None:
                 await container.budget_alert_job.stop()
+            if container.retention_sweeper is not None:
+                await container.retention_sweeper.stop()
             if container.observation_hub is not None:
                 await container.observation_hub.stop_and_drain()
             await container.aclose()
@@ -186,6 +191,9 @@ def create_app(settings: Optional[AppSettings] = None) -> FastAPI:
         hub = container.observation_hub
         report = hub.metrics() if hub is not None else {}
         report["breakers"] = container.breaker_snapshot()
+        # P10.5 T5：保留清理语义计数区块（sweeper 缺席 = 不挂账，不出空键）
+        if container.retention_sweeper is not None:
+            report["retention"] = container.retention_sweeper.metrics()
         return result_to_dict(Results.success(report))
 
     # P9 §10.2/§17.5.2：版本化能力探针端点（按需触发实测三步；失败标 versioning_unavailable）

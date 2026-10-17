@@ -86,6 +86,9 @@ class AppSettings:
     # P10.4a T4.1（D10）告警通道 yaml 路径：出厂样例总开关 false（未显式开不装配通道）；
     # 解析失败同样不阻断启动，仅在启动日志显著提示
     alerts_yaml_path: str = "resources/alerts.yaml"  # RAGENT_ALERTS_YAML
+    # P10.5 T5（D14）保留清理 yaml 路径：出厂样例 dry_run=true（首跑安全模式）；
+    # 解析失败不阻断启动（retention job 不装配），启动日志显著提示
+    retention_yaml_path: str = "resources/retention.yaml"  # RAGENT_RETENTION_YAML
 
     def is_memory(self) -> bool:
         """是否内存栈（对齐 Java @ConditionalOnProperty 语义）"""
@@ -128,6 +131,9 @@ class AppSettings:
             init_admin_password=os.environ.get("RAGENT_INIT_ADMIN_PASSWORD", ""),
             pricing_yaml_path=os.environ.get("RAGENT_PRICING_YAML", "resources/pricing.yaml"),
             alerts_yaml_path=os.environ.get("RAGENT_ALERTS_YAML", "resources/alerts.yaml"),
+            retention_yaml_path=os.environ.get(
+                "RAGENT_RETENTION_YAML", "resources/retention.yaml"
+            ),
         )
 
 
